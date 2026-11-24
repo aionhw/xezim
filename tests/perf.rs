@@ -94,3 +94,5 @@ mod process_memory_paths;
 mod packed_member_path_read;
 #[path = "perf/decl_param_scope_scaling.rs"]
 mod decl_param_scope_scaling;
+#[path = "perf/scoped_package_calls.rs"]
+mod scoped_package_calls;

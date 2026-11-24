@@ -344,6 +344,16 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(v) = params.get(raw) {
             return Some(v.clone());
         }
+        // §26.3: in the body of an inlined `pkg::f`, a bare name with no bare
+        // parameter entry is `pkg`'s own parameter.
+        if hier.root.is_none()
+            && let [seg] = hier.path.as_slice()
+            && seg.selects.is_empty()
+            && let Some((pkg, _)) = self.inlining_stack.last().and_then(|n| n.rsplit_once("::"))
+            && let Some(v) = params.get(format!("{pkg}::{}", seg.name.name).as_str())
+        {
+            return Some(v.clone());
+        }
         // §26.3: `pkg::P` (a two-segment path) is the package's own
         // parameter, keyed `pkg::P`; the suffix match below would take any
         // bare `P` — another package's, imported here.

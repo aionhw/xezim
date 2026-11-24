@@ -211,23 +211,29 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// §26.3: the function-table key a BARE call names from the body being
     /// compiled. Inside a package function (free-function mode under
-    /// `__free_fn__<pkg>`) a name declared in several scopes resolves in the
-    /// enclosing package first, which the table keeps as `pkg::name` (the
-    /// bare key holds whichever declaration registered last). A contested
-    /// name the package does not declare itself, or one met inside an
-    /// inlined callee (whose own package may differ), returns `None` so the
-    /// body stays on the interpreter, which resolves it at run time.
-    /// Uncontested names and every other compile mode keep the bare key.
+    /// `__free_fn__<pkg>`, or the inlined body of a `pkg::f` call) a name
+    /// declared in several scopes resolves in that package first, which the
+    /// table keeps as `pkg::name` (the bare key holds whichever declaration
+    /// registered last). A contested name the package does not declare
+    /// itself, or one met inside an inlined callee of unknown package,
+    /// returns `None` so the body stays on the interpreter, which resolves it
+    /// at run time. Uncontested names and every other compile mode keep the
+    /// bare key.
     pub(super) fn scoped_callee_name(&self, bare: String) -> Option<String> {
-        if !self.free_function_mode || bare.contains("::") {
+        if bare.contains("::") {
             return Some(bare);
         }
-        let Some(pkg) = self
+        let inlined_pkg = self
+            .inlining_stack
+            .last()
+            .and_then(|n| n.rsplit_once("::"))
+            .map(|(p, _)| p);
+        let free_fn_pkg = self
             .method_class
             .as_deref()
             .and_then(|c| c.strip_prefix("__free_fn__"))
-            .filter(|p| !p.is_empty())
-        else {
+            .filter(|p| self.free_function_mode && !p.is_empty());
+        let Some(pkg) = inlined_pkg.or(free_fn_pkg) else {
             return Some(bare);
         };
         let Some(f) = self.functions else {
@@ -237,11 +243,32 @@ impl<'a> BytecodeCompiler<'a> {
         if !f.keys().any(|k| k.ends_with(suffix.as_str())) {
             return Some(bare);
         }
-        if !self.inlining_stack.is_empty() {
+        if inlined_pkg.is_none() && !self.inlining_stack.is_empty() {
             return None;
         }
         let qualified = format!("{pkg}{suffix}");
         f.contains_key(&qualified).then_some(qualified)
+    }
+
+    /// §26.3: the function-table key of `P::name(...)`, which arrives as
+    /// `Ident([P, name])` like a call through a handle or an instance. Only
+    /// when `P` names no local, signal or `P.name` instance subroutine. Not in
+    /// a class method, whose class members would capture the inlined body's
+    /// bare names.
+    fn package_callee_name(&self, pkg: &str, name: &str) -> Option<String> {
+        let functions = self.functions?;
+        if (self.method_mode && !self.free_function_mode)
+            || self.local_var_regs.contains_key(pkg)
+            || self.local_array_regs.contains_key(pkg)
+            || self.local_var_array.contains_key(pkg)
+            || self.method_handle_names.contains(pkg)
+            || self.lookup_signal_id_by_name(pkg).is_some()
+            || functions.contains_key(&format!("{pkg}.{name}"))
+        {
+            return None;
+        }
+        let key = format!("{pkg}::{name}");
+        functions.contains_key(&key).then_some(key)
     }
 
     /// `f(args).m` for a pure `f` returning an unpacked struct of scalars:
@@ -342,12 +369,20 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> Option<RegId> {
         let name = match &func.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                h.path[0].name.name.clone()
+                Some(h.path[0].name.name.clone())
             }
-            _ => {
-                self.bail("Expr_Call_func_not_single_ident");
-                return None;
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                self.package_callee_name(&h.path[0].name.name, &h.path[1].name.name)
             }
+            _ => None,
+        };
+        let Some(name) = name else {
+            self.bail("Expr_Call_func_not_single_ident");
+            return None;
         };
         let Some(name) = self.scoped_callee_name(name) else {
             self.bail("Expr_Call_pkg_scope");
