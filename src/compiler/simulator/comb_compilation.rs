@@ -53,7 +53,13 @@ impl Simulator {
     /// §25.5: normalize an indexed interface instance's modport member
     /// before building the dependency of a port connection (#1602 H09).
     pub(super) fn indexed_modport_member(&self, expr: &Expression) -> Option<Expression> {
-        if self.modport_names.is_empty() || !Self::select_entered_member_shape(expr) {
+        if self.modport_names.is_empty() {
+            return None;
+        }
+        let rooted_select = matches!(&expr.kind, ExprKind::Ident(h)
+            if h.root.as_deref() == Some("$root")
+                && h.path.iter().rev().skip(1).any(|seg| !seg.selects.is_empty()));
+        if !rooted_select && !Self::select_entered_member_shape(expr) {
             return None;
         }
         let name = self.selected_path_storage(expr, true)?;
@@ -75,12 +81,18 @@ impl Simulator {
             };
             match &e.kind {
                 ExprKind::Ident(h) => {
-                    if h.root.as_deref() == Some("$root") {
+                    let rooted = h.root.as_deref() == Some("$root");
+                    if rooted {
                         name.push_str("$root.");
                     } else if h.root.is_some() {
                         return None;
                     }
-                    for (i, seg) in h.path.iter().enumerate() {
+                    // Port substitution can mark an explicitly rooted path
+                    // whose first segment already spells out `$root`.
+                    let skip_root = usize::from(
+                        rooted && h.path.first().is_some_and(|s| s.name.name == "$root"),
+                    );
+                    for (i, seg) in h.path[skip_root..].iter().enumerate() {
                         if i != 0 {
                             name.push('.');
                         }
@@ -137,6 +149,60 @@ impl Simulator {
         let (owner, _) = stored.rsplit_once('.')?;
         (owner.contains(']') || self.module.struct_members.contains_key(owner))
             .then(|| stored.to_string())
+    }
+
+    fn fold_indexed_modport_reads(&self, expr: &mut Expression) {
+        if let Some(folded) = self.indexed_modport_member(expr) {
+            *expr = folded;
+            return;
+        }
+        match &mut expr.kind {
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Paren(operand)
+            | ExprKind::MemberAccess { expr: operand, .. } => {
+                self.fold_indexed_modport_reads(operand);
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.fold_indexed_modport_reads(left);
+                self.fold_indexed_modport_reads(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                for part in [condition, then_expr, else_expr] {
+                    self.fold_indexed_modport_reads(part);
+                }
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                for part in [expr, left, right] {
+                    self.fold_indexed_modport_reads(part);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.fold_indexed_modport_reads(count);
+                for part in exprs {
+                    self.fold_indexed_modport_reads(part);
+                }
+            }
+            ExprKind::Concatenation(parts)
+            | ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. } => {
+                for part in parts {
+                    self.fold_indexed_modport_reads(part);
+                }
+            }
+            ExprKind::NamedArg { expr: Some(value), .. } => {
+                self.fold_indexed_modport_reads(value);
+            }
+            _ => {}
+        }
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
@@ -962,8 +1028,8 @@ impl Simulator {
             if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
                 ca.lhs = folded;
             }
-            if let Some(folded) = self.indexed_modport_member(&ca.rhs) {
-                ca.rhs = folded;
+            if !self.modport_names.is_empty() && self.has_indexed_scopes() {
+                self.fold_indexed_modport_reads(&mut ca.rhs);
             }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
