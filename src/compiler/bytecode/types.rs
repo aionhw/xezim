@@ -461,6 +461,7 @@ impl<'a> BytecodeCompiler<'a> {
             let Some(name) = scoped_arrays::operand_name(arg) else {
                 continue;
             };
+            let local_width = self.local_var_regs.get(&name).map(|&(_, width)| width);
             let shape = if let Some(local) = self.local_var_array.get(&name) {
                 Some((
                     local.lo,
@@ -471,6 +472,8 @@ impl<'a> BytecodeCompiler<'a> {
                 self.local_array_regs.get(&name)
             {
                 Some((lo, lo + len as i64 - 1, width))
+            } else if local_width.is_some() {
+                None
             } else {
                 scope
                     .and_then(|scope| self.arrays.get(&cat_dot(scope, &name)))
@@ -485,7 +488,7 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         widths.insert(name.clone(), total);
                     }
-                } else if let Some(&(_, width)) = self.local_var_regs.get(&name) {
+                } else if let Some(width) = local_width {
                     widths.insert(name.clone(), width);
                 }
             }

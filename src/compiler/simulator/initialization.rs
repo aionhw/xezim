@@ -2086,6 +2086,7 @@ impl Simulator {
             let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
             let module_claims = |nm: &str| {
                 module.signals.contains_key(nm)
+                    || module.parameters.contains_key(nm)
                     || module.arrays.contains_key(nm)
                     || module.dynamic_arrays.contains(nm)
                     || module.associative_arrays.contains_key(nm)
