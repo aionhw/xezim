@@ -262,7 +262,7 @@ impl Simulator {
                             // strings unresized.
                             && !self.module.string_signals.contains(&*name)
                         {
-                            let idx = self.eval_expr(index).to_i64().unwrap_or(i64::MIN);
+                            let idx = self.eval_expr(index).to_index().unwrap_or(i64::MIN);
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
                                 return self.fast_signal_write_id(id, val);
@@ -337,7 +337,7 @@ impl Simulator {
                 matches!(shape.dims.get(depth), Some(Dim::Dyn))
             })
         {
-            let Some(j) = self.eval_expr(index).to_i64() else {
+            let Some(j) = self.eval_expr(index).to_index() else {
                 return false;
             };
             if j < 0 || j as u64 >= self.get_queue_size(&row) {
@@ -585,7 +585,9 @@ impl Simulator {
                     && !self.module.associative_arrays.contains_key(base.as_ref())
                     && !member_shadows(self, &base)
                 {
-                    let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        return false;
+                    };
                     // §7.4.1: a bit-select into a FRAME-local unpacked-struct
                     // MEMBER leaf (`rw_access.byte_en[z] = ...` inside a
                     // procedural block / foreach): the member is pre-
@@ -655,13 +657,6 @@ impl Simulator {
                     }
                 }
             }
-        }
-        // A packed member of a class collection element has no signal of
-        // its own. Resolve the packed select within the stored element.
-        if !self.no_class_objects()
-            && let Some(changed) = self.class_collection_member_index_write(expr, index, val)
-        {
-            return changed;
         }
         // BIT-select write into a PACKED-STRUCT MEMBER
         // (`t.f2[3] = 1'b1`): the member is a bit-slice of the parent
@@ -1774,38 +1769,107 @@ impl Simulator {
         false
     }
 
-    fn class_collection_member_index_write(
+    pub(in crate::compiler::simulator) fn class_collection_member_select_steps<'e>(
+        &self,
+        expr: &'e Expression,
+    ) -> Option<(
+        &'e Expression,
+        crate::ast::types::StructUnionType,
+        Vec<PendingSel<'e>>,
+    )> {
+        let mut steps = Vec::new();
+        let mut saw_member = false;
+        let mut cur = expr;
+        loop {
+            if saw_member && matches!(cur.kind, ExprKind::Index { .. }) {
+                let shadowed_local = !self.local_stack.is_empty() && {
+                    let mut root = cur;
+                    while let ExprKind::Index { expr: b, .. } = &root.kind {
+                        root = b;
+                    }
+                    matches!(&root.kind, ExprKind::Ident(h) if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && self.local_stack.last().is_some_and(|l| l.contains_key(&h.path[0].name.name)))
+                };
+                if !shadowed_local && let Some(su) = self.packed_struct_elem_type(cur) {
+                    steps.reverse();
+                    return Some((cur, su, steps));
+                }
+            }
+            match &cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Index { expr: base, index } => {
+                    steps.push(PendingSel::Index(index));
+                    cur = base;
+                }
+                ExprKind::RangeSelect {
+                    expr: base,
+                    kind,
+                    left,
+                    right,
+                } => {
+                    steps.push(PendingSel::Range {
+                        kind: *kind,
+                        left,
+                        right,
+                    });
+                    cur = base;
+                }
+                ExprKind::MemberAccess { expr: base, member } => {
+                    saw_member = true;
+                    steps.push(PendingSel::Member(&member.name));
+                    cur = base;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    pub(in crate::compiler::simulator) fn class_collection_member_select_write(
         &mut self,
-        expr: &Expression,
-        index: &Expression,
+        lhs: &Expression,
         value: &Value,
     ) -> Option<bool> {
-        let ExprKind::MemberAccess { .. } = expr.kind else {
-            return None;
-        };
-        let mut steps = vec![PendingSel::Index(index)];
-        let mut elem = expr;
-        while let ExprKind::MemberAccess { expr, member } = &elem.kind {
-            steps.push(PendingSel::Member(&member.name));
-            elem = expr;
-        }
-        if !matches!(elem.kind, ExprKind::Index { .. }) {
-            return None;
-        }
-        let ty = DataType::Struct(self.packed_struct_elem_type(elem)?);
-        steps.reverse();
+        let (elem, su, steps) = self.class_collection_member_select_steps(lhs)?;
+        let ty = DataType::Struct(su);
         let (hops, width, two_state) = self.packed_hops(&ty, &steps)?;
         let (selected_width, range) = self.packed_hops_eval(&hops, &steps);
         let Some((lsb, src, len)) = range else {
             return Some(false);
         };
         let mut current = self.eval_expr(elem).resize(width);
-        let fitted = if two_state { value.to_two_state() } else { value.clone() }
-            .resize_for_assign(selected_width);
-        for bit in 0..len {
-            current.set_bit((lsb + bit) as usize, fitted.get_bit((src + bit) as usize));
+        let fitted = if two_state && value.has_xz() {
+            value.to_two_state()
+        } else {
+            value.clone()
         }
+        .resize_for_assign(selected_width);
+        current.copy_bits_from(lsb as usize, &fitted, src as usize, len as usize);
         Some(self.assign_value(elem, &current))
+    }
+
+    pub(in crate::compiler::simulator) fn class_collection_member_select_read(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<Value> {
+        let (elem, su, steps) = self.class_collection_member_select_steps(expr)?;
+        let ty = DataType::Struct(su);
+        let (hops, width, two_state) = self.packed_hops(&ty, &steps)?;
+        let (selected_width, range) = self.packed_hops_eval(&hops, &steps);
+        let out_w = selected_width.max(1);
+        let mut out = if two_state {
+            Value::zero(out_w)
+        } else {
+            Value::new(out_w)
+        };
+        if let Some((lsb, src, len)) = range {
+            let current = self.eval_expr(elem).resize(width);
+            out.copy_bits_from(src as usize, &current, lsb as usize, len as usize);
+            if two_state && out.has_xz() {
+                out = out.to_two_state();
+            }
+        }
+        Some(out)
     }
 
     /// `pkg::x`, `pkg::arr[i]`, `pkg::v[h:l]` as an assignment TARGET: package

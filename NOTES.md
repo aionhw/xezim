@@ -87,11 +87,31 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   their declared sign (§7.4.5, #1568).
 - An unpacked struct field can hold a virtual interface and use it to
   read or write the connected interface's array (§25.9, §7.6, #1311).
+- Packed-member and unpacked-array member selects with unknown (`x`/`z`) or
+  out-of-range indices discard writes (including frozen nonblocking assignment
+  indices) and read `x` or `0` at the member's width and signedness (§7.2.1,
+  §7.4.6, §10.4.2, §11.5.1, #1561).
+- Bit-selects and constant or indexed part-selects on elements of packed-array
+  members inside packed or unpacked structs read and update their selected
+  element bits (§7.2.1, §7.4.1, §11.5.1, #1564).
+- Bit-select and part-select reads and writes on packed members of
+  class-property arrays, queues, dynamic arrays, and associative arrays resolve
+  through the owning element (§7.2.1, §8.4, §11.5.1, #1569, #1574).
+- Queue and array slices of unpacked structs, including class properties
+  initialized from assignment patterns and function returns, copy elements
+  member-wise and preserve overlapping source ranges (§7.2, §7.4.6, §7.10.1,
+  #1540).
 
 **Performance**
 
 - Packed declaration selects look up instance parameters by name, avoiding
   repeated scans of the design-wide parameter table (§23.10, #1563).
+- Unrolled constant packed-member stores compile for two-state and mixed
+  containers using `DropXz` in the bytecode VM and native backends,
+  eliminating interpreter fallbacks (§6.11.2, #1598).
+- Declared packed-struct member resolution caches layouts once per declaration
+  root using shared handles, and packed member updates splice bits in place
+  instead of cloning full layout vectors or looping bit by bit.
 
 - Edge fanouts use compact entries and event waiters allocate wide-value
   storage only when needed.

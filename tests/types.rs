@@ -922,3 +922,9 @@ mod unit_member_vs_unimported_package;
 
 #[path = "types/unit_parameter_over_hidden_enum.rs"]
 mod unit_parameter_over_hidden_enum;
+#[path = "types/packed_member_xz_index_1561.rs"]
+mod packed_member_xz_index_1561;
+#[path = "types/packed_struct_member_array_part_select_1564.rs"]
+mod packed_struct_member_array_part_select_1564;
+#[path = "types/unrolled_two_state_packed_member_store.rs"]
+mod unrolled_two_state_packed_member_store;

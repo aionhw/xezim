@@ -20,12 +20,7 @@ impl Simulator {
         lvalue: &Expression,
     ) -> Option<(String, u32, u32)> {
         let flat = self.flat_member_name(lvalue)?;
-        for (i, _) in flat
-            .match_indices('.')
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
+        for (i, _) in flat.rmatch_indices('.') {
             let (base, prefix) = (&flat[..i], &flat[i + 1..]);
             let Some(layout) = self.module.packed_struct_fields.get(base) else {
                 continue;
@@ -168,7 +163,7 @@ impl Simulator {
                     cur = expr.as_ref();
                 }
                 ExprKind::Index { expr, index } => {
-                    steps.push((None, self.eval_expr(index).to_i64()?));
+                    steps.push((None, self.eval_expr(index).to_index()?));
                     cur = expr.as_ref();
                 }
                 _ => break,
@@ -429,7 +424,7 @@ impl Simulator {
         if steps.iter().all(|(f, _)| f.is_some()) {
             return None;
         }
-        steps.push((None, self.eval_expr(idx).to_i64()?));
+        steps.push((None, self.eval_expr(idx).to_index()?));
         self.packed_path_slice(&root, &steps)
     }
 
@@ -452,13 +447,6 @@ impl Simulator {
     /// Row-major flatten of an index chain over a packed array's declared
     /// dimensions. `dims` are outermost-first `(left, right)` declared ranges;
     /// the trailing entries that describe the ELEMENT type are ignored.
-    pub(in crate::compiler::simulator) fn flatten_packed_slot(
-        indices: &[u64],
-        dims: Option<&[(i64, i64)]>,
-    ) -> Option<u32> {
-        Self::flatten_packed_slot_iter(indices.iter().map(|&index| index as i64), dims)
-    }
-
     pub(in crate::compiler::simulator) fn flatten_packed_slot_iter(
         indices: impl IntoIterator<Item = i64>,
         dims: Option<&[(i64, i64)]>,
