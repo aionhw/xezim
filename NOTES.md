@@ -10,6 +10,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- `cg.option.<name>` reads and writes the options of a covergroup declared in
+  a class, inside the class and through a handle (§19.7, §19.4, #1625).
 - Input-port substitution distinguishes escaped names containing dots from
   hierarchical references with the same spelling (§5.6.1, §23.6, PR #727).
 - Queue and array slices reached through object properties preserve their
