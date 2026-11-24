@@ -46,8 +46,7 @@ endmodule
 
 #[test]
 fn conditional_disjunctive_and_soft_bounds_are_not_promoted() {
-    check(
-        r#"
+    let src = r#"
 class C;
  rand longint unsigned x,y;
  rand bit [64:0] z;
@@ -78,6 +77,13 @@ module top;
    $display("T|PASS");
  end
 endmodule
-"#,
+"#;
+    check(src);
+    // Exercise both block orders regardless of how the hash table visits
+    // these names.
+    check(
+        &src.replace("constraint guarded", "constraint temporary")
+            .replace("constraint hard", "constraint guarded")
+            .replace("constraint temporary", "constraint hard"),
     );
 }

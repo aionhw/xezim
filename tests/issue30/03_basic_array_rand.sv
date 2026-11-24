@@ -121,6 +121,7 @@ module tb_top;
     ArrayRandomizationBus bus = new();
     int status;
     int expected_sum;
+    bit [2:0] assoc_changed = 0;
 
     repeat (20) begin
       status = bus.randomize();
@@ -139,8 +140,13 @@ module tb_top;
         `SVTEST_CHECK(bus.dyn_arr[j] == (j * 5) + bus.index_offset, "dyn_arr math mismatch")
       end
 
-      `SVTEST_CHECK(bus.assoc_arr[4'h2] != 8'hAA && bus.assoc_arr[4'h5] != 8'hBB && bus.assoc_arr[4'hA] != 8'hCC, 
-                    "Associative elements were not overwritten")
+      `SVTEST_CHECK(bus.assoc_arr.exists(4'h2) && bus.assoc_arr.exists(4'h5) &&
+                    bus.assoc_arr.exists(4'hA), "Randomization lost an associative key")
+      // A legal random draw can equal its pre_randomize value. Check that
+      // each seeded key changes at least once over the complete sample.
+      assoc_changed[0] |= bus.assoc_arr[4'h2] != 8'hAA;
+      assoc_changed[1] |= bus.assoc_arr[4'h5] != 8'hBB;
+      assoc_changed[2] |= bus.assoc_arr[4'hA] != 8'hCC;
 
       `SVTEST_CHECK(bus.test_queue.size() >= 2 && bus.test_queue.size() <= 4, "Queue size failure")
       foreach (bus.test_queue[k]) begin
@@ -177,6 +183,7 @@ module tb_top;
       `SVTEST_CHECK(bus.array_sum_val >= 20 && bus.array_sum_val <= 40, "Existential summation bound violated")
     end
 
+    `SVTEST_CHECK(&assoc_changed, "Associative elements were never randomized")
     `SVTEST_PASSFAIL
   end
 
