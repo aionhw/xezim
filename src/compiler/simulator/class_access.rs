@@ -294,15 +294,17 @@ impl Simulator {
             .cloned()
     }
 
-    /// The covergroup instance of a `cg.option.<name>` access.
+    /// The covergroup instance of a `cg.option.<name>` access: the path
+    /// before `option`, so `o.cc.option.<name>` reaches a covergroup held
+    /// by a class object. The caller checks the `option` segment.
     pub(super) fn cg_option_target(&mut self, hier: &HierarchicalIdentifier) -> Option<usize> {
-        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+        if hier.path.len() < 3 || hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
         let head = Expression::new(
             ExprKind::Ident(HierarchicalIdentifier {
                 root: hier.root.clone(),
-                path: vec![hier.path[0].clone()],
+                path: hier.path[..hier.path.len() - 2].to_vec(),
                 span: hier.span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
