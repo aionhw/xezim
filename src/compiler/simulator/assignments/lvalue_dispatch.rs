@@ -18,16 +18,24 @@ impl Simulator {
             return self.assign_value_inner(&folded, val);
         }
         // §19.7 `cg.option.<name> = v` on a covergroup instance.
-        if let ExprKind::Ident(h) = &lhs.kind {
-            if h.path.len() == 3 && h.path[1].name.name == "option" {
-                if let Some(idx) = self.cg_option_target(h) {
-                    if let Some(Some(inst)) = self.cg_heap.get_mut(idx) {
-                        inst.options
-                            .insert(h.path[2].name.name.clone(), val.clone());
-                    }
-                    return true;
+        let cg_opt = match &lhs.kind {
+            ExprKind::Ident(h) => match Self::cg_option_ident_field(h) {
+                Some(f) => {
+                    let f = f.to_string();
+                    self.cg_option_target(h).map(|i| (i, f))
                 }
+                None => None,
+            },
+            ExprKind::MemberAccess { expr: base, member } => {
+                self.cg_option_member_target(base, member)
             }
+            _ => None,
+        };
+        if let Some((idx, field)) = cg_opt {
+            if let Some(Some(inst)) = self.cg_heap.get_mut(idx) {
+                inst.options.insert(field, val.clone());
+            }
+            return true;
         }
         if !self.module.packages.is_empty() {
             if let Some(stripped) = self.strip_package_lvalue(lhs) {

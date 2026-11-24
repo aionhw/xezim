@@ -118,6 +118,13 @@ impl Simulator {
                 return self.sva_sig_read(args);
             }
             ExprKind::MemberAccess { expr: base, member } => {
+                // §19.7 `cc.option.<name>` / `this.cc.option.<name>` in the
+                // class that holds covergroup `cc`.
+                if let Some((idx, field)) = self.cg_option_member_target(base, member)
+                    && let Some(v) = self.cg_option_read(idx, &field)
+                {
+                    return v;
+                }
                 if let Some(v) = self.plain_member_read(base, member) {
                     return v;
                 }
@@ -537,9 +544,10 @@ impl Simulator {
                         }
                     }
                 }
-                if hier.path.len() == 3 && hier.path[1].name.name == "option" {
+                if let Some(field) = Self::cg_option_ident_field(hier) {
                     if let Some(idx) = self.cg_option_target(hier) {
-                        if let Some(v) = self.cg_option_read(idx, &hier.path[2].name.name) {
+                        let field = field.to_string();
+                        if let Some(v) = self.cg_option_read(idx, &field) {
                             return v;
                         }
                     }
