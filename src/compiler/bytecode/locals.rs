@@ -152,7 +152,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// inspected (no branch can land between them: conditionals compile to
     /// `Select`), and anything not recognised keeps the `DropXz`. A loop
     /// counter's `i = i + 1` / `i++` therefore costs nothing extra.
-    fn stored_value_two_state(&self, reg: RegId) -> bool {
+    pub(super) fn stored_value_two_state(&self, reg: RegId) -> bool {
         let insns = &self.insns;
         let mut end = insns.len();
         while end > 0
