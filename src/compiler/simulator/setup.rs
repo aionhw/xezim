@@ -1794,6 +1794,23 @@ impl Simulator {
         }
     }
 
+    fn register_event_always_process(&mut self, ab: &AlwaysBlock) {
+        let forever_stmt = Statement::new(
+            StatementKind::Forever {
+                body: Box::new(ab.stmt.clone()),
+            },
+            ab.stmt.span,
+        );
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        if !ab.scope.is_empty() {
+            self.process_scope_hint.insert(pid, ab.scope.clone());
+        }
+        self.process_origin
+            .insert(pid, (ab.stmt.span, "always block"));
+        self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+    }
+
     pub(super) fn classify_one_always_block(
         &mut self,
         ab: AlwaysBlock,
@@ -1830,6 +1847,33 @@ impl Simulator {
         // rewritten as `return Some(...)`.)
         Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
         Self::sva_stmt_clocks(&ab.stmt, &mut self.always_sva_clocks);
+        // §9.4.2: a selected object's property can change on an object
+        // write or when the receiver is replaced. The procedural waiter
+        // follows both, including when the receiver starts out null.
+        let indexed_object_head = if !self.module.classes.is_empty()
+            && let Some(event) = Self::leading_event(&ab.stmt)
+        {
+            let saved_hint = self.name_resolve_hint.borrow().clone();
+            if !ab.scope.is_empty() {
+                *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
+            }
+            let selected = |expr: &Expression| {
+                Self::event_expr_needs_value_wait(expr) && self.event_member_of_class_handle(expr)
+            };
+            let found = match event {
+                EventControl::EventExpr(terms) => terms.iter().any(|term| selected(&term.expr)),
+                EventControl::HierIdentifier(expr) => selected(expr),
+                _ => false,
+            };
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            found
+        } else {
+            false
+        };
+        if indexed_object_head {
+            self.register_event_always_process(&ab);
+            return None;
+        }
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -2108,23 +2152,9 @@ impl Simulator {
                     || star_kept_own_write
                     || self.event_needs_value_waiter(&sens, &ab.scope)
                 {
-                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
-                        return None;
+                    if !self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                        self.register_event_always_process(&ab);
                     }
-                    let forever_stmt = Statement::new(
-                        StatementKind::Forever {
-                            body: Box::new(ab.stmt.clone()),
-                        },
-                        ab.stmt.span,
-                    );
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    if !ab.scope.is_empty() {
-                        self.process_scope_hint.insert(pid, ab.scope.clone());
-                    }
-                    self.process_origin
-                        .insert(pid, (ab.stmt.span, "always block"));
-                    self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                     return None;
                 }
                 let mut dropped_terms: Vec<String> = Vec::new();
