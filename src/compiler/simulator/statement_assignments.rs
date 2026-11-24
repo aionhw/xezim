@@ -3355,15 +3355,20 @@ impl Simulator {
                 //    — writing the bare name lost `component::m_name =
                 //    {m_parent.get_full_name(), ".", get_name()}`, leaving
                 //    every non-top component's get_full_name() empty.
-                if self
+                if let Some(slot) = self
                     .local_stack
-                    .last()
-                    .is_some_and(|f| f.contains_key(&*lname))
+                    .last_mut()
+                    .and_then(|f| f.get_mut(&*lname))
                 {
-                    self.local_stack
-                        .last_mut()
-                        .unwrap()
-                        .insert(lname.to_string(), sval);
+                    *slot = sval;
+                    // §13.4.2: this direct frame write still updates the
+                    // shared cell of a static local or output formal.
+                    if !self.in_const_param_eval
+                        && self.static_local_names.contains(&*lname)
+                        && let Some(key) = self.static_local_key_for(&lname)
+                    {
+                        self.static_cell_sync(&lname, &key, true);
+                    }
                 } else {
                     self.assign_value(lvalue, &sval);
                 }
