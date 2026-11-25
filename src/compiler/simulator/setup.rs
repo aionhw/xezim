@@ -4152,6 +4152,11 @@ impl Simulator {
                 self.ctl_rearm(s);
             }
         }
+        if !self.ts_ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ts_ctl_rearm_pending) {
+                self.ts_ctl_rearm(s);
+            }
+        }
         for e in list {
             self.prof_clock_tree_evals += 1;
             if !matches!(

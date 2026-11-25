@@ -197,6 +197,7 @@ impl Simulator {
                 Some((_, Some(id))) => {
                     if self.forced_signals.get(&id) != Some(&v) {
                         self.forced_signals.remove(&id);
+                        self.ctl_note_external_write(id);
                         self.assign_value(&lvalue, &v);
                         let stored = self.signal_table.get(id).cloned().unwrap_or(v);
                         self.forced_signals.insert(id, stored);
@@ -253,6 +254,7 @@ impl Simulator {
                 self.packed.release_forced(id);
             } else if let Some(id) = id {
                 self.forced_signals.remove(&id);
+                self.ctl_note_external_write(id);
                 // Re-evaluate continuous drivers (nets). For a variable no
                 // comb entry writes it, so the scan finds nothing and the
                 // value is retained.
@@ -508,6 +510,7 @@ impl Simulator {
             }
         }
         self.forced_signals.remove(&id);
+        self.ctl_note_external_write(id);
         if !self.settling && !self.in_edge_block {
             let drivers: Vec<CombEntry> = self
                 .comb_writers_of(id)

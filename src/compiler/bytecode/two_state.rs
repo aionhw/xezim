@@ -634,12 +634,34 @@ pub enum TsInsn {
         lo: u32,
         v: u8,
     },
+    /// Non-blocking twin of `RangeFillXW` (e.g. `q <= {W{1'bx}}` in SRAM models).
+    RangeFillNbaXW {
+        sig: u32,
+        hi: u32,
+        lo: u32,
+        v: u8,
+    },
     /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
     /// the raw value/xz planes, already masked to the assigned width.
     ConstStoreX {
         sig: u32,
         v: u64,
         x: u64,
+    },
+    /// Non-blocking store of a folded 4-state constant (`q <= 32'bx;`).
+    ConstStoreNbaX(Box<TsRangeStoreX>),
+    /// Reduction XOR on a narrow register (`^x`, 1-bit parity).
+    RedXor {
+        d: u16,
+        s: u16,
+    },
+    /// Unsigned modulo on narrow registers (`a % b`); bails on `b == 0`
+    /// (4-state yields all-X).
+    Mod {
+        d: u16,
+        a: u16,
+        b: u16,
+        mask: u64,
     },
     /// Partial-range counterpart (`y[hi:lo] = 'x;`).
     RangeStoreX(Box<TsRangeStoreX>),
@@ -1161,6 +1183,7 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::RangeStoreDyn { sig, .. }
             | TsInsn::RangeStoreNbaDyn { sig, .. }
             | TsInsn::RangeFillXW { sig, .. }
+            | TsInsn::RangeFillNbaXW { sig, .. }
             | TsInsn::ConstStoreX { sig, .. }
             | TsInsn::Store { sig, .. }
             | TsInsn::StoreNba { sig, .. }
@@ -1175,7 +1198,9 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::WStoreNba { sig, .. }
             | TsInsn::WRangeStore { sig, .. }
             | TsInsn::WRangeStoreNba { sig, .. } => writes.push(*sig),
-            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
+            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) | TsInsn::ConstStoreNbaX(p) => {
+                writes.push(p.sig)
+            }
             // A save snapshots a signal the stream is about to store, for
             // the undo after a bail: not an input.
             TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
@@ -1232,6 +1257,8 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::CaseJmp { .. }
             | TsInsn::CaseMaskJmp { .. }
             | TsInsn::RedOr { .. }
+            | TsInsn::RedXor { .. }
+            | TsInsn::Mod { .. }
             | TsInsn::WRedOr { .. }
             | TsInsn::WRedAnd { .. }
             | TsInsn::RedAnd { .. }
@@ -2460,6 +2487,8 @@ pub fn lower_two_state(
                     | Insn::Move(..)
                     | Insn::BlockingAssign(..)
                     | Insn::BlockingAssignRange(..)
+                    | Insn::NbaAssign(..)
+                    | Insn::NbaAssignRange(..)
                     | Insn::CasezEq(..)
                     | Insn::CasexEq(..)
             )
@@ -3120,6 +3149,26 @@ pub fn lower_two_state(
                     gate!("unsupported constant comparison");
                 }
                 let w = narrow_reg!(rw, *s, "wide operand (binop-const)");
+                // `x === 1'bx` (e.g. SRAM `if (^addr === 1'bx)`): on a clean
+                // two-state register, a case-equality against a constant with
+                // X/Z bits is ALWAYS 0. Marking `has_case_eq` keeps `tsx` off
+                // so an actual X input falls back to the 4-state VM.
+                if matches!(kind, BinOpConstKind::CaseEq)
+                    && k.has_xz()
+                    && !k.is_real
+                    && !k.is_fill
+                    && k.width <= 64
+                    && xfill[*s as usize].is_none()
+                {
+                    has_case_eq = true;
+                    def!(rw, *d, 1);
+                    rc[*d as usize] = Some(0);
+                    out.push(TsInsn::Const { d: *d as u16, v: 0 });
+                    if let Insn::CmpBranchConst(_, _, _, _, t) = insn {
+                        out.push(TsInsn::Jmp { t: *t });
+                    }
+                    continue;
+                }
                 let v = clean_const(k)?;
                 let both_sg = sg[*s as usize] && k.is_signed;
                 if both_sg && w < k.width && mn!(*s) {
@@ -3479,6 +3528,32 @@ pub fn lower_two_state(
                         s: *src as u16,
                         mask: ts_mask(sw),
                     }
+                });
+            }
+            Insn::ReduceXor(d, src) => {
+                let sw = narrow_reg!(rw, *src, "wide operand (redxor)");
+                let _ = sw;
+                def!(rw, *d, 1);
+                out.push(TsInsn::RedXor {
+                    d: *d as u16,
+                    s: *src as u16,
+                });
+            }
+            Insn::Mod(d, a, b) => {
+                let (wa, wb) = (
+                    narrow_reg!(rw, *a, "wide operand (mod)"),
+                    narrow_reg!(rw, *b, "wide operand (mod)"),
+                );
+                if sg[*a as usize] && sg[*b as usize] {
+                    gate!("signed mod");
+                }
+                let w = wa.max(wb);
+                def!(rw, *d, w);
+                out.push(TsInsn::Mod {
+                    d: *d as u16,
+                    a: *a as u16,
+                    b: *b as u16,
+                    mask: ts_mask(w),
                 });
             }
             // A signed tag on a narrow register: the LoadSignalSigned
@@ -3968,6 +4043,19 @@ pub fn lower_two_state(
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("nba dest oob/real");
                 }
+                if let Some((v, _)) = xfill[*r as usize] {
+                    if signal_widths[sig] != *w || *w == 0 {
+                        gate!("x-fill nba dest shape");
+                    }
+                    side_effects = true;
+                    out.push(TsInsn::RangeFillNbaXW {
+                        sig: sig as u32,
+                        hi: *w - 1,
+                        lo: 0,
+                        v,
+                    });
+                    continue;
+                }
                 if let Some(bit) = wfill[*r as usize] {
                     if signal_widths[sig] != *w || *w == 0 {
                         gate!("fill dest shape");
@@ -3984,6 +4072,21 @@ pub fn lower_two_state(
                 let Some(cw) = rw[*r as usize] else {
                     gate!("untracked source (nba)");
                 };
+                if let Some((v, x)) = xc[*r as usize] {
+                    if signal_widths[sig] != *w || *w == 0 || *w > 64 {
+                        gate!("x-const nba dest shape");
+                    }
+                    let m = ts_mask(cw.min(*w));
+                    side_effects = true;
+                    out.push(TsInsn::ConstStoreNbaX(Box::new(TsRangeStoreX {
+                        sig: sig as u32,
+                        hi: *w - 1,
+                        lo: 0,
+                        v: v & m,
+                        x: x & m,
+                    })));
+                    continue;
+                }
                 if *w > 64 {
                     if *w > 512 || cw != *w || signal_signed[sig] {
                         gate!("wide nba dest shape");
@@ -4440,7 +4543,9 @@ pub fn lower_two_state(
                 | TsInsn::RangeStoreDyn { .. }
                 | TsInsn::RangeStoreNbaDyn { .. }
                 | TsInsn::RangeFillXW { .. }
+                | TsInsn::RangeFillNbaXW { .. }
                 | TsInsn::ConstStoreX { .. }
+                | TsInsn::ConstStoreNbaX(..)
                 | TsInsn::RangeStoreX(..)
                 | TsInsn::RangeStoreW { .. }
                 | TsInsn::RangeStoreNbaW { .. }
@@ -4552,6 +4657,7 @@ pub fn lower_two_state(
             | TsInsn::RangeStoreDyn { sig, .. }
             | TsInsn::RangeStoreNbaDyn { sig, .. }
             | TsInsn::RangeFillXW { sig, .. }
+            | TsInsn::RangeFillNbaXW { sig, .. }
             | TsInsn::RangeStoreNbaW { sig, .. }
             | TsInsn::RangeFillW { sig, .. }
             | TsInsn::RangeFillNbaW { sig, .. }
@@ -4559,7 +4665,9 @@ pub fn lower_two_state(
             | TsInsn::WRangeStoreNba { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
-            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
+            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) | TsInsn::ConstStoreNbaX(p) => {
+                writes.push(p.sig)
+            }
             TsInsn::NbaFromElem(op) | TsInsn::WNbaFromElem(op) => writes.push(op.dst),
             TsInsn::ElemStoreNbaFromSig(f) => {
                 let op = &f.op;

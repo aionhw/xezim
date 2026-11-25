@@ -887,15 +887,45 @@ impl Simulator {
         let deps = &self.comb_dep_entries;
         self.comb_observer = (self.comb_entries.iter().enumerate())
             .map(|(i, e)| {
-                matches!(
-                    e.item,
-                    CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
-                ) && e.cold.write_signal_ids.iter().all(|&w| {
-                    w + 1 >= offs.len()
-                        || deps[offs[w] as usize..offs[w + 1] as usize]
-                            .iter()
-                            .all(|&d| d as usize == i)
-                })
+                // Only hold back entries that can observe transient values
+                // (AST blocks, assertions/displays/fallbacks, coverage hits,
+                // NBAs, or self-reading accumulators). Pure next-state
+                // `always @*` / `always_comb` blocks whose writes feed only
+                // flops are idempotent and settle in-place in pass 0.
+                let has_side_effect = match &e.item {
+                    CombItem::AlwaysBlock { .. } => true,
+                    CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                        compiled.has_fallback
+                            || e.has_unresolved_reads
+                            || compiled.instructions.iter().any(|ins| {
+                                matches!(
+                                    ins,
+                                    super::bytecode::Insn::CovHit(_)
+                                        | super::bytecode::Insn::Format(..)
+                                        | super::bytecode::Insn::NbaAssign(..)
+                                        | super::bytecode::Insn::NbaAssignConst(..)
+                                        | super::bytecode::Insn::NbaAssignRange(..)
+                                        | super::bytecode::Insn::NbaAssignRangeDyn(..)
+                                        | super::bytecode::Insn::NbaAssignBitDyn(..)
+                                        | super::bytecode::Insn::NbaAssignArray(..)
+                                        | super::bytecode::Insn::NbaAssignArrayRange(..)
+                                        | super::bytecode::Insn::NbaAssignArrayRead(..)
+                                )
+                            })
+                            || e.cold
+                                .write_signal_ids
+                                .iter()
+                                .any(|w| e.cold.read_signal_ids.contains(w))
+                    }
+                    _ => false,
+                };
+                has_side_effect
+                    && e.cold.write_signal_ids.iter().all(|&w| {
+                        w + 1 >= offs.len()
+                            || deps[offs[w] as usize..offs[w + 1] as usize]
+                                .iter()
+                                .all(|&d| d as usize == i)
+                    })
             })
             .collect();
         self.comb_has_observer = self.comb_observer.iter().any(|&o| o);
@@ -2153,6 +2183,13 @@ impl Simulator {
                 }
             }
             self.ctl_build();
+            let mut ts_ctl_added = false;
+            for eidx in 0..self.ts_hdr.len() {
+                ts_ctl_added |= self.ts_ctl_try_register(eidx);
+            }
+            if ts_ctl_added {
+                self.ts_ctl_dsts.sort_unstable();
+            }
             self.build_mux_guards();
             if self.gate_lane_valid && self.gate_lane.len() == self.comb_entries.len() {
                 self.refresh_gate_routes();
@@ -2163,6 +2200,13 @@ impl Simulator {
                 for &eidx in pending.iter() {
                     self.bit_sens_patch(eidx as usize);
                 }
+            }
+            let mut ts_ctl_added = false;
+            for &eidx in pending.iter() {
+                ts_ctl_added |= self.ts_ctl_try_register(eidx as usize);
+            }
+            if ts_ctl_added {
+                self.ts_ctl_dsts.sort_unstable();
             }
             self.bit_sens_pending = pending;
             self.bit_sens_pending.clear();
@@ -2312,22 +2356,44 @@ impl Simulator {
     /// Turn every `CombItem::CtlGate` back into its `FusedGate` and restore
     /// the static masks of the edges it held (when they are still in place).
     pub(super) fn ctl_revert(&mut self) {
-        if self.ctl_gates.is_empty() {
+        if self.ctl_gates.is_empty() && self.ts_ctl.is_empty() {
             return;
         }
-        for e in self.comb_entries.iter_mut() {
-            if let CombItem::CtlGate { slot } = e.item {
-                e.item = CombItem::FusedGate {
-                    op: self.ctl_gates[slot as usize].op,
-                };
+        if !self.ctl_gates.is_empty() {
+            for e in self.comb_entries.iter_mut() {
+                if let CombItem::CtlGate { slot } = e.item {
+                    e.item = CombItem::FusedGate {
+                        op: self.ctl_gates[slot as usize].op,
+                    };
+                }
+            }
+            if self.comb_dep_edges.len() == self.comb_dep_entries.len() {
+                for g in &self.ctl_gates {
+                    let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+                    if let Some(edges) = self.comb_dep_edges.get_mut(lo..hi) {
+                        for e in edges {
+                            e.mask = g.smask;
+                        }
+                    }
+                }
             }
         }
-        if self.comb_dep_edges.len() == self.comb_dep_entries.len() {
-            for g in &self.ctl_gates {
-                let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
-                if let Some(edges) = self.comb_dep_edges.get_mut(lo..hi) {
-                    for e in edges {
-                        e.mask = g.smask;
+        if !self.ts_ctl.is_empty() && self.comb_dep_edges.len() == self.comb_dep_entries.len() {
+            for c in &self.ts_ctl {
+                if c.masked {
+                    let (lo0, hi0) = (c.pos0 as usize, (c.pos0 + c.npos0) as usize);
+                    if let Some(edges) = self.comb_dep_edges.get_mut(lo0..hi0) {
+                        for e in edges {
+                            e.mask = c.smask0;
+                        }
+                    }
+                    if c.npos1 != 0 {
+                        let (lo1, hi1) = (c.pos1 as usize, (c.pos1 + c.npos1) as usize);
+                        if let Some(edges) = self.comb_dep_edges.get_mut(lo1..hi1) {
+                            for e in edges {
+                                e.mask = c.smask1;
+                            }
+                        }
                     }
                 }
             }
@@ -2336,6 +2402,10 @@ impl Simulator {
         self.ctl_sig.clear();
         self.ctl_dsts.clear();
         self.ctl_rearm_pending.clear();
+        self.ts_ctl.clear();
+        self.ts_ctl_by_entry.clear();
+        self.ts_ctl_dsts.clear();
+        self.ts_ctl_rearm_pending.clear();
         self.gate_lane_valid = false;
     }
 
@@ -2543,33 +2613,48 @@ impl Simulator {
         r
     }
 
-    /// An external write (deposit) to signal `id`: a `CtlGate` driving it
-    /// must see its high-fanout input again, so the next toggle re-evaluates
-    /// the gate and overwrites the deposit exactly as an unmasked gate does.
+    /// An external write (deposit / VPI / force / release) to signal `id`:
+    /// any `CtlGate` or `TsCtl` driving it must see its masked input(s) again,
+    /// so the next toggle re-evaluates and overwrites the write exactly as an
+    /// unmasked driver does.
     pub(super) fn ctl_note_external_write(&mut self, id: usize) {
-        if self.ctl_dsts.is_empty() {
-            return;
-        }
-        let id = id as u32;
-        let start = self.ctl_dsts.partition_point(|&(d, _)| d < id);
-        let slots: Vec<u32> = self.ctl_dsts[start..]
-            .iter()
-            .take_while(|&&(d, _)| d == id)
-            .map(|&(_, s)| s)
-            .collect();
-        if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
-            for s in slots {
-                self.ctl_rearm(s);
+        let id32 = id as u32;
+        if !self.ctl_dsts.is_empty() {
+            let start = self.ctl_dsts.partition_point(|&(d, _)| d < id32);
+            let slots: Vec<u32> = self.ctl_dsts[start..]
+                .iter()
+                .take_while(|&&(d, _)| d == id32)
+                .map(|&(_, s)| s)
+                .collect();
+            if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
+                for s in slots {
+                    self.ctl_rearm(s);
+                }
+            } else {
+                self.ctl_rearm_pending.extend(slots);
             }
-        } else {
-            self.ctl_rearm_pending.extend(slots);
+        }
+        if !self.ts_ctl_dsts.is_empty() {
+            let start = self.ts_ctl_dsts.partition_point(|&(d, _)| d < id32);
+            let slots: Vec<u32> = self.ts_ctl_dsts[start..]
+                .iter()
+                .take_while(|&&(d, _)| d == id32)
+                .map(|&(_, s)| s)
+                .collect();
+            if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
+                for s in slots {
+                    self.ts_ctl_rearm(s);
+                }
+            } else {
+                self.ts_ctl_rearm_pending.extend(slots);
+            }
         }
     }
 
     /// `$deposit(target, ...)`: re-arm the gates driving the target's
     /// signal, or every gate when the target does not resolve statically.
     pub(super) fn ctl_note_deposit(&mut self, target: &Expression) {
-        if self.ctl_dsts.is_empty() {
+        if self.ctl_dsts.is_empty() && self.ts_ctl_dsts.is_empty() {
             return;
         }
         let mut root = target;
@@ -2579,7 +2664,12 @@ impl Simulator {
         match self.get_lhs_signal_id(root) {
             Some(id) => self.ctl_note_external_write(id),
             None => {
-                let all: Vec<u32> = self.ctl_dsts.iter().map(|&(d, _)| d).collect();
+                let all: Vec<u32> = self
+                    .ctl_dsts
+                    .iter()
+                    .chain(self.ts_ctl_dsts.iter())
+                    .map(|&(d, _)| d)
+                    .collect();
                 for d in all {
                     self.ctl_note_external_write(d as usize);
                 }
@@ -2595,6 +2685,256 @@ impl Simulator {
                 e.mask = g.smask;
             }
         }
+    }
+
+    pub(super) fn ts_ctl_rearm(&mut self, slot: u32) {
+        let Some(c) = self.ts_ctl.get_mut(slot as usize) else {
+            return;
+        };
+        if !c.masked {
+            return;
+        }
+        c.masked = false;
+        let (pos0, npos0, smask0) = (c.pos0, c.npos0, c.smask0);
+        let (pos1, npos1, smask1) = (c.pos1, c.npos1, c.smask1);
+        let (lo0, hi0) = (pos0 as usize, (pos0 + npos0) as usize);
+        if let Some(es) = self.comb_dep_edges.get_mut(lo0..hi0) {
+            for e in es {
+                e.mask = smask0;
+            }
+        }
+        if npos1 != 0 {
+            let (lo1, hi1) = (pos1 as usize, (pos1 + npos1) as usize);
+            if let Some(es) = self.comb_dep_edges.get_mut(lo1..hi1) {
+                for e in es {
+                    e.mask = smask1;
+                }
+            }
+        }
+    }
+
+    /// Register dynamic controlling-value edge masking (`TsCtl`) for a
+    /// specialized two-state arena entry (`TS_AND_EQ`, `TS_AND_BIT`,
+    /// `TS_AND2`, `TS_OR2`) once its static edge masks are in `comb_dep_edges`.
+    /// Returns true if a slot was registered (caller sorts `ts_ctl_dsts`).
+    pub(super) fn ts_ctl_try_register(&mut self, eidx: usize) -> bool {
+        use super::bytecode::TsInsn::*;
+        const TS_CTL_MIN_FANOUT: u32 = 16;
+        if !self.ctl_on
+            || !self.sdf_delays.is_empty()
+            || self.comb_dep_edges.len() != self.comb_dep_entries.len()
+        {
+            return false;
+        }
+        if self.ts_ctl_by_entry.get(eidx).copied().unwrap_or(u32::MAX) != u32::MAX {
+            return false;
+        }
+        let Some(h) = self.ts_hdr.get(eidx).copied() else {
+            return false;
+        };
+        let kind = h.kind();
+        if !matches!(
+            kind,
+            Self::TS_AND_EQ | Self::TS_AND_BIT | Self::TS_AND2 | Self::TS_OR2
+        ) {
+            return false;
+        }
+        let Some(entry) = self.comb_entries.get(eidx) else {
+            return false;
+        };
+        if entry.has_unresolved_reads
+            || !matches!(entry.item, CombItem::CompiledContAssign { .. })
+            || self
+                .is_clock_tree_entry
+                .get(eidx)
+                .copied()
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        let nsig = self.comb_dep_offsets.len().saturating_sub(1);
+        let offs = &self.comb_dep_offsets;
+        let fanout = |s: u32| -> u32 {
+            let s = s as usize;
+            if s < nsig { offs[s + 1] - offs[s] } else { 0 }
+        };
+        let insns = &self.ts_arena[h.off as usize..h.off as usize + h.len()];
+        let (dst, en, data0, data1_opt, ctl_is_sig2): (u32, u32, u32, Option<u32>, bool) =
+            match kind {
+                Self::TS_AND_EQ => match insns {
+                    [
+                        LoadSigSigRange {
+                            sig: en, sig2: s1, ..
+                        },
+                        SigRangeEq { sig: s2, .. },
+                        LogAndStore { sig: dst, .. },
+                    ]
+                    | [
+                        LoadSig { sig: en, .. },
+                        SigRangeW { sig: s1, .. },
+                        SigRangeEq { sig: s2, .. },
+                        LogAndStore { sig: dst, .. },
+                    ]
+                    | [
+                        LoadSigSigRange {
+                            sig: en, sig2: s1, ..
+                        },
+                        SigRangeW { sig: s2, .. },
+                        Eq { .. },
+                        LogAndStore { sig: dst, .. },
+                    ]
+                    | [
+                        LoadSig { sig: en, .. },
+                        SigRangeW { sig: s1, .. },
+                        SigRangeW { sig: s2, .. },
+                        Eq { .. },
+                        LogAndStore { sig: dst, .. },
+                    ] => {
+                        let d1 = if s1 == s2 { None } else { Some(*s2) };
+                        (*dst, *en, *s1, d1, false)
+                    }
+                    _ => return false,
+                },
+                Self::TS_AND_BIT => match insns {
+                    [
+                        LoadSigSigRange {
+                            sig: en, sig2: s1, ..
+                        },
+                        Bit { .. },
+                        LogAndStore { sig: dst, .. },
+                    ]
+                    | [
+                        LoadSig { sig: en, .. },
+                        SigRangeW { sig: s1, .. },
+                        Bit { .. },
+                        LogAndStore { sig: dst, .. },
+                    ]
+                    | [
+                        LoadSig { sig: en, .. },
+                        SigBit { sig: s1, .. } | SigBitW { sig: s1, .. },
+                        LogAndStore { sig: dst, .. },
+                    ] => (*dst, *en, *s1, None, false),
+                    _ => return false,
+                },
+                Self::TS_AND2 | Self::TS_OR2 => match insns {
+                    [
+                        LoadSig2 { sig1, sig2, .. },
+                        LogAndStore { sig: dst, .. } | LogOrStore { sig: dst, .. },
+                    ] => {
+                        if fanout(*sig1) >= fanout(*sig2) {
+                            (*dst, *sig2, *sig1, None, true)
+                        } else {
+                            (*dst, *sig1, *sig2, None, false)
+                        }
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            };
+        let max_fo = fanout(data0).max(data1_opt.map_or(0, fanout));
+        if max_fo < TS_CTL_MIN_FANOUT {
+            return false;
+        }
+        // Distinctness & declared-net check (mirrors `ctl_build`).
+        if dst == en
+            || dst == data0
+            || data1_opt == Some(dst)
+            || en == data0
+            || data1_opt == Some(en)
+        {
+            return false;
+        }
+        if !self
+            .name_opt(dst as usize)
+            .is_some_and(|n| self.module.nets.contains(n))
+        {
+            return false;
+        }
+        if self
+            .is_clock_tree_signal
+            .get(en as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let e = eidx as u32;
+        let edge_range = |sig: u32| -> (usize, usize) {
+            let s = sig as usize;
+            if s >= nsig {
+                return (0, 0);
+            }
+            let (lo, hi) = (offs[s] as usize, offs[s + 1] as usize);
+            let deps = &self.comb_dep_entries[lo..hi];
+            let k = lo + deps.partition_point(|&d| d < e);
+            let mut k2 = k;
+            while k2 < hi && self.comb_dep_entries[k2] == e {
+                k2 += 1;
+            }
+            (k, k2)
+        };
+        // Controlling input must have an active edge to `eidx` (never masked).
+        let (en_lo, en_hi) = edge_range(en);
+        if en_lo == en_hi
+            || self.comb_dep_edges[en_lo..en_hi]
+                .iter()
+                .any(|d| d.mask == 0)
+        {
+            return false;
+        }
+        let (k0, k0_end) = edge_range(data0);
+        if k0 == k0_end {
+            return false;
+        }
+        let smask0 = self.comb_dep_edges[k0].mask;
+        if smask0 == 0
+            || self.comb_dep_edges[k0..k0_end]
+                .iter()
+                .any(|d| d.mask != smask0)
+        {
+            return false;
+        }
+        let (pos1, npos1, smask1) = if let Some(data1) = data1_opt {
+            let (k1, k1_end) = edge_range(data1);
+            if k1 == k1_end {
+                return false;
+            }
+            let sm1 = self.comb_dep_edges[k1].mask;
+            if sm1 == 0
+                || self.comb_dep_edges[k1..k1_end]
+                    .iter()
+                    .any(|d| d.mask != sm1)
+            {
+                return false;
+            }
+            (k1 as u32, (k1_end - k1) as u32, sm1)
+        } else {
+            (0, 0, 0)
+        };
+        if self.ctl_sig.len() < nsig {
+            self.ctl_sig.resize(nsig, false);
+        }
+        self.ctl_sig[data0 as usize] = true;
+        if let Some(data1) = data1_opt {
+            self.ctl_sig[data1 as usize] = true;
+        }
+        let slot = self.ts_ctl.len() as u32;
+        self.ts_ctl.push(TsCtl {
+            pos0: k0 as u32,
+            npos0: (k0_end - k0) as u32,
+            smask0,
+            pos1,
+            npos1,
+            smask1,
+            masked: false,
+            ctl_is_sig2,
+        });
+        if self.ts_ctl_by_entry.len() <= eidx {
+            self.ts_ctl_by_entry.resize(self.comb_entries.len(), u32::MAX);
+        }
+        self.ts_ctl_by_entry[eidx] = slot;
+        self.ts_ctl_dsts.push((dst, slot));
+        true
     }
 
     /// Resolve the dispatch plan for a comb entry: two-state island if the
@@ -2634,16 +2974,27 @@ impl Simulator {
                         {
                             let off = self.ts_arena.len() as u32;
                             self.ts_arena.extend(ts.insns.iter().cloned());
-                            let kind = if !cfg!(feature = "opcode-census") && Self::is_slice_transfer(&ts.insns) {
-                                Self::TS_SLICE_TRANSFER
-                            } else if !cfg!(feature = "opcode-census")
-                                && self.ts_mux_stream_on
-                                && Self::ts_kind_of(&ts) == 1
-                                && Self::is_mux_stream(&ts.insns)
-                            {
-                                Self::TS_MUX_STREAM
+                            let base_kind = Self::ts_kind_of(&ts);
+                            let kind = if !cfg!(feature = "opcode-census") && base_kind == 1 {
+                                if Self::is_slice_transfer(&ts.insns) {
+                                    Self::TS_SLICE_TRANSFER
+                                } else if Self::is_and_eq_stream(&ts.insns) {
+                                    Self::TS_AND_EQ
+                                } else if Self::is_and_bit_stream(&ts.insns) {
+                                    Self::TS_AND_BIT
+                                } else if Self::is_and2_stream(&ts.insns) {
+                                    Self::TS_AND2
+                                } else if Self::is_or2_stream(&ts.insns) {
+                                    Self::TS_OR2
+                                } else if Self::is_eq_store_stream(&ts.insns) {
+                                    Self::TS_EQ_STORE
+                                } else if self.ts_mux_stream_on && Self::is_mux_stream(&ts.insns) {
+                                    Self::TS_MUX_STREAM
+                                } else {
+                                    base_kind
+                                }
                             } else {
-                                Self::ts_kind_of(&ts)
+                                base_kind
                             };
                             self.ts_hdr[eidx] = TsHdr {
                                 off,

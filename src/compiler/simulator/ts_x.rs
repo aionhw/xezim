@@ -593,6 +593,28 @@ impl Simulator {
                         };
                         set!(*d, p);
                     }
+                    TsInsn::RedXor { d, s } => {
+                        let (sv, sx) = (v!(*s), x!(*s));
+                        set!(
+                            *d,
+                            if sx != 0 {
+                                (0, 1)
+                            } else {
+                                ((sv.count_ones() & 1) as u64, 0)
+                            }
+                        );
+                    }
+                    TsInsn::Mod { d, a, b, mask } => {
+                        let (av, ax, bv, bx) = (v!(*a), x!(*a), v!(*b), x!(*b));
+                        set!(
+                            *d,
+                            if (ax | bx) != 0 || bv == 0 {
+                                (0, *mask)
+                            } else {
+                                ((av % bv) & mask, 0)
+                            }
+                        );
+                    }
                     TsInsn::Concat { d, parts } => {
                         // §11.4.12: preserve both planes of a full-word
                         // first part without shifting zero by 64.
@@ -853,6 +875,13 @@ impl Simulator {
                     }
                     TsInsn::RangeFillXW { sig, hi, lo, v } => {
                         self.ts_wide_range_fill_xz(*sig as usize, *lo, *hi, *v);
+                    }
+                    TsInsn::RangeFillNbaXW { sig, hi, lo, v } => {
+                        self.ts_wide_range_fill_nba_xz(*sig as usize, *lo, *hi, *v);
+                    }
+                    TsInsn::ConstStoreNbaX(p) => {
+                        let w = p.hi.saturating_sub(p.lo) + 1;
+                        self.ts_store_nba_xz(p.sig as usize, p.v, p.x, w);
                     }
                     // ---- array elements (§7.4.6 / §11.5.1: an x or out-of-range
                     // index reads all-x and writes nothing) ----

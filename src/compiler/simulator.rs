@@ -2259,6 +2259,12 @@ pub struct Simulator {
     /// nets).
     quiet_bits: Vec<u64>,
     quiet_valid: bool,
+    /// Latched at settle entry when no global write observer (VCD dump, value
+    /// trace, commit plan, inline-bits mirror, force exprs, edge/dirty hooks,
+    /// arm/profile census) is active. Lets `after_signal_write_inner` decide
+    /// quiet vs armed-edge with one bool + one bitmap load.
+    #[serde(skip)]
+    fast_quiet_obs: bool,
     prof_quiet_stores: u64,
     prof_observed_stores: u64,
     /// Native two-state streams (XEZIM_TS_JIT=1, jit feature): per comb
@@ -4013,6 +4019,17 @@ pub struct Simulator {
     ctl_dsts: Vec<(u32, u32)>,
     /// Slots re-armed while the settle held the dependency edges.
     ctl_rearm_pending: Vec<u32>,
+    /// Dynamic controlling-value edge masks for specialized two-state arena
+    /// entries (`TS_AND_EQ`, `TS_AND_BIT`, `TS_AND2`, `TS_OR2`).
+    ts_ctl: Vec<TsCtl>,
+    /// `ts_ctl_by_entry[eidx]` holds the `ts_ctl` slot index, or `u32::MAX`.
+    /// Empty when no two-state entry is masked.
+    ts_ctl_by_entry: Vec<u32>,
+    /// `(destination signal, slot)` of every `TsCtl`, sorted: an external
+    /// write to a destination (deposit / VPI / force / release) re-arms it.
+    ts_ctl_dsts: Vec<(u32, u32)>,
+    /// `ts_ctl` slots re-armed while the settle held the dependency edges.
+    ts_ctl_rearm_pending: Vec<u32>,
     /// XEZIM_CTL_MASK=0, or a settle mode that evaluates entries outside the
     /// canonical loop (partitioned / level-BSP), turns the skip off.
     ctl_on: bool,
