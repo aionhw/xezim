@@ -29,6 +29,33 @@ fn lines(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// §10.4.2: parentheses preserve the member values captured by each NBA.
+#[test]
+fn nonblocking_copy_captures_parenthesized_struct_leaves() {
+    let out = lines(
+        r#"
+module top;
+  typedef struct { logic [3:0] n; int i; } item_t;
+  item_t src, plain, wrapped, delayed;
+  bit clk;
+  always @(posedge clk) begin
+    plain <= src;
+    wrapped <= ((src));
+    delayed <= #3 (src);
+  end
+  initial begin
+    src = '{4'hb, 25};
+    #1 clk = 1;
+    #1 $display("R immediate %h,%0d %h,%0d", plain.n, plain.i, wrapped.n, wrapped.i);
+    src = '{4'hf, 50};
+    #3 $display("R delayed %h,%0d", delayed.n, delayed.i);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["R immediate b,25 b,25", "R delayed b,25"]);
+}
+
 #[test]
 fn compiled_processes_copy_whole_structs() {
     let out = lines(

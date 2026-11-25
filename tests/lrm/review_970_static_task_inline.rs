@@ -13,6 +13,50 @@ fn lines(src: &str) -> Vec<String> {
     sim.output.iter().map(|o| o.message.clone()).collect()
 }
 
+/// §6.21, §8.6, §13.4.2: automatic declarations belong to the callee.
+#[test]
+fn static_task_preserves_automatic_callee_initializers() {
+    let src = r#"
+module top;
+  class C;
+    function int method_value(int a);
+      int local_value = a + 2;
+      return local_value;
+    endfunction
+  endclass
+  C c;
+  function automatic int function_value(int a);
+    int local_value = a + 1;
+    return local_value;
+  endfunction
+  task static run_checks(int a);
+    int function_result, method_result;
+    function_result = function_value(a);
+    method_result = c.method_value(a);
+    begin
+      static int calls = 0;
+      calls++;
+      $display("values=%0d,%0d calls=%0d", function_result, method_result, calls);
+    end
+  endtask
+  initial begin
+    c = new;
+    run_checks(10);
+    run_checks(20);
+    run_checks(30);
+  end
+endmodule
+"#;
+    assert_eq!(
+        lines(src),
+        [
+            "values=11,12 calls=1",
+            "values=21,22 calls=2",
+            "values=31,32 calls=3"
+        ]
+    );
+}
+
 #[test]
 fn written_first_locals_inline_and_carried_locals_stay_static() {
     let src = r#"module top;
