@@ -102,7 +102,16 @@ impl Simulator {
             crate::ast::types::DataType::TypeReference {
                 name, dimensions, ..
             } if name.has_scope() => {
-                super::elaborate::specialized_class_scope_width(name, &self.module).and_then(|w| {
+                let inherited = name.scopes.last().is_some_and(|scope| {
+                    self.class_local_typedef_decl(&scope.name.name, &name.name.name)
+                        .is_some_and(|(owner, _)| owner != scope.name.name)
+                });
+                let width = inherited
+                    .then(|| self.packed_struct_layout_in_ctx(data_type))
+                    .flatten()
+                    .and_then(|fields| fields.iter().map(|(_, offset, width)| offset + width).max())
+                    .or_else(|| super::elaborate::specialized_class_scope_width(name, &self.module));
+                width.and_then(|w| {
                     let mut total: u64 = u64::from(w);
                     for d in dimensions {
                         let crate::ast::types::PackedDimension::Range { left, right, .. } = d

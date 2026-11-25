@@ -297,13 +297,14 @@ impl Simulator {
         // the type it names, and so does a class typedef of such a typedef
         // (`typedef vec_t word_t;`, §6.18).
         let local;
+        let mut declaring_class = self.class_context_stack.last().cloned().flatten()?;
         let is_class_typedef = matches!(dt, DataType::TypeReference { .. });
         let dt = match dt {
             DataType::TypeReference {
                 name, dimensions, ..
             } if dimensions.is_empty() && !name.has_scope() => {
-                let ctx = self.class_context_stack.last().cloned().flatten()?;
-                let mut target = self.class_local_typedef(&ctx, &name.name.name)?;
+                let (mut owner, mut target) =
+                    self.class_local_typedef_decl(&declaring_class, &name.name.name)?;
                 for _ in 0..16 {
                     let DataType::TypeReference {
                         name, dimensions, ..
@@ -314,11 +315,15 @@ impl Simulator {
                     if !dimensions.is_empty() || name.has_scope() {
                         break;
                     }
-                    match self.class_local_typedef(&ctx, &name.name.name) {
-                        Some(next) => target = next,
+                    match self.class_local_typedef_decl(owner, &name.name.name) {
+                        Some((next_owner, next)) => {
+                            owner = next_owner;
+                            target = next;
+                        }
                         None => break,
                     }
                 }
+                declaring_class = owner.to_string();
                 local = target.clone();
                 &local
             }
@@ -350,10 +355,18 @@ impl Simulator {
             return is_class_typedef.then(|| resolve_type_width(dt, None, None));
         }
         let ctx = self.class_context_stack.last().cloned().flatten()?;
-        let spec = match &self.current_spec {
+        let mut spec = match &self.current_spec {
             Some((b, _)) if *b == ctx || self.class_extends(&ctx, b) => self.current_spec.clone(),
             _ => self.inherited_param_spec(&ctx),
         };
+        // §6.18/§8.25: an inherited typedef's dimensions use the
+        // declaring specialization, including an expression in extends.
+        if let Some((base, signature)) = &spec
+            && *base != declaring_class
+            && let Some(sig) = self.ancestor_spec(base, signature, &declaring_class)
+        {
+            spec = Some((declaring_class.clone(), sig));
+        }
         let saved = std::mem::replace(&mut self.current_spec, spec);
         let from_spec = self.class_spec_value_params();
         self.current_spec = saved;
@@ -361,7 +374,7 @@ impl Simulator {
         // than copied over them: this runs on every call of a method with
         // such a formal.
         let mut top = from_spec.unwrap_or_default();
-        let mut cur = Some(ctx);
+        let mut cur = Some(declaring_class);
         let mut guard = 0;
         while let Some(cn) = cur {
             guard += 1;

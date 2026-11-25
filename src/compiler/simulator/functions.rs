@@ -2403,6 +2403,21 @@ impl Simulator {
         }
     }
 
+    /// Value bindings for a typedef declared in an ancestor of the active
+    /// specialization (§6.18, §8.25).
+    fn class_typedef_spec_params(
+        &mut self,
+        base: &str,
+        signature: &str,
+        owner: &str,
+    ) -> Option<HashMap<String, Value>> {
+        let sig = self.ancestor_spec(base, signature, owner)?;
+        let saved = self.current_spec.replace((owner.to_string(), sig));
+        let params = self.class_spec_value_params();
+        self.current_spec = saved;
+        params
+    }
+
     pub(super) fn packed_struct_layout_in_ctx(
         &mut self,
         dt: &DataType,
@@ -2418,11 +2433,25 @@ impl Simulator {
             && name.has_scope()
             && let Some(scope) = name.scopes.last()
             && let Some(cls) = self.module.classes.get(&scope.name.name).cloned()
-            && let Some(target_dt) = self.class_local_typedef(&cls.name, &name.name.name).cloned()
+            && let Some((owner, target_dt)) = self.class_local_typedef_decl(&cls.name, &name.name.name)
         {
-            let target_dt = self
-                .follow_class_local_typedef(&cls.name, &target_dt)
-                .unwrap_or(target_dt);
+            let owner = owner.to_string();
+            let target_dt = self.follow_class_local_typedef(&owner, target_dt).unwrap_or_else(|| target_dt.clone());
+            if owner != cls.name {
+                let args = scope.type_args.iter().map(|arg| self.expr_to_spec_fragment(arg)).collect::<Option<Vec<_>>>()?;
+                let sig = self.canonicalize_spec_sig(&cls.name, &args.join(","));
+                let mut params = self.module.parameters.clone();
+                self.populate_class_chain_params(&owner, &mut params);
+                if let Some(spec) = self.class_typedef_spec_params(&cls.name, &sig, &owner) {
+                    params.extend(spec);
+                }
+                return super::elaborate::packed_struct_field_layout(
+                    &target_dt,
+                    &params,
+                    &self.module.typedefs,
+                    &self.module.typedef_types,
+                );
+            }
             if !scope.type_args.is_empty() || self.class_chain_has_value_params(&cls.name) {
                 let mut params = self.module.parameters.clone();
                 self.populate_class_chain_params(&cls.name, &mut params);
@@ -2499,8 +2528,16 @@ impl Simulator {
                         params.extend(spec_map);
                     }
                     if let Some(h) = self.this_stack.last().copied().flatten() {
-                        for (pn, v) in self.instance_value_params(h) {
-                            params.insert(pn, v);
+                        params.extend(self.instance_value_params(h));
+                    }
+                    if let DataType::TypeReference { name, .. } = dt
+                        && let Some((owner, _)) = self.class_local_typedef_decl(&ctx, &name.name.name)
+                        && owner != ctx
+                        && let Some((base, sig)) = self.current_spec.clone()
+                    {
+                        let owner = owner.to_string();
+                        if let Some(spec) = self.class_typedef_spec_params(&base, &sig, &owner) {
+                            params.extend(spec);
                         }
                     }
                     return super::elaborate::packed_struct_field_layout(

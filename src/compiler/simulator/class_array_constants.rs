@@ -480,13 +480,21 @@ impl Simulator {
     /// §10.9.1 / §10.8: pattern elements are assigned in the context of the
     /// declared element type, including its width, signing and state domain.
     fn class_array_element_value(&mut self, expr: &Expression, layout: &ClassArrayLayout) -> Value {
+        let value = if layout.string || layout.real {
+            self.eval_expr(expr)
+        } else {
+            self.eval_expr_ctx(expr, layout.width)
+        };
+        self.fit_class_array_element(value, layout)
+    }
+
+    fn fit_class_array_element(&self, value: Value, layout: &ClassArrayLayout) -> Value {
         if layout.string {
-            return self.eval_expr(expr);
+            return value;
         }
         if layout.real {
-            return Value::from_f64(self.eval_expr(expr).to_f64());
+            return Value::from_f64(value.to_f64());
         }
-        let value = self.eval_expr_ctx(expr, layout.width);
         let mut value = self.fit_pattern_item_value(value, layout.width);
         if layout.two_state {
             value = value.to_two_state();
@@ -642,22 +650,44 @@ impl Simulator {
         leaf: &str,
         init: &Expression,
     ) {
-        let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
-            return;
-        };
         let signature = self.canonicalize_spec_sig(class, "");
         let saved_spec = self.current_spec.replace((class.to_string(), signature));
         self.class_context_stack.push(Some(class.to_string()));
         self.this_stack.push(None);
         if let Some(layout) = self.class_array_layout(class, leaf) {
-            for (index, value) in self.class_array_pattern_values(items, &layout) {
-                self.signals
-                    .insert(format!("{}::{}[{}]", class, leaf, index), value);
-            }
+            self.store_class_fixed_array_init(&format!("{class}::{leaf}"), init, &layout);
         }
         self.this_stack.pop();
         self.class_context_stack.pop();
         self.current_spec = saved_spec;
+    }
+
+    /// §10.9.1 and §10.10: both pattern and unpacked concatenation
+    /// initializers store elements in declared order, starting at the left bound.
+    pub(super) fn store_class_fixed_array_init(
+        &mut self,
+        key: &str,
+        init: &Expression,
+        layout: &ClassArrayLayout,
+    ) {
+        let values = match &Self::unparen(init.peel_typed_pattern()).kind {
+            ExprKind::AssignmentPattern(items) => self.class_array_pattern_values(items, layout),
+            ExprKind::Concatenation(items) => {
+                let values = self.unpacked_concat_operand_values(items.iter().collect(), true, None);
+                let indices = layout.indices();
+                if values.len() != indices.len() {
+                    return;
+                }
+                indices
+                    .into_iter()
+                    .zip(values.into_iter().map(|v| self.fit_class_array_element(v, layout)))
+                    .collect()
+            }
+            _ => return,
+        };
+        for (index, value) in values {
+            self.signals.insert(format!("{key}[{index}]"), value);
+        }
     }
 
     pub(super) fn class_array_pattern_values(

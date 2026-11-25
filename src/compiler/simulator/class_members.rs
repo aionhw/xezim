@@ -2651,13 +2651,17 @@ impl Simulator {
 
     /// The target of typedef `tn` declared in class `cn` or an ancestor.
     pub(super) fn class_local_typedef(&self, cn: &str, tn: &str) -> Option<&DataType> {
+        self.class_local_typedef_decl(cn, tn).map(|(_, dt)| dt)
+    }
+
+    pub(super) fn class_local_typedef_decl(&self, cn: &str, tn: &str) -> Option<(&str, &DataType)> {
         let mut cur: Option<&str> = Some(cn);
         let mut guard = 0;
         while let Some(c) = cur {
             guard += 1;
             let cd = self.module.classes.get(c)?;
             if let Some(dt) = cd.typedef_targets.get(tn) {
-                return Some(dt);
+                return Some((&cd.name, dt));
             }
             if guard > 64 {
                 return None;

@@ -1619,16 +1619,8 @@ impl Simulator {
                         self.signals.insert(elem, default.clone());
                     }
                 }
-                if let Some(init) = init
-                    && let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind
-                {
-                    for (index, value) in self.class_array_pattern_values(items, &layout) {
-                        let mut elem = spec_key.clone();
-                        elem.push('[');
-                        Self::push_i64(&mut elem, index);
-                        elem.push(']');
-                        self.signals.insert(elem, value);
-                    }
+                if let Some(init) = init {
+                    self.store_class_fixed_array_init(&spec_key, &init, &layout);
                 }
             } else {
                 let w = default_w.max(1);
