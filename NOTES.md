@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Assignment patterns copy unpacked-struct array properties field by field,
+  including into multidimensional class properties. Delayed blocking
+  assignments sample those fields before the delay (§7.6, §9.4.5, §10.9.1,
+  #1553, #1554).
 - Runtime SDF annotation delays complex drivers of zero-delay specify paths
   and rejects pulses shorter than the annotated delay (§30.7, §32.9, #1630, #1631).
 - Library modules retain their source timescales and contribute to the
