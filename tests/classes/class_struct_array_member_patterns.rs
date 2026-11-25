@@ -67,3 +67,49 @@ endmodule
         ]
     );
 }
+
+/// §7.6 and §10.9.1: a class-property array can be the value of a
+/// multidimensional array's positional pattern item.
+#[test]
+fn array_pattern_copies_rows_from_class_struct_arrays() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int a; byte b; } S;
+  class C;
+    S rows[2];
+    S dst[2][2];
+    function void copy();
+      dst = '{rows, this.rows};
+      $display("class %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][1].a, dst[1][0].b);
+      dst[1][0].a = 9;
+    endfunction
+  endclass
+  C c;
+  S dst[2][2];
+  initial begin
+    c = new;
+    c.rows[0] = '{1, 2};
+    c.rows[1] = '{3, 4};
+    dst = '{c.rows, c.rows};
+    $display("module %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][1].a, dst[1][0].b);
+    c.copy();
+    $display("updated %0d %0d", c.dst[1][0].a, c.rows[0].a);
+    dst = '{c.dst[1], c.dst[0]};
+    $display("rows %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][0].a, dst[1][1].b);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim
+        .output
+        .iter()
+        .map(|line| line.message.as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        ["module 1 4 3 2", "class 1 4 3 2", "updated 9 1", "rows 9 4 1 4"]
+    );
+}

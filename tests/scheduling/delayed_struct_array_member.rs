@@ -153,3 +153,37 @@ module top;
 endmodule"#);
     assert_eq!(lines, ["pending 0 0", "arrived 6 7"]);
 }
+
+/// §7.6 and §9.4.5: sample every field of a class-property array before
+/// delaying the procedural assignment.
+#[test]
+fn procedural_delay_captures_class_struct_array_fields() {
+    let lines = run(r#"
+module top;
+  typedef struct { int a; byte b; } S;
+  class C;
+    S rows[2];
+    S dst[2];
+    task copy();
+      rows[0] = '{1, 2};
+      rows[1] = '{3, 4};
+      fork
+        dst = #2 rows;
+        #1 begin
+          rows[0].a = 9;
+          rows[1].b = 8;
+          $display("pending %0d %0d", dst[0].a, dst[1].b);
+        end
+      join
+      $display("saved %0d %0d %0d %0d", dst[0].a, dst[0].b, dst[1].a, dst[1].b);
+    endtask
+  endclass
+  C c;
+  initial begin
+    c = new;
+    c.copy();
+  end
+endmodule
+"#);
+    assert_eq!(lines, ["pending 0 0", "saved 1 2 3 4"]);
+}
