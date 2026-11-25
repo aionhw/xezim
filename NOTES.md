@@ -10,6 +10,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Overlapping unpacked-struct array slices retain the original field values,
+  and copies between a queue and a descending fixed array follow the latter's
+  declared order (§7.4.6, §7.6, §7.10).
+- Delayed struct-array assignments evaluate a computed row index once and
+  sample queue lengths and element fields before suspending (§7.6, §9.4.5).
+- Specialized static associative arrays use their concrete key type, and
+  dimension queries report the fixed array's specialized bounds (§7.8, §8.25,
+  §20.7).
+- Type aliases in a derived class preserve the declaring specialization of
+  their inherited packed target (§6.18, §8.25).
 - Direct copies preserve unpacked-struct fields across fixed class arrays,
   multidimensional class rows and module arrays (§7.6, §8.4).
 - Delayed blocking array assignments sample fields reached through a computed
