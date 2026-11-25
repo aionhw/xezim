@@ -127,8 +127,21 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   initialized from assignment patterns and function returns, copy elements
   member-wise and preserve overlapping source ranges (§7.2, §7.4.6, §7.10.1,
   #1540).
+- Parameterized class static collections and fixed-size arrays isolate per
+  specialization, materialize on pre-instantiation scoped reads and writes, and
+  preserve parameter-dependent element widths (§8.9, §8.25).
+- Fixed-size array class property assignment patterns evaluate their items in
+  the declared element type context (§10.9.1).
+- Inherited and parameterized class-scoped packed typedefs and packed structs
+  retain their declaring-scope widths and field offsets across properties,
+  arrays, queues, method formals (`output`/`inout`/`ref`), and specialized scope
+  declarations (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Class instantiation and startup skip redundant property-initializer sorting,
+  duplicate parameter-map cloning, and unused static collection copies; packed
+  property width lookups hit the cache without cloning parameter maps or values.
 
 - Packed declaration selects look up instance parameters by name, avoiding
   repeated scans of the design-wide parameter table (§23.10, #1563).

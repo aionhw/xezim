@@ -324,12 +324,13 @@ impl Simulator {
             }
             _ => dt,
         };
-        let dims = match dt {
+        let (dims, packed_struct) = match dt {
             DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
                 if !dimensions.is_empty() =>
             {
-                dimensions
+                (Some(dimensions), false)
             }
+            DataType::Struct(su) if su.packed => (None, true),
             _ => return None,
         };
         let range_ok = |d: &crate::ast::types::PackedDimension,
@@ -343,7 +344,9 @@ impl Simulator {
         // §6.18, §8.13: the class's typedef target can already have its
         // bounds folded in the declaring class. Falling back to the bare
         // design typedef loses that width when the bound was a class constant.
-        if dims.iter().all(|d| range_ok(d, None)) {
+        if let Some(dims) = dims
+            && dims.iter().all(|d| range_ok(d, None))
+        {
             return is_class_typedef.then(|| resolve_type_width(dt, None, None));
         }
         let ctx = self.class_context_stack.last().cloned().flatten()?;
@@ -389,7 +392,7 @@ impl Simulator {
             base: &self.module.parameters,
             top: &top,
         };
-        if !dims.iter().all(|d| range_ok(d, Some(&env))) {
+        if !packed_struct && let Some(dims) = dims && !dims.iter().all(|d| range_ok(d, Some(&env))) {
             return None;
         }
         Some(crate::elaborate::resolve_type_width_env(

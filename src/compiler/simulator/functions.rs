@@ -2281,7 +2281,7 @@ impl Simulator {
         {
             self.module.packed_full_dims.insert(name.to_string(), fdims);
         }
-        if let DataType::Struct(su) = self.resolve_dt(dt) {
+        if let DataType::Struct(su) = self.resolve_dt_in_ctx(dt) {
             for m in &su.members {
                 let (ew, fd) = super::elaborate::packed_member_meta(
                     &m.data_type,
@@ -2306,13 +2306,221 @@ impl Simulator {
                 }
             }
         }
-        if let Some(fields) = self.formal_struct_layout(dt) {
-            if !fields.is_empty() {
-                self.module
-                    .packed_struct_fields
-                    .insert(name.to_string(), fields);
+        if let Some(fields) = self.packed_struct_layout_in_ctx(dt)
+            && !fields.is_empty()
+            && self
+                .module
+                .packed_struct_fields
+                .get(name)
+                .is_none_or(|cur| cur.as_slice() != fields.as_slice())
+        {
+            self.module
+                .packed_struct_fields
+                .insert(name.to_string(), fields);
+        }
+    }
+
+    pub(super) fn resolve_dt_in_ctx(&self, dt: &DataType) -> DataType {
+        if let Some(Some(ctx)) = self.class_context_stack.last().as_ref() {
+            let mut cur = dt;
+            for _ in 0..16 {
+                let DataType::TypeReference {
+                    name,
+                    dimensions,
+                    type_args,
+                    ..
+                } = cur
+                else {
+                    break;
+                };
+                if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
+                    break;
+                }
+                match self.class_local_typedef(ctx, &name.name.name) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            return self.resolve_dt(cur);
+        }
+        self.resolve_dt(dt)
+    }
+
+    fn follow_class_local_typedef(&self, cls_name: &str, init_dt: &DataType) -> Option<DataType> {
+        let mut local: Option<DataType> = None;
+        let mut cur = init_dt;
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } = cur
+            else {
+                break;
+            };
+            if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
+                break;
+            }
+            match self.class_local_typedef(cls_name, &name.name.name) {
+                Some(next) => {
+                    local = Some(next.clone());
+                    cur = local.as_ref().unwrap();
+                }
+                None => break,
             }
         }
+        local
+    }
+
+    fn populate_class_chain_params(&self, cls_name: &str, params: &mut HashMap<String, Value>) {
+        let mut chain = Vec::new();
+        let mut c = Some(cls_name.to_string());
+        while let Some(cn) = c {
+            if chain.len() >= 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            chain.push(cd);
+            c = cd.extends.clone();
+        }
+        for cd in chain.iter().rev() {
+            for (pn, init) in &cd.param_defaults {
+                if let Some(init) = init {
+                    let env = super::elaborate::ParamEnv::Overlay {
+                        base: &self.module.parameters,
+                        top: params,
+                    };
+                    if let Some(v) =
+                        super::elaborate::const_eval_i64_with_params_env(init, Some(&env))
+                    {
+                        params.insert(pn.clone(), Value::from_u64(v as u64, 32));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn packed_struct_layout_in_ctx(
+        &mut self,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32)>> {
+        if let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+            && dimensions.is_empty()
+            && type_args.is_empty()
+            && name.has_scope()
+            && let Some(scope) = name.scopes.last()
+            && let Some(cls) = self.module.classes.get(&scope.name.name).cloned()
+            && let Some(target_dt) = self.class_local_typedef(&cls.name, &name.name.name).cloned()
+        {
+            let target_dt = self
+                .follow_class_local_typedef(&cls.name, &target_dt)
+                .unwrap_or(target_dt);
+            if !scope.type_args.is_empty() || self.class_chain_has_value_params(&cls.name) {
+                let mut params = self.module.parameters.clone();
+                self.populate_class_chain_params(&cls.name, &mut params);
+                let mut overridden: HashSet<String> = HashSet::default();
+                for (i, arg) in scope.type_args.iter().enumerate() {
+                    let (pn, e) = match &arg.kind {
+                        ExprKind::NamedArg {
+                            name: pn,
+                            expr: Some(e),
+                        } if !cls.type_param_names.iter().any(|t| t == &pn.name) => {
+                            (pn.name.clone(), e.as_ref())
+                        }
+                        ExprKind::NamedArg { .. } => continue,
+                        _ => match cls.param_order.get(i) {
+                            Some(pn) if !cls.type_param_names.iter().any(|t| t == pn) => {
+                                (pn.clone(), arg)
+                            }
+                            _ => continue,
+                        },
+                    };
+                    let val = {
+                        let env = super::elaborate::ParamEnv::Overlay {
+                            base: &self.module.parameters,
+                            top: &params,
+                        };
+                        super::elaborate::const_eval_i64_with_params_env(e, Some(&env))
+                            .map(|v| Value::from_u64(v as u64, 32))
+                    }
+                    .unwrap_or_else(|| self.eval_expr(e));
+                    params.insert(pn.clone(), val);
+                    overridden.insert(pn);
+                }
+                if !overridden.is_empty() {
+                    for (pn, init) in &cls.param_defaults {
+                        if !overridden.contains(pn)
+                            && let Some(init) = init
+                        {
+                            let env = super::elaborate::ParamEnv::Overlay {
+                                base: &self.module.parameters,
+                                top: &params,
+                            };
+                            if let Some(v) =
+                                super::elaborate::const_eval_i64_with_params_env(init, Some(&env))
+                            {
+                                params.insert(pn.clone(), Value::from_u64(v as u64, 32));
+                            }
+                        }
+                    }
+                }
+                return super::elaborate::packed_struct_field_layout(
+                    &target_dt,
+                    &params,
+                    &self.module.typedefs,
+                    &self.module.typedef_types,
+                )
+                .or_else(|| Self::untagged_union_layout(&self.module, &target_dt));
+            }
+            return super::elaborate::packed_struct_field_layout(
+                &target_dt,
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            )
+            .or_else(|| Self::untagged_union_layout(&self.module, &target_dt));
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let local = self.follow_class_local_typedef(&ctx, dt);
+            if local.is_some() || self.class_chain_has_value_params(&ctx) {
+                let target_dt = local.as_ref().unwrap_or(dt);
+                if self.class_chain_has_value_params(&ctx) {
+                    let mut params = self.module.parameters.clone();
+                    self.populate_class_chain_params(&ctx, &mut params);
+                    if let Some(spec_map) = self.class_spec_value_params() {
+                        params.extend(spec_map);
+                    }
+                    if let Some(h) = self.this_stack.last().copied().flatten() {
+                        for (pn, v) in self.instance_value_params(h) {
+                            params.insert(pn, v);
+                        }
+                    }
+                    return super::elaborate::packed_struct_field_layout(
+                        target_dt,
+                        &params,
+                        &self.module.typedefs,
+                        &self.module.typedef_types,
+                    )
+                    .or_else(|| Self::untagged_union_layout(&self.module, target_dt));
+                }
+                return super::elaborate::packed_struct_field_layout(
+                    target_dt,
+                    &self.module.parameters,
+                    &self.module.typedefs,
+                    &self.module.typedef_types,
+                )
+                .or_else(|| Self::untagged_union_layout(&self.module, target_dt));
+            }
+        }
+        self.formal_struct_layout(dt)
     }
 
     /// `packed_struct_field_layout` of a formal's type, memoized per named
