@@ -129,13 +129,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   #1540).
 - Parameterized class static collections and fixed-size arrays isolate per
   specialization, materialize on pre-instantiation scoped reads and writes, and
-  preserve parameter-dependent element widths (§8.9, §8.25).
+  preserve parameter-dependent element widths. Fixed static arrays accept
+  unpacked concatenation initializers (§8.9, §8.25, §10.10).
 - Fixed-size array class property assignment patterns evaluate their items in
   the declared element type context (§10.9.1).
 - Inherited and parameterized class-scoped packed typedefs and packed structs
   retain their declaring-scope widths and field offsets across properties,
   arrays, queues, method formals (`output`/`inout`/`ref`), and specialized scope
-  declarations (§6.18, §8.13, §8.25, §13.5.1).
+  declarations, including when the base parameters come from an expression in
+  the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
 
