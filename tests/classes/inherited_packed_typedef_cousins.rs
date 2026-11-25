@@ -224,3 +224,41 @@ endmodule
     let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
     assert_eq!(lines, ["method 11 11 12 7ff", "scope 11 7ff 12 7ff out=7ff"]);
 }
+
+/// §6.18 and §8.25: each link of a typedef follows its lexical scope.
+/// An alias does not change the owner of inherited packed bounds.
+#[test]
+fn derived_aliases_use_the_original_typedef_specialization() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  class A #(int W=4);
+    localparam int L=W+1;
+    typedef bit[L-1:0] scalar;
+    typedef struct packed { bit[L-1:0] payload; bit flag; } packet;
+  endclass
+  class B #(int N=6) extends A#(N+2);
+    typedef scalar alias_t;
+    typedef packet packet_t;
+    localparam int L=99;
+    function void run();
+      alias_t a='1;
+      packet_t b='1;
+      $display("nested %0d %0d %0h",$bits(a),$bits(b),b.payload);
+    endfunction
+  endclass
+  initial begin
+    B#(8) b=new;
+    B#(8)::alias_t a='1;
+    B#(8)::packet_t p='1;
+    b.run();
+    $display("scoped %0d %0h %0d %0h",$bits(a),a,$bits(p),p.payload);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["nested 11 12 7ff", "scoped 11 7ff 12 7ff"]);
+}

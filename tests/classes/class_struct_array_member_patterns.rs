@@ -182,3 +182,57 @@ endmodule
     let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
     assert_eq!(lines, ["fixed nested 42 17 42 17"]);
 }
+
+/// §7.4.6 and §7.6: an overlapping struct-array slice samples each
+/// field before any destination element is overwritten.
+#[test]
+fn overlapping_class_struct_array_slices_copy_every_field() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int n; byte b; } S;
+  class C; S a[3:0]; endclass
+  C c;
+  S out_arr[2];
+  initial begin
+    c=new;
+    c.a[3]='{1,11}; c.a[2]='{2,22}; c.a[1]='{3,33}; c.a[0]='{4,44};
+    out_arr=c.a[3:2];
+    c.a[2:1]=c.a[3:2];
+    $display("slice %0d %0d %0d %0d %0d %0d",out_arr[0].n,out_arr[1].b,c.a[2].n,c.a[2].b,c.a[1].n,c.a[1].b);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["slice 1 22 1 11 2 22"]);
+}
+
+/// §7.6 and §7.10: copying a queue to a descending fixed array and back
+/// preserves element order and all unpacked struct fields.
+#[test]
+fn class_queue_and_descending_fixed_struct_array_copy_in_order() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int n; } S;
+  class C; S a[5:4]; S q[$]; endclass
+  C c;
+  S q[$];
+  initial begin
+    c=new;
+    c.q = '{'{7},'{9}};
+    c.a=c.q;
+    q=c.a;
+    $display("rank %0d %0d %0d %0d %0d",c.a[5].n,c.a[4].n,q.size(),q[0].n,q[1].n);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["rank 7 9 2 7 9"]);
+}

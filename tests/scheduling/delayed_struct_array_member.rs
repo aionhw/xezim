@@ -217,3 +217,49 @@ endmodule
 "#);
     assert_eq!(lines, ["receiver 1 11 14"]);
 }
+
+/// §7.6 and §9.4.5: a delayed row copy samples a computed selector and
+/// the selected struct fields once, before the delay.
+#[test]
+fn delayed_class_row_selector_runs_once() {
+    let lines = run(r#"
+module top;
+  typedef struct { int n; } S;
+  class C; S a[3:1][2]; endclass
+  C c;
+  S out_arr[2];
+  int calls;
+  function int pick(); calls++; return 2; endfunction
+  initial begin
+    c=new; c.a[2][0].n=7; c.a[2][1].n=9;
+    fork
+      out_arr = #3 c.a[pick()];
+      #1 c.a[2][0].n=99;
+    join
+    $display("index %0d %0d %0d",calls,out_arr[0].n,out_arr[1].n);
+  end
+endmodule
+"#);
+    assert_eq!(lines, ["index 1 7 9"]);
+}
+
+/// §7.6 and §9.4.5: a delayed blocking queue copy samples the source
+/// length and each struct field before later writes or pops.
+#[test]
+fn delayed_struct_queue_copy_preserves_elements_and_size() {
+    let lines = run(r#"
+module top;
+  typedef struct { int n; byte b; } S;
+  S source[$], target[$];
+  initial begin
+    source = '{'{7,11},'{9,13}};
+    fork
+      target = #3 source;
+      #1 begin source[0].n=99; source.pop_back(); end
+    join
+    $display("queue %0d %0d %0d",target.size(),target[0].n,target[1].b);
+  end
+endmodule
+"#);
+    assert_eq!(lines, ["queue 2 7 13"]);
+}

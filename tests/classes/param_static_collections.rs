@@ -122,3 +122,51 @@ endmodule
     let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
     assert_eq!(lines, ["static 8 9 10 8 9 2 ff"]);
 }
+
+/// §7.8 and §8.25: a static associative array uses the specialization’s
+/// concrete key type for lookup, including narrowing integral keys.
+#[test]
+fn specialized_static_associative_keys_use_the_bound_type() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef string key_t;
+  class C #(type K=string, int W=8);
+    static bit [W-1:0] tab[K];
+  endclass
+  initial begin
+    C#(key_t,8)::tab["alpha"]=11;
+    C#(key_t,8)::tab["bravo"]=22;
+    C#(bit[2:0],4)::tab[11]=4'hd;
+    $display("key %0d %0d %0d %0d %0d",C#(key_t,8)::tab.num(),C#(key_t,8)::tab["alpha"],C#(key_t,8)::tab["bravo"],C#(bit[2:0],4)::tab.num(),C#(bit[2:0],4)::tab[3]);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["key 2 11 22 1 13"]);
+}
+
+/// §8.25 and §20.7: a query of a directly named specialization reports
+/// the fixed static member’s actual bounds rather than default bounds.
+#[test]
+fn specialized_static_queries_use_actual_array_bounds() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  class P #(int N=4);
+    static logic [N-1:0] data[N:N-2] = '{'1,2,3};
+  endclass
+  initial begin
+    $display("shape %0d %0d %0d %0d %0d %0d", $size(P#(8)::data),$left(P#(8)::data),$right(P#(8)::data),$bits(P#(8)::data),$bits(P#(8)::data[8]),$bits(P#(4)::data[4]));
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["shape 3 8 6 24 8 4"]);
+}
