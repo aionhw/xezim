@@ -196,6 +196,43 @@ fn module_timescale_applies_to_v_library_modules() {
     );
 }
 
+/// §3.14, §22.7: library definitions retain their own directive, and their
+/// finer precision must be known before scaling the primary design's delays.
+#[test]
+fn library_timescale_sets_delays_and_global_precision() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("library_timescale_1632");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("child.v"), r#"`timescale 1ps/1fs
+module child(input clk, output reg constant_nba, variable_nba, blocking);
+  integer d = 218;
+  always @(posedge clk) constant_nba <= #218 1'b1;
+  always @(posedge clk) variable_nba <= #(d) 1'b1;
+  always @(posedge clk) #218.25 blocking = 1;
+endmodule
+"#).unwrap();
+    std::fs::write(dir.join("top.v"), r#"`timescale 1ns/1ns
+module top;
+  reg clk = 0;
+  wire a,b,c;
+  child u(clk,a,b,c);
+  initial begin #1 clk=1; #1 $printtimescale(top.u); $finish; end
+  always @(posedge a) $display("constant %.2f", $realtime*1000);
+  always @(posedge b) $display("variable %.2f", $realtime*1000);
+  always @(posedge c) $display("blocking %.2f", $realtime*1000);
+endmodule
+"#).unwrap();
+    for args in [
+        &["-v", "child.v", "top.v"][..],
+        &["-y", ".", "top.v"][..],
+        &["child.v", "top.v"][..],
+    ] {
+        let output = run(&dir, args);
+        for line in ["constant 1218.00", "variable 1218.00", "blocking 1218.25", "1ps / 1fs"] {
+            assert!(output.contains(line), "{args:?}: {output}");
+        }
+    }
+}
+
 /// #937: a library file supplies modules, not packages. A package the `-v`
 /// file declares (here through an `include`) is not compiled, so the adopted
 /// module's `import` of it is an error at that import, in the library file,

@@ -900,3 +900,56 @@ endmodule
     let out = run("udp_sdf", src, &[("d.sdf", sdf)], &[]);
     check("UDP annotated delay", &out, &["120 q=1", "224 q=0"]);
 }
+
+/// §30.7, §32.9: runtime IOPATH annotation keeps the delay and cancels a
+/// pending update for both simple and complex zero-delay path drivers.
+#[test]
+fn runtime_sdf_delays_zero_paths_and_rejects_short_pulses() {
+    let src = r#"`timescale 1ps/1ps
+module timed_cell(input a,b,c, output copy, fused, primitive_out, expression_out);
+  assign copy = a;
+  and (fused, a, b);
+  and (primitive_out, a, b, c);
+  assign expression_out = a & b & c;
+  specify
+    (a => copy) = 0;
+    (a => fused) = 0;
+    (a => primitive_out) = 0;
+    (a => expression_out) = 0;
+  endspecify
+endmodule
+module tb;
+  reg a, control;
+  wire y0,y1,y2,y3;
+  timed_cell u(a,control,control,y0,y1,y2,y3);
+  initial begin
+    $sdf_annotate("d.sdf");
+    a=0; control=1;
+    #100 a=1; #10 a=0;
+    #90 a=1; #100 a=0;
+    #100 $finish;
+  end
+  always @(y0) if ($time >= 100) $display("%0d ps y0=%b", $time, y0);
+  always @(y1) if ($time >= 100) $display("%0d ps y1=%b", $time, y1);
+  always @(y2) if ($time >= 100) $display("%0d ps y2=%b", $time, y2);
+  always @(y3) if ($time >= 100) $display("%0d ps y3=%b", $time, y3);
+endmodule
+"#;
+    let sdf = r#"(DELAYFILE (TIMESCALE 1ps)
+      (CELL (CELLTYPE "timed_cell") (INSTANCE u) (DELAY (ABSOLUTE
+        (IOPATH a copy (30) (30)) (IOPATH a fused (31) (31))
+        (IOPATH a primitive_out (32) (32)) (IOPATH a expression_out (33) (33))))))"#;
+    let expected = [
+        "230 y0=1", "231 y1=1", "232 y2=1", "233 y3=1",
+        "330 y0=0", "331 y1=0", "332 y2=0", "333 y3=0",
+    ];
+    let out = run("sdf_late_zero_paths", src, &[("d.sdf", sdf)], &[]);
+    check("runtime SDF", &out, &expected);
+    let out = run(
+        "sdf_cli_zero_paths",
+        &src.replace("$sdf_annotate(\"d.sdf\");", ""),
+        &[("d.sdf", sdf)],
+        &["--sdf", "d.sdf"],
+    );
+    check("CLI SDF", &out, &expected);
+}
