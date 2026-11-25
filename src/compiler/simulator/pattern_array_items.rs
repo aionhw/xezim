@@ -131,7 +131,7 @@ impl Simulator {
     /// Each select in it is checked with `cond_expr_is_effect_free`; `this`
     /// at the root of the chain (`this.rows`) names the handle and runs
     /// nothing.
-    fn operand_chain_effect_free(e: &Expression) -> bool {
+    pub(super) fn operand_chain_effect_free(e: &Expression) -> bool {
         match &Self::unparen(e).kind {
             ExprKind::This => true,
             ExprKind::MemberAccess { expr, .. } => Self::operand_chain_effect_free(expr),

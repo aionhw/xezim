@@ -2753,8 +2753,15 @@ impl Simulator {
                         let (di, si) = (format!("{}{}", d, sfx), format!("{}{}", sname, sfx));
                         if let Some(inner) = &elem_su {
                             self.copy_unpacked_struct(&di, &si, inner);
-                        } else if let Some(v) = self.get_signal_value_by_name(&si) {
-                            self.write_leaf_by_name(&di, v);
+                        } else if let Some(v) = self.struct_leaf_value(&si) {
+                            let is_str = matches!(
+                                self.resolve_dt_ref(&m.data_type),
+                                DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            );
+                            self.write_struct_leaf(&di, v, is_str);
                         }
                     }
                 }
@@ -2779,6 +2786,9 @@ impl Simulator {
     pub(super) fn write_struct_leaf(&mut self, flat: &str, v: Value, is_str: bool) {
         if let Some((h, key)) = flat.split_once('#')
             && let Ok(h) = h.parse::<usize>()
+            && !flat.split_once('[').is_some_and(|(root, _)| {
+                self.module.arrays_2d.contains_key(root) || self.module.arrays_nd.contains_key(root)
+            })
             && let Some(Some(inst)) = self.heap.get_mut(h)
             && let Some(old) = inst.properties.get_mut(key)
         {

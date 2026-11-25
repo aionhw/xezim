@@ -1759,6 +1759,22 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §7.6: a fixed class array of unpacked structs copies its fields,
+        // before the collection and scalar paths can consume either operand.
+        if !self.no_class_objects()
+            && matches!(
+                rvalue.kind,
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+            )
+            && (self.lvalue_root_is_unpacked_struct_prop(lvalue, true)
+                || self.lvalue_root_is_unpacked_struct_prop(rvalue, true))
+            && Self::operand_chain_effect_free(lvalue)
+            && Self::operand_chain_effect_free(rvalue)
+            && self.copy_multi_dim_array(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         if self.assign_class_scalar_row(lvalue, rvalue) {
             self.settle_after_proc_write();
             return;
@@ -2036,6 +2052,18 @@ impl Simulator {
         // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
         // reads back, which is what left every element 0.
         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+            // A fixed class-array element uses its heap leaves even when
+            // a module array has the same name as the property (§8.4).
+            if matches!(lvalue.kind, ExprKind::Index { .. })
+                && self.lvalue_root_is_unpacked_struct_prop(lvalue, false)
+                && Self::operand_chain_effect_free(lvalue)
+                && self.class_unpacked_elem_is_heap_owned(lvalue)
+                && let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue)
+            {
+                self.assign_class_unpacked_elem(lvalue, rvalue, &su);
+                self.settle_after_proc_write();
+                return;
+            }
             if let Some((handle, prop, su)) = self
                 .lvalue_root_is_unpacked_struct_prop(lvalue, true)
                 .then(|| self.class_unpacked_array_prop_of(lvalue))
