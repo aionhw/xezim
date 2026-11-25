@@ -1465,7 +1465,14 @@ impl Simulator {
                 && Self::const_elem_ref(&ca.rhs, &self.module)
                     .and_then(|(base, idx)| self.elem_cell(&base, &idx))
                     .is_some_and(is_packed_id);
-            let item = if has_transition_delay || packed_array_copy {
+            // §30.7, §32.9: a zero-delay specify path can acquire a runtime
+            // SDF delay. Keep its driver on the path that also cancels a
+            // pending update when the input pulse ends before it matures.
+            let annotatable_path = self.preserve_sdf_wiring
+                && self.module_paths.as_ref().is_some_and(|paths| {
+                    wids.iter().any(|&id| paths.is_path_net(id))
+                });
+            let item = if has_transition_delay || packed_array_copy || annotatable_path {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),

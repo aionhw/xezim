@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Runtime SDF annotation delays complex drivers of zero-delay specify paths
+  and rejects pulses shorter than the annotated delay (§30.7, §32.9, #1630, #1631).
+- Library modules retain their source timescales and contribute to the
+  simulation precision (§3.14, §22.7, #1632).
+- The public VPI header declares the coverage control operation codes and the
+  DPI guide documents their support status (§40.5.3, #1619).
 - Static tasks can call automatic functions and class methods repeatedly,
   with each call initializing its own locals (§6.21, §8.6, #1629).
 - Nonblocking assignments copy unpacked structs through parenthesized

@@ -713,6 +713,12 @@ controls, immediate/deferred assertions, `vpi_get_assertion_info`, and the
 SystemVerilog thread, frame and class-object callback reasons of
 `sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`) are not implemented.
 
+The six IEEE 1800 §40.5.3 coverage control operations (`vpiCoverageStart`,
+`vpiCoverageStop`, `vpiCoverageReset`, `vpiCoverageCheck`, `vpiCoverageMerge`,
+and `vpiCoverageSave`) are declared in `sv_vpi_user.h` and currently return 0
+with an unsupported-operation diagnostic from `vpi_control`. Coverage query
+properties are supported independently.
+
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
 `tests/dpi/vpi_systf.{c,sv}`, `tests/dpi/vpi_assertion.{c,sv}`,
 `tests/strings/vpi_assertion_controls.rs`, `tests/strings/vpi_routines.rs`

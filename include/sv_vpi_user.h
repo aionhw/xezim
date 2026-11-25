@@ -231,6 +231,14 @@
 #define vpiAssertionSysLock             647
 #define vpiAssertionSysUnlock           648
 
+/* IEEE 1800 §40.5.3: coverage control operations for vpi_control(). */
+#define vpiCoverageStart 750
+#define vpiCoverageStop  751
+#define vpiCoverageReset 752
+#define vpiCoverageCheck 753
+#define vpiCoverageMerge 754
+#define vpiCoverageSave  755
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -137,9 +137,8 @@ impl Simulator {
     ///    the vec is nonempty (build-time CLI annotation never fuses a
     ///    delayed destination, so the check is one `is_empty()` there).
     ///
-    /// `CompiledContAssign` (bytecode VM) entries keep their build-time
-    /// behavior — the VM's BlockingAssign does not model SDF delay, which is
-    /// the same limitation the CLI --sdf path has.
+    /// Specify-path drivers eligible for runtime annotation keep their
+    /// continuous-assignment evaluator, which also handles pulse rejection.
     pub(super) fn apply_sdf_annotation_late(&mut self) {
         if self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
