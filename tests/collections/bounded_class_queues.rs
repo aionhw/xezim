@@ -7,8 +7,8 @@ fn run(src: &str) -> Vec<String> {
     simulate(src, 100)
         .expect("simulate failed")
         .output
-        .into_iter()
-        .map(|entry| entry.message)
+        .iter()
+        .map(|entry| entry.message.clone())
         .collect()
 }
 
