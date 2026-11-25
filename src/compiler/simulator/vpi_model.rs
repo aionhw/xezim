@@ -3289,7 +3289,7 @@ impl<'a> Builder<'a> {
         ty: c_int,
         prim_type: c_int,
         def: &str,
-        terms: &[(&'a Expression, c_int)],
+        terms: &[(&Expression, c_int)],
         delay: Option<&'a Expression>,
         inputs: u32,
         span: Span,
@@ -3357,19 +3357,26 @@ impl<'a> Builder<'a> {
         let def = self.defs.get(mi.module_name.name.as_str()).copied();
         if let Some((DefRef::Udp(u), _)) = def {
             for hi in &mi.instances {
-                let exprs: Vec<&'a Expression> = hi
+                let exprs: Vec<std::borrow::Cow<'a, Expression>> = hi
                     .connections
                     .iter()
                     .filter_map(|c| match c {
-                        PortConnection::Ordered(Some(e)) => Some(e),
-                        PortConnection::Named { expr: Some(e), .. } => Some(e),
+                        PortConnection::Ordered(Some(e)) => {
+                            Some(std::borrow::Cow::Borrowed(e.as_ref()))
+                        }
+                        PortConnection::Named { expr: Some(e), .. } => {
+                            Some(std::borrow::Cow::Borrowed(e.as_ref()))
+                        }
+                        PortConnection::NamedIdent { actual, bound, .. } => Some(
+                            std::borrow::Cow::Owned(PortConnection::ident_expr(actual, *bound)),
+                        ),
                         _ => None,
                     })
                     .collect();
-                let terms: Vec<(&'a Expression, c_int)> = exprs
+                let terms: Vec<(&Expression, c_int)> = exprs
                     .iter()
                     .enumerate()
-                    .map(|(i, e)| (*e, if i == 0 { c::OUTPUT } else { c::INPUT }))
+                    .map(|(i, e)| (e.as_ref(), if i == 0 { c::OUTPUT } else { c::INPUT }))
                     .collect();
                 let inputs = u.ports.len().saturating_sub(1) as u32;
                 self.primitive(
@@ -3446,7 +3453,7 @@ impl<'a> Builder<'a> {
         let scope_full = self.m.scopes[ctx.scope as usize].full.clone();
         let by_name_conn = conns.is_some_and(|(cs, _)| {
             cs.iter()
-                .any(|c| matches!(c, PortConnection::Named { .. } | PortConnection::Wildcard))
+                .any(|c| c.is_named() || matches!(c, PortConnection::Wildcard))
         });
         let wildcard =
             conns.is_some_and(|(cs, _)| cs.iter().any(|c| matches!(c, PortConnection::Wildcard)));
@@ -3471,20 +3478,28 @@ impl<'a> Builder<'a> {
                     let mut e: Option<Expression> = None;
                     let mut named = false;
                     for c in cs {
-                        if let PortConnection::Named {
-                            name,
-                            expr,
-                            implicit,
-                        } = c
-                        {
-                            if name.name == *pname {
+                        match c {
+                            PortConnection::Named {
+                                name,
+                                expr,
+                                implicit,
+                            } if name.name == *pname => {
                                 named = true;
                                 e = match expr {
-                                    Some(x) => Some(x.clone()),
+                                    Some(x) => Some((**x).clone()),
                                     None if *implicit => Some(ident_expr(pname)),
                                     None => None,
                                 };
                             }
+                            PortConnection::NamedIdent {
+                                name,
+                                actual,
+                                bound,
+                            } if name.name == *pname => {
+                                named = true;
+                                e = Some(PortConnection::ident_expr(actual, *bound));
+                            }
+                            _ => {}
                         }
                     }
                     if !named {
@@ -3493,7 +3508,7 @@ impl<'a> Builder<'a> {
                                 e = Some(ident_expr(pname));
                             }
                         } else if let Some(PortConnection::Ordered(Some(x))) = cs.get(i) {
-                            e = Some(x.clone());
+                            e = Some((**x).clone());
                         }
                     }
                     match e {

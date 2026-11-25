@@ -2780,7 +2780,7 @@ fn check_instantiations(
         };
         for instance in &inst.instances {
             for conn in &instance.connections {
-                if let xezim_core::ast::decl::PortConnection::Named { name, .. } = conn {
+                if let Some(name) = conn.named_port() {
                     if !ports.contains(&name.name) {
                         errs.push(format!(
                             "port '{}' is not a port of module '{}' (LRM 1800-2017 §23.3.2)",
@@ -2863,6 +2863,11 @@ fn collect_scope_names(ports: &PortList, items: &[ModuleItem]) -> Option<HashSet
                                     expr: Some(e),
                                     ..
                                 } => collect_implicit_net_names(e, &mut names),
+                                xezim_core::ast::decl::PortConnection::NamedIdent {
+                                    actual, ..
+                                } => {
+                                    names.insert(actual.name.clone());
+                                }
                                 _ => {}
                             }
                         }
@@ -2930,12 +2935,7 @@ fn check_implicit_ports(
             let explicit: HashSet<String> = instance
                 .connections
                 .iter()
-                .filter_map(|c| match c {
-                    xezim_core::ast::decl::PortConnection::Named { name, .. } => {
-                        Some(name.name.clone())
-                    }
-                    _ => None,
-                })
+                .filter_map(|c| c.named_port().map(|name| name.name.clone()))
                 .collect();
             for conn in &instance.connections {
                 match conn {
@@ -3699,24 +3699,43 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
         let (by_pos, by_name) = port_directions(tp, titems);
         for inst in &mi.instances {
             for (i, c) in inst.connections.iter().enumerate() {
-                let (dir, actual, port) = match c {
+                let (dir, bad, port) = match c {
                     PortConnection::Ordered(Some(e)) => {
-                        (by_pos.get(i).copied().flatten(), e, format!("#{}", i + 1))
+                        let dir = by_pos.get(i).copied().flatten();
+                        let bad = match dir {
+                            Some(PortDirection::Output) => !assignable(e),
+                            Some(PortDirection::Inout) => {
+                                !assignable(e)
+                                    || root(e).is_some_and(|r| vars.contains(r) && !ports.contains(r))
+                            }
+                            _ => false,
+                        };
+                        (dir, bad, format!("#{}", i + 1))
                     }
                     PortConnection::Named {
                         name,
                         expr: Some(e),
                         ..
-                    } => (by_name.get(&name.name).copied(), e, name.name.clone()),
-                    _ => continue,
-                };
-                let bad = match dir {
-                    Some(PortDirection::Output) => !assignable(actual),
-                    Some(PortDirection::Inout) => {
-                        !assignable(actual)
-                            || root(actual).is_some_and(|r| vars.contains(r) && !ports.contains(r))
+                    } => {
+                        let dir = by_name.get(&name.name).copied();
+                        let bad = match dir {
+                            Some(PortDirection::Output) => !assignable(e),
+                            Some(PortDirection::Inout) => {
+                                !assignable(e)
+                                    || root(e).is_some_and(|r| vars.contains(r) && !ports.contains(r))
+                            }
+                            _ => false,
+                        };
+                        (dir, bad, name.name.clone())
                     }
-                    _ => false,
+                    PortConnection::NamedIdent { name, actual, .. } => {
+                        let dir = by_name.get(&name.name).copied();
+                        let bad = matches!(dir, Some(PortDirection::Inout))
+                            && vars.contains(actual.name.as_str())
+                            && !ports.contains(actual.name.as_str());
+                        (dir, bad, name.name.clone())
+                    }
+                    _ => continue,
                 };
                 if bad {
                     errs.push(format!(
@@ -5637,6 +5656,9 @@ fn check_cont_assign_rhs_names(
                         xezim_core::ast::decl::PortConnection::Ordered(Some(e))
                         | xezim_core::ast::decl::PortConnection::Named { expr: Some(e), .. } => {
                             bare(e, &mut implied)
+                        }
+                        xezim_core::ast::decl::PortConnection::NamedIdent { actual, .. } => {
+                            implied.push(actual.name.clone());
                         }
                         _ => {}
                     }

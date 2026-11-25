@@ -4153,20 +4153,21 @@ suppressed but the explicit SDF annotation still applies."
                 *t = rewritten;
             }
         }
+        // Drop the raw source buffers before parsing and elaboration — `pre`
+        // already holds the preprocessed texts, line maps, and raw line counts
+        // (#721).
+        drop(sources);
         // A saved image can be loaded later with a VPI or DPI library (§38.34).
         xezim_core::elaborate::set_vpi_net_drivers(
             _output_file.is_some() || !vpi_libs.is_empty() || !dpi_libs.is_empty(),
         );
-        match xezim_core::parse_and_elaborate_multi_preprocessed(
-            &sources,
+        match xezim_core::parse_and_elaborate_preprocessed_owned(
+            pre,
             top_module.as_deref(),
             &include_dirs,
-            &source_files,
             &defines,
-            Some(pre),
         ) {
             Ok((_defs, mut elab)) => {
-                drop(sources);
                 // Second-pass `should_fail` lint (additive — does not alter the
                 // elaboration above): reject illegal SV the main path accepts.
                 let dv: Vec<&xezim::SourceDefinition> = _defs.values().collect();
