@@ -192,7 +192,8 @@ thread_local! {}
 // Parenthesized unpacked-struct sources can lower to leaf copies (#1627).
 // Class specialization and inherited typedefs change collection and formal layouts.
 // Inherited typedef local parameters contribute to specialized widths and layouts.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3188;
+// Class-local aliases follow each typedef's declaring specialization.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3189;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

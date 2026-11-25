@@ -2346,29 +2346,28 @@ impl Simulator {
         self.resolve_dt(dt)
     }
 
-    fn follow_class_local_typedef(&self, cls_name: &str, init_dt: &DataType) -> Option<DataType> {
-        let mut local: Option<DataType> = None;
+    /// Follow lexical alias links, retaining the owner of the final target.
+    fn follow_class_local_typedef<'a>(
+        &'a self,
+        cls_name: &str,
+        init_dt: &DataType,
+    ) -> Option<(&'a str, &'a DataType)> {
+        let mut local = None;
+        let mut owner = cls_name;
         let mut cur = init_dt;
         for _ in 0..16 {
-            let DataType::TypeReference {
-                name,
-                dimensions,
-                type_args,
-                ..
-            } = cur
-            else {
+            let DataType::TypeReference { name, dimensions, type_args, .. } = cur else {
                 break;
             };
             if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
                 break;
             }
-            match self.class_local_typedef(cls_name, &name.name.name) {
-                Some(next) => {
-                    local = Some(next.clone());
-                    cur = local.as_ref().unwrap();
-                }
-                None => break,
-            }
+            let Some((next_owner, next)) = self.class_local_typedef_decl(owner, &name.name.name) else {
+                break;
+            };
+            local = Some((next_owner, next));
+            owner = next_owner;
+            cur = next;
         }
         local
     }
@@ -2443,13 +2442,12 @@ impl Simulator {
         let scope = name.scopes.last()?;
         let base = &scope.name.name;
         let (owner, target) = self.class_local_typedef_decl(base, &name.name.name)?;
+        let (owner, target) = self.follow_class_local_typedef(owner, target).unwrap_or((owner, target));
         if owner == base {
             return None;
         }
         let owner = owner.to_string();
-        let target = self
-            .follow_class_local_typedef(&owner, target)
-            .unwrap_or_else(|| target.clone());
+        let target = target.clone();
         let args = scope
             .type_args
             .iter()
@@ -2480,11 +2478,10 @@ impl Simulator {
             && let Some(cls) = self.module.classes.get(&scope.name.name).cloned()
             && let Some((owner, target_dt)) = self.class_local_typedef_decl(&cls.name, &name.name.name)
         {
-            let owner = owner.to_string();
-            let target_dt = self.follow_class_local_typedef(&owner, target_dt).unwrap_or_else(|| target_dt.clone());
-            if owner != cls.name
-                && let Some((target, params)) = self.scoped_inherited_typedef(name)
-            {
+            let target_dt = self
+                .follow_class_local_typedef(owner, target_dt)
+                .map_or_else(|| target_dt.clone(), |(_, dt)| dt.clone());
+            if let Some((target, params)) = self.scoped_inherited_typedef(name) {
                 return super::elaborate::packed_struct_field_layout(
                     &target,
                     &params,
@@ -2558,9 +2555,11 @@ impl Simulator {
             .or_else(|| Self::untagged_union_layout(&self.module, &target_dt));
         }
         if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-            let local = self.follow_class_local_typedef(&ctx, dt);
+            let local = self
+                .follow_class_local_typedef(&ctx, dt)
+                .map(|(owner, dt)| (owner.to_string(), dt.clone()));
             if local.is_some() || self.class_chain_has_value_params(&ctx) {
-                let target_dt = local.as_ref().unwrap_or(dt);
+                let target_dt = local.as_ref().map_or(dt, |(_, target)| target);
                 if self.class_chain_has_value_params(&ctx) {
                     let mut params = self.module.parameters.clone();
                     self.populate_class_chain_params(&ctx, &mut params);
@@ -2570,13 +2569,11 @@ impl Simulator {
                     if let Some(h) = self.this_stack.last().copied().flatten() {
                         params.extend(self.instance_value_params(h));
                     }
-                    if let DataType::TypeReference { name, .. } = dt
-                        && let Some((owner, _)) = self.class_local_typedef_decl(&ctx, &name.name.name)
-                        && owner != ctx
+                    if let Some((owner, _)) = &local
+                        && *owner != ctx
                         && let Some((base, sig)) = self.current_spec.clone()
                     {
-                        let owner = owner.to_string();
-                        if let Some(spec) = self.class_typedef_spec_params(&base, &sig, &owner) {
+                        if let Some(spec) = self.class_typedef_spec_params(&base, &sig, owner) {
                             params.extend(spec);
                         }
                     }
