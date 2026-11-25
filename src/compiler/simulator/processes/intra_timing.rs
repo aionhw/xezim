@@ -295,7 +295,14 @@ impl Simulator {
         rhs: &Expression,
         span: crate::ast::Span,
     ) -> (Expression, Option<Statement>) {
-        let frozen = self.freeze_array_rhs_selectors(rhs);
+        // §9.4.5: capture a computed receiver once before the array
+        // probes. Leaf lookup can then use the held handle after the call.
+        let rhs = Self::unparen(rhs);
+        let frozen = if Self::recv_chain_call(rhs).is_some() {
+            Some(self.freeze_conditional_path(rhs, true))
+        } else {
+            self.freeze_array_rhs_selectors(rhs)
+        };
         let rhs = frozen.as_ref().unwrap_or(rhs);
         let mut inner = rhs;
         while let ExprKind::Paren(e) = &inner.kind {
