@@ -740,6 +740,9 @@ impl Simulator {
         self.local_iface_aliases.push(vif_frame);
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
+        // §6.21, §13.4.2: the caller's task lifetime governs the actuals,
+        // but the function's declarations belong to its own activation.
+        let caller_static_task = self.current_static_task.take();
         self.open_decl_shadow_frame();
         for port in &fd.ports {
             if let DataType::TypeReference {
@@ -923,6 +926,7 @@ impl Simulator {
             }
         }
         self.sync_static_locals();
+        self.current_static_task = caller_static_task;
         *self.name_resolve_hint.borrow_mut() = saved_body_hint;
         *self.activation_scope.borrow_mut() = saved_body_activation;
         self.current_scope = saved_body_scope;

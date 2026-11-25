@@ -189,7 +189,8 @@ thread_local! {}
 // §7.4.6, §11.5.1, §20.6.2: bound packed stores and size declarations from locals.
 // §6.11.2: compile 2-state and mixed constant packed member stores with DropXz.
 // Scoped package calls can now lower to compiled function calls (#1623).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3185;
+// Parenthesized unpacked-struct sources can lower to leaf copies (#1627).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3186;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

@@ -2482,6 +2482,9 @@ impl Simulator {
                     self.refresh_ref_redirect_hot();
                 }
                 self.push_local_frame_typed(locals, frame_types);
+                // §8.6, §6.21: class methods have their own automatic
+                // activation even when called by a static task.
+                let caller_static_task = self.current_static_task.take();
                 self.open_decl_shadow_frame();
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
@@ -2770,6 +2773,7 @@ impl Simulator {
                 // Write back any static locals declared in this body before
                 // the locals frame is dropped.
                 self.sync_static_locals();
+                self.current_static_task = caller_static_task;
                 self.fn_ret_collection_stack.pop();
                 self.fn_ret_assoc_stack.pop();
                 self.fn_ret_ctx_stack.pop();

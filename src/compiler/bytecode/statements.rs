@@ -164,6 +164,11 @@ impl<'a> BytecodeCompiler<'a> {
             } => (lvalue, rvalue, Some(delay)),
             _ => return None,
         };
+        // §10.4.2: parentheses preserve the struct value and its leaves.
+        let mut rvalue = rvalue;
+        while let ExprKind::Paren(inner) = &rvalue.kind {
+            rvalue = inner;
+        }
         // `lookup_signal_id` falls back from `<scope>.<n>` to outer names. A
         // struct declared in an inner scope may have member leaves but no
         // container signal, so an outer hit can be an unrelated struct of

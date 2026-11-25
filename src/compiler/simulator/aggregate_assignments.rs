@@ -2568,6 +2568,8 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<Vec<(Expression, Value)>> {
+        // §10.4.2: a parenthesized struct still names the same leaf storage.
+        let rvalue = Self::unparen(rvalue);
         match &lvalue.kind {
             ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {}
             ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {}

@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Static tasks can call automatic functions and class methods repeatedly,
+  with each call initializing its own locals (§6.21, §8.6, #1629).
+- Nonblocking assignments copy unpacked structs through parenthesized
+  source expressions (§10.4.2, #1627).
 - `cg.option.<name>` reads and writes the options of a covergroup declared in
   a class, inside the class and through a handle (§19.7, §19.4, #1625).
 - Input-port substitution distinguishes escaped names containing dots from
