@@ -1493,11 +1493,9 @@ impl Simulator {
             }
             self.class_context_stack.push(Some(cname.clone()));
             self.this_stack.push(None);
-            let Some((is_str, is_queue, assoc_iw, elem_type)) = self.module.classes.get(&cname).map(|cd| {
+            let Some((key_type, is_queue, default_iw, elem_type)) = self.module.classes.get(&cname).map(|cd| {
                 (
-                    cd.static_assoc_key_types
-                        .get(&prop)
-                        .is_some_and(|kt| kt == "string"),
+                    cd.static_assoc_key_types.get(&prop).cloned(),
                     cd.queue_property_names.contains(&prop),
                     cd.static_assoc_index_props.get(&prop).copied(),
                     self.class_prop_elem_type(cd, &prop).cloned(),
@@ -1529,6 +1527,25 @@ impl Simulator {
                 self.module.queue_vars.insert(spec_key.clone());
             }
             if is_assoc {
+                // §7.8 and §8.25: a key type parameter belongs to this
+                // specialization, including its width, sign and string kind.
+                let concrete_key = key_type.as_deref().and_then(|key| self.resolve_type_param_binding(key));
+                let key = concrete_key.as_deref().or(key_type.as_deref());
+                let is_str = key.is_some_and(|key| {
+                    key == "string" || self.module.typedef_types.get(key).is_some_and(|dt| {
+                        matches!(self.resolve_dt_ref(dt), DataType::Simple {
+                            kind: crate::ast::types::SimpleType::String, ..
+                        })
+                    })
+                });
+                let assoc_iw = (!is_str).then(|| {
+                    concrete_key.as_deref().and_then(|key| {
+                        let signed = self.concrete_type_signed(key)?;
+                        let width = self.concrete_type_width(key)
+                            .or_else(|| matches!(key, "bit" | "logic" | "reg").then_some(1))?;
+                        Some((width, signed))
+                    }).or(default_iw)
+                }).flatten();
                 self.module
                     .associative_arrays
                     .entry(spec_key.clone())
@@ -1605,9 +1622,13 @@ impl Simulator {
                 self.module
                     .arrays
                     .insert(spec_key.clone(), (layout.lo, layout.hi, layout.width));
-                if layout.descending {
+                let declared = if layout.descending {
                     self.module.descending_arrays.insert(spec_key.clone());
-                }
+                    (layout.hi, layout.lo)
+                } else {
+                    (layout.lo, layout.hi)
+                };
+                self.module.unpacked_decl_dims.insert(spec_key.clone(), vec![declared]);
                 self.widths.insert(spec_key.clone(), layout.width);
                 for i in layout.lo..=layout.hi {
                     let mut elem = spec_key.clone();
