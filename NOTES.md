@@ -10,6 +10,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Direct copies preserve unpacked-struct fields across fixed class arrays,
+  multidimensional class rows and module arrays (§7.6, §8.4).
+- Delayed blocking array assignments sample fields reached through a computed
+  class handle and evaluate the receiver once (§7.6, §9.4.5).
+- Fixed static array initializers can copy another array of the same
+  specialization (§7.6, §8.25).
+- Inherited packed typedef widths and field layouts use local parameters of
+  the declaring specialization (§6.18, §8.25).
+- A pending event at the maximum simulation timestamp still honors an earlier
+  `--max-time` cap.
 - Assignment patterns copy unpacked-struct array properties field by field,
   including into multidimensional class properties. Delayed blocking
   assignments sample those fields before the delay (§7.6, §9.4.5, §10.9.1,
