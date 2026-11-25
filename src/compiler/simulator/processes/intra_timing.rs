@@ -178,11 +178,15 @@ impl Simulator {
             selects += 1;
             base = expr;
         }
-        let ExprKind::Ident(h) = &base.kind else { return None };
-        if h.path.iter().any(|s| !s.selects.is_empty()) {
-            return None;
-        }
-        let name = self.array_operand_name(base).unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+        let name = match &base.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => self
+                .expr_assoc_name(base)
+                .unwrap_or_else(|| self.resolve_hier_name(h).into_owned()),
+            ExprKind::MemberAccess { .. } if Self::operand_chain_effect_free(base) => {
+                self.expr_assoc_name(base)?
+            }
+            _ => return None,
+        };
         let rank = if self.module.arrays_2d.contains_key(&name) {
             2
         } else {
@@ -329,6 +333,9 @@ impl Simulator {
         // array, a subarray or slice of one, an array of unpacked structs, a
         // class property's row) is read element by element now. It was
         // captured as one scalar, so the delayed store wrote zeros.
+        if let Some(snapshot) = self.delayed_struct_queue_snapshot(inner, span) {
+            return snapshot;
+        }
         if let Some(snapshot) = self.unpacked_array_snapshot(inner, span) {
             return snapshot;
         }
@@ -345,6 +352,44 @@ impl Simulator {
         }
         let val = self.eval_target_rhs(lvalue, rhs);
         (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// §7.6 and §9.4.5: a whole queue or dynamic array of unpacked
+    /// structs needs both its live length and each element's field values.
+    fn delayed_struct_queue_snapshot(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, Option<Statement>)> {
+        if !matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+            || !Self::operand_chain_effect_free(e)
+        {
+            return None;
+        }
+        let name = self.array_operand_name(e)?;
+        let size = self.live_coll_size(&name)?;
+        let su = self.queue_elem_struct(&name)?;
+        if size == 0 {
+            return Some((Expression::new(ExprKind::Concatenation(Vec::new()), span), None));
+        }
+        if size > 1 << 20 {
+            return None;
+        }
+        let suffixes = self.unpacked_struct_leaf_keys("", &su);
+        let mut rows = Vec::new();
+        for i in 0..size {
+            for (suffix, width, _) in &suffixes {
+                if *width > 0 {
+                    let value = self
+                        .struct_leaf_value(&format!("{name}[{i}]{suffix}"))
+                        .unwrap_or_else(|| Value::new(*width));
+                    rows.push((format!("[{i}]{suffix}"), value));
+                }
+            }
+        }
+        let mut slots = Vec::new();
+        let pattern = self.kept_element_pattern(Self::leaf_rows(rows), span, &mut slots);
+        Some((pattern, Some(Self::intra_release_stmt(&slots, span))))
     }
 
     /// The statement that frees the captured pattern items `slots` once the
