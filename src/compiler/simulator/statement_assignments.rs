@@ -3544,27 +3544,31 @@ impl Simulator {
                     }
                     return;
                 }
-                let dst_prefix = format!("{}[", dst);
-                let dst_keys: Vec<String> = self.signals.keys_with_elem_prefix(&dst_prefix);
-                for k in dst_keys {
-                    self.signals.remove(&k);
+                // Copying a fixed source into a dynamic destination must
+                // translate its index bounds and resize the destination.
+                if !self.module.dynamic_arrays.contains(&dst) {
+                    let dst_prefix = format!("{}[", dst);
+                    let dst_keys: Vec<String> = self.signals.keys_with_elem_prefix(&dst_prefix);
+                    for k in dst_keys {
+                        self.signals.remove(&k);
+                    }
+                    // Re-key each `<src>[k]` entry as `<dst>[k]` — the
+                    // suffix from `src.len()` already includes `[k]`.
+                    let src_prefix = format!("{}[", src);
+                    let entries: Vec<(String, Value)> = self
+                        .signals
+                        .keys_with_elem_prefix(&src_prefix)
+                        .into_iter()
+                        .filter_map(|k| {
+                            let v = self.signals.get(&k)?.clone();
+                            Some((format!("{}{}", dst, &k[src.len()..]), v))
+                        })
+                        .collect();
+                    for (k, v) in entries {
+                        self.signals.insert(k, v);
+                    }
+                    return;
                 }
-                // Re-key each `<src>[k]` entry as `<dst>[k]` — the
-                // suffix from `src.len()` already includes `[k]`.
-                let src_prefix = format!("{}[", src);
-                let entries: Vec<(String, Value)> = self
-                    .signals
-                    .keys_with_elem_prefix(&src_prefix)
-                    .into_iter()
-                    .filter_map(|k| {
-                        let v = self.signals.get(&k)?.clone();
-                        Some((format!("{}{}", dst, &k[src.len()..]), v))
-                    })
-                    .collect();
-                for (k, v) in entries {
-                    self.signals.insert(k, v);
-                }
-                return;
             }
         } // !formal_operand
         // Slice assignment for N-dimensional unpacked arrays where LHS
