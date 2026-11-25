@@ -3114,7 +3114,7 @@ impl Simulator {
     }
 
     /// `w = v` / `r = v[1]` / `v[1] = r` over multi-dimensional unpacked
-    /// arrays or fixed class-property struct arrays. Returns true on a copy.
+    /// arrays or fixed class-property arrays. Returns true on a copy.
     pub(super) fn copy_multi_dim_array(
         &mut self,
         lvalue: &Expression,
@@ -3157,9 +3157,6 @@ impl Simulator {
                         .and_then(|dt| self.unpacked_struct_of(&dt))
                 }
             });
-        if !(l_nd || r_nd || elem_su.is_some()) {
-            return false;
-        }
         if lbase == rbase && lsfx == rsfx {
             return true;
         }
