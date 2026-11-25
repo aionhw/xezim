@@ -3098,8 +3098,30 @@ impl Simulator {
                 } else {
                     self.module.arrays.insert(scoped.clone(), (0, 63, width));
                 }
-                if let Some(m) = max {
-                    self.module.queue_max_sizes.insert(scoped.clone(), m);
+                let capacity = cdef
+                    .queue_property_bounds
+                    .get(prop)
+                    .and_then(|bound| {
+                        let mut bindings: HashMap<String, Value> = HashMap::default();
+                        for (name, _) in &cdef.param_defaults {
+                            if let Some(value) = ancestor_value_args
+                                .get(&cdef.name)
+                                .and_then(|args| args.get(name))
+                                .or_else(|| instance.properties.get(name))
+                            {
+                                bindings.insert(name.clone(), value.clone());
+                            }
+                        }
+                        let env = super::elaborate::ParamEnv::Overlay {
+                            base: &self.module.parameters,
+                            top: &bindings,
+                        };
+                        super::elaborate::const_eval_i64_with_params_env(bound, Some(&env))
+                            .and_then(Self::bounded_queue_capacity)
+                    })
+                    .or(max);
+                if let Some(capacity) = capacity {
+                    self.module.queue_max_sizes.insert(scoped.clone(), capacity);
                 }
                 self.set_queue_size(&scoped, 0);
             }

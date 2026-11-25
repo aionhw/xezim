@@ -3475,37 +3475,22 @@ impl Simulator {
     ) -> Option<String> {
         let mut level = su.clone();
         let mut key = prop.to_string();
-        let mut found: Option<(DataType, StructCollKind, bool)> = None;
         for (j, mname) in tail.iter().enumerate() {
             let (dt, dims) = Self::struct_member_decl(&level, mname)?;
+            let dims = self.member_dims(&dt, &dims);
+            key.push('.');
+            key.push_str(mname);
             let last = j + 1 == tail.len();
             match Self::coll_kind_of(&dims) {
-                Some(kind) if last => {
-                    key.push('.');
-                    key.push_str(mname);
-                    found = Some((dt, kind, self.string_keyed_dim(&dims[0])));
-                    break;
+                Some(_) if last => {
+                    let name = format!("{handle}#{key}");
+                    return self.ensure_struct_member_coll(&name).then_some(name);
                 }
-                Some(_) => return None, // collection mid-path: nested machinery
-                None => {
-                    if last {
-                        break; // the final member is not a collection
-                    }
-                    level = self.unpacked_struct_of(&dt)?;
-                    key.push('.');
-                    key.push_str(mname);
-                }
+                None if !last => level = self.unpacked_struct_of(&dt)?,
+                _ => return None,
             }
         }
-        let (dt, kind, string_key) = found?;
-        let elem_w = resolve_type_width(
-            &dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        )
-        .max(1);
-        self.register_struct_coll(handle, &key, kind, elem_w, string_key);
-        Some(format!("{}#{}", handle, key))
+        None
     }
 
     /// Put a struct-member collection on the §7.8 collection registries
@@ -3630,8 +3615,9 @@ impl Simulator {
         for (j, (seg, nidx)) in segs.iter().enumerate().skip(1) {
             let su = self.unpacked_struct_of(&dt)?;
             let (mdt, dims) = Self::struct_member_decl(&su, seg)?;
+            let dims = self.member_dims(&mdt, &dims);
             if j == last {
-                return Some((mdt, dims, *nidx));
+                return Some((mdt, dims.into_owned(), *nidx));
             }
             if *nidx != dims.len() {
                 return None;
@@ -3778,6 +3764,39 @@ impl Simulator {
         )
         .max(1);
         self.register_coll_name(name, kind, elem_w, string_key);
+        if let Some((_, dims, depth)) = self.struct_member_path_decl(name) {
+            match dims.get(depth) {
+                Some(crate::ast::types::UnpackedDimension::Queue {
+                    max_size: Some(bound),
+                    ..
+                }) => {
+                    if let Some(capacity) = super::elaborate::const_eval_i64_with_params(
+                        bound,
+                        Some(&self.module.parameters),
+                    )
+                    .and_then(Self::bounded_queue_capacity)
+                    {
+                        self.module
+                            .queue_max_sizes
+                            .insert(name.to_string(), capacity);
+                    }
+                }
+                Some(crate::ast::types::UnpackedDimension::Associative { data_type, .. }) => {
+                    let (index, _) = super::elaborate::assoc_key_type_info(
+                        data_type.as_deref(),
+                        &self.module.parameters,
+                        &self.module.typedefs,
+                        &self.module.typedef_types,
+                    );
+                    if let Some(index) = index {
+                        self.module
+                            .assoc_index_widths
+                            .insert(name.to_string(), index);
+                    }
+                }
+                _ => {}
+            }
+        }
         // A packed-struct element type slices `m[j].f` / a locator's
         // `item.f` through the collection's field layout.
         if !self.module.packed_struct_fields.contains_key(name) {
@@ -3842,15 +3861,11 @@ impl Simulator {
                 // An ELEMENT of a class-property collection of structs
                 // (`c.aa[k].q`, `fa[i].q` in a method) is keyed under the
                 // instance (`<h>#aa[k]`).
-                if matches!(base.kind, ExprKind::Index { .. })
-                    && !self.no_class_objects()
-                    && let Some(row) = self.coll_elem_expr_key(base)
-                    && row.contains('#')
+                if !self.no_class_objects()
+                    && let Some(row) = self.class_struct_element_path(base)
                 {
                     let f = format!("{}.{}", row, member.name);
-                    if self.ensure_struct_member_coll(&f) {
-                        return Some(f);
-                    }
+                    return self.ensure_struct_member_coll(&f).then_some(f);
                 }
                 if !self.root_may_hold_struct(e) {
                     return None;
@@ -3880,6 +3895,39 @@ impl Simulator {
             return None;
         }
         Some(flat)
+    }
+
+    /// Resolve the storage of a selected class struct and any nested
+    /// members below that element (§7.2.1).
+    pub(super) fn class_struct_element_path(&mut self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Index { .. } => {
+                let (base, indices) = Self::split_row_selects(e);
+                let mut key = self.expr_assoc_name(&base)?;
+                Self::class_storage_owner(&key)?;
+                for index in &indices {
+                    let value = if Self::expr_contains_dollar(index) {
+                        self.eval_index_of_queue(&key, index)
+                    } else {
+                        self.eval_expr(index)
+                    };
+                    let index = if self.is_associative_array(&key) {
+                        self.assoc_key_str(&key, &value)
+                    } else {
+                        value.to_index()?.to_string()
+                    };
+                    key.push('[');
+                    key.push_str(&index);
+                    key.push(']');
+                }
+                Some(key)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.class_struct_element_path(expr)?;
+                Some(format!("{base}.{}", member.name))
+            }
+            _ => None,
+        }
     }
 
     /// `s.m.first(k)` / `last` / `next` / `prev` on an associative member of
@@ -4714,6 +4762,8 @@ impl Simulator {
                         Some(&rhs_f),
                         rhs_outer,
                     );
+                } else if rhs_explicit && Self::coll_kind_of(&dims).is_some() {
+                    self.assign_struct_member_coll(&lhs_f, &rhs_f);
                 }
                 continue;
             }

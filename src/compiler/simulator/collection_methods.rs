@@ -222,6 +222,56 @@ impl OrderKeys {
 }
 
 impl Simulator {
+    /// §7.10.5: an insertion into a full bounded queue discards the old
+    /// tail unless it appends, in which case the new element is discarded.
+    fn insert_queue_elem(&mut self, name: &str, index: u64, size: u64, arg: &Expression) {
+        let full = self
+            .module
+            .queue_max_sizes
+            .get(name)
+            .is_some_and(|&max| size >= u64::from(max));
+        if full && index == size {
+            if matches!(
+                self.unpacked_pattern(arg).kind,
+                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+            ) {
+                self.eval_row_value_for_effects(arg);
+            } else {
+                let _ = self.queue_eval_arg(name, arg);
+            }
+        } else {
+            let end = size - u64::from(full);
+            // §13.5.1: the scalar input to insert/push_front is evaluated
+            // before the queue changes, including an input reading this queue.
+            let saved = if index < end
+                && !matches!(arg.kind, ExprKind::Number(_) | ExprKind::StringLiteral(_))
+                && !crate::compiler::packed_assignment_pattern_plan::has_pattern(arg)
+                && (!self.has_coll_rows
+                    || self
+                        .coll_shape_at(name)
+                        .is_none_or(|(shape, depth)| depth + 1 == shape.dims.len()))
+                && let Some(ty) = self.integral_queue_elem(name)
+            {
+                let value = self.queue_eval_arg(name, arg);
+                Some(Self::fit_queue_elem_to(Some(ty), value))
+            } else {
+                None
+            };
+            if index < end && (full || !self.queue_shift_fast(name, index, end, true)) {
+                for i in (index..end).rev() {
+                    self.queue_move_elem(name, i, i + 1);
+                }
+            }
+            let slot = Self::name_with_index(name, index as i64);
+            if let Some(value) = saved {
+                self.set_signal_value_by_name(&slot, value);
+            } else {
+                self.queue_store_elem(name, &slot, arg);
+            }
+        }
+        self.set_queue_size(name, size + 1);
+    }
+
     /// If `e` names a plain object-typed lvalue holding a live class handle,
     /// returns that handle; otherwise `None`. Used by `std::randomize(obj)`
     /// to dispatch to the object's own randomize rather than scalar-drawing
@@ -3701,33 +3751,14 @@ impl Simulator {
                 // returns 0 because the bare `new` has no class
                 // context). The resulting handle is what gets pushed.
                 let cur_size = self.get_queue_size(obj_name);
-                if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
-                    if cur_size >= max as u64 {
-                        return Some(Value::zero(32));
-                    }
-                }
-                let elem = Self::name_with_index(obj_name, cur_size as i64);
-                self.queue_store_elem(obj_name, &elem, arg);
-                self.set_queue_size(obj_name, cur_size + 1);
+                self.insert_queue_elem(obj_name, cur_size, cur_size, arg);
             }
             return Some(Value::zero(32));
         }
         if bm == BuiltinM::PushFront {
             if let Some(arg) = args.first() {
                 let cur_size = self.get_queue_size(obj_name);
-                if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
-                    if cur_size >= max as u64 {
-                        return Some(Value::zero(32));
-                    }
-                }
-                if !self.queue_shift_fast(obj_name, 0, cur_size, true) {
-                    for i in (0..cur_size).rev() {
-                        self.queue_move_elem(obj_name, i, i + 1);
-                    }
-                }
-                let head = Self::name_with_index(obj_name, 0);
-                self.queue_store_elem(obj_name, &head, arg);
-                self.set_queue_size(obj_name, cur_size + 1);
+                self.insert_queue_elem(obj_name, 0, cur_size, arg);
             }
             return Some(Value::zero(32));
         }
@@ -3841,16 +3872,7 @@ impl Simulator {
                     }
                     _ => return Some(Value::zero(32)),
                 };
-                // Move elements member-wise: an unpacked-struct element has no
-                // container signal, so a packed copy shifts nothing at all.
-                if !self.queue_shift_fast(obj_name, idx, cur_size, true) {
-                    for i in (idx..cur_size).rev() {
-                        self.queue_move_elem(obj_name, i, i + 1);
-                    }
-                }
-                let slot = format!("{}[{}]", obj_name, idx);
-                self.queue_store_elem(obj_name, &slot, &args[1]);
-                self.set_queue_size(obj_name, cur_size + 1);
+                self.insert_queue_elem(obj_name, idx, cur_size, &args[1]);
             }
             return Some(Value::zero(32));
         }

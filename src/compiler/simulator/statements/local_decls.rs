@@ -1198,8 +1198,16 @@ impl Simulator {
                         // `q[i] = v` back-fill - not the discard-out-of-
                         // range rule of an unallocated dynamic array.
                         // Mirror the module-scope classification.
-                        if matches!(first, UnpackedDimension::Queue { .. }) {
+                        if let UnpackedDimension::Queue { max_size, .. } = first {
                             self.module.queue_vars.insert(name.clone());
+                            if let Some(bound) = max_size
+                                && let Some(capacity) = self
+                                    .eval_expr(bound)
+                                    .to_i64()
+                                    .and_then(Self::bounded_queue_capacity)
+                            {
+                                self.module.queue_max_sizes.insert(name.clone(), capacity);
+                            }
                         }
                         self.widths.insert(name.clone(), w);
                         self.set_queue_size(&name, 0);

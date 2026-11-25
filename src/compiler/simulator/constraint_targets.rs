@@ -901,7 +901,12 @@ impl Simulator {
             // Wide numeric keys are keyed by hex digits.
             return Value::from_str_radix(key, 16, kw);
         }
-        let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+        let bits = if signed {
+            key.parse::<i64>().unwrap_or(0) as u64
+        } else {
+            key.parse::<u64>().unwrap_or(0)
+        };
+        let mut v = Value::from_u64(bits, kw);
         v.is_signed = signed;
         v
     }

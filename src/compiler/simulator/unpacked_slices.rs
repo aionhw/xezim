@@ -646,6 +646,29 @@ impl Simulator {
         };
         // §10.9.1: a slice is an unpacked target, so a pattern supplies one
         // item per selected element in left-to-right order, not packed bits.
+        if dst.sliced
+            && let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
+            && let Some(su) = self.queue_elem_struct(&dst.root_name)
+        {
+            let positions = Self::slice_pattern_indices(&dst);
+            let dt = DataType::Struct(su.clone());
+            let values = self.pattern_elems_for_type(items, &positions, &dt);
+            for ((name, position), value) in dst.names.iter().zip(positions).zip(values) {
+                let (Some(name), Some(value)) = (name, value) else {
+                    continue;
+                };
+                let target = Self::index_expr(&dst.root, position);
+                if self.module.arrays_2d.get(&dst.root_name).is_none()
+                    && self.module.arrays_nd.get(&dst.root_name).is_none()
+                    && self.class_unpacked_elem_is_heap_owned(&target)
+                {
+                    self.assign_class_unpacked_elem(&target, value, &su);
+                } else {
+                    self.assign_pattern_or_leaf(name, &dt, value);
+                }
+            }
+            return true;
+        }
         if let Some(values) = self.unpacked_slice_rhs_values(&dst, rvalue) {
             for (name, value) in dst.names.iter().zip(values) {
                 if let Some(name) = name {
@@ -767,17 +790,7 @@ impl Simulator {
         if !dst.sliced {
             return None;
         }
-        let indices: Vec<i64> = dst
-            .names
-            .iter()
-            .map(|n| {
-                n.as_ref()
-                    .and_then(|n| n.rsplit_once('['))
-                    .and_then(|(_, n)| n.strip_suffix(']'))
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(i64::MIN)
-            })
-            .collect();
+        let indices = Self::slice_pattern_indices(dst);
         let dt = self
             .class_member_coll_type(&dst.root_name)
             .cloned()
@@ -799,6 +812,19 @@ impl Simulator {
                 })
                 .collect(),
         )
+    }
+
+    fn slice_pattern_indices(dst: &UnpackedElems) -> Vec<i64> {
+        dst.names
+            .iter()
+            .map(|n| {
+                n.as_ref()
+                    .and_then(|n| n.rsplit_once('['))
+                    .and_then(|(_, n)| n.strip_suffix(']'))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(i64::MIN)
+            })
+            .collect()
     }
 
     /// §10.4.2: the per-element updates of `lhs <= rhs` when either side is

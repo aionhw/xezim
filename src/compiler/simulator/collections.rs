@@ -3625,7 +3625,24 @@ impl Simulator {
         eprintln!("[xezim][warning] ignoring write to queue {name}[{index}] with size {size} (IEEE 1800-2023 §7.10.1)");
     }
 
+    /// §7.10: the bound is the last legal index, so a bound of N
+    /// permits N+1 elements.
+    pub(super) fn bounded_queue_capacity(bound: i64) -> Option<u32> {
+        u32::try_from(bound).ok()?.checked_add(1)
+    }
+
     pub(super) fn set_queue_size(&mut self, obj_name: &str, size: u64) {
+        // §7.10.5: an assignment or method drops elements above the bound.
+        let size = if let Some(&max) = self.module.queue_max_sizes.get(obj_name)
+            && size > u64::from(max)
+        {
+            eprintln!(
+                "[xezim][warning] truncating bounded queue {obj_name} to {max} elements (IEEE 1800-2023 §7.10.5)"
+            );
+            u64::from(max)
+        } else {
+            size
+        };
         if !self.assoc_elem_colls.is_empty() && size > 0 && self.assoc_elem_colls.contains(obj_name)
         {
             self.mark_struct_coll_owner_present(obj_name);

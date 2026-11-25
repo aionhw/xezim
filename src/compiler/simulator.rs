@@ -193,7 +193,9 @@ thread_local! {}
 // Class specialization and inherited typedefs change collection and formal layouts.
 // Inherited typedef local parameters contribute to specialized widths and layouts.
 // Class-local aliases follow each typedef's declaring specialization.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3189;
+// Bounded class queues retain their declared capacities and local bounds.
+// Delayed struct assignments retain nested collection members.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318a;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

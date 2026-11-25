@@ -1,6 +1,7 @@
 //! Delay values and intra-assignment timing controls.
 
 use super::*;
+use crate::ast::types::{StructUnionType, UnpackedDimension};
 
 impl Simulator {
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -326,6 +327,9 @@ impl Simulator {
             }
             return self.capture_intra_rhs(lvalue, &selected, span);
         }
+        if let Some(snapshot) = self.delayed_struct_collections_snapshot(inner, span) {
+            return snapshot;
+        }
         if let Some(values) = self.capture_array_rhs(lvalue, inner) {
             return (self.saved_array_pattern(values, span), None);
         }
@@ -352,6 +356,208 @@ impl Simulator {
         }
         let val = self.eval_target_rhs(lvalue, rhs);
         (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// §7.2.1 and §9.4.5: a struct is sampled with its collection
+    /// members, including their lengths, keys and defaults.
+    fn delayed_struct_collections_snapshot(
+        &mut self,
+        expr: &Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, Option<Statement>)> {
+        if !matches!(
+            expr.kind,
+            ExprKind::Ident(_)
+                | ExprKind::MemberAccess { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+        ) || !Self::operand_chain_effect_free(expr)
+        {
+            return None;
+        }
+        let mut slots = Vec::new();
+        let snapshot = if let Some((array, extents, _)) = self.fixed_array_snapshot_shape(expr) {
+            let su = self.queue_elem_struct(&array.root_name)?;
+            if !self.struct_has_collection_member(&su) || array.names.iter().any(Option::is_none) {
+                return None;
+            }
+            self.snapshot_struct_rows(&array.names, &extents, &su, span, &mut slots)
+        } else {
+            let name = self
+                .expr_assoc_name(expr)
+                .or_else(|| self.class_struct_element_path(expr))
+                .or_else(|| {
+                    let (handle, prop) = self.class_prop_receiver(expr)?;
+                    self.class_prop_struct(handle, &prop)?;
+                    Some(format!("{handle}#{prop}"))
+                })
+                .or_else(|| self.flat_member_name(expr))?;
+            let (storage, decl) = self.struct_copy_target(name.clone());
+            let su = self
+                .queue_elem_struct(&name)
+                .or(decl)
+                .or_else(|| self.struct_elem_type(expr))?;
+            if !self.struct_has_collection_member(&su) {
+                return None;
+            }
+            if let Some(size) = self.live_coll_size(&name) {
+                if size > 1 << 20 {
+                    return None;
+                }
+                let dim = UnpackedDimension::Unsized(span);
+                return Some((
+                    self.snapshot_struct_member(
+                        &name,
+                        &DataType::Struct(su),
+                        &[dim],
+                        span,
+                        &mut slots,
+                    ),
+                    Some(Self::intra_release_stmt(&slots, span)),
+                ));
+            }
+            if self.is_associative_array(&name) {
+                return None;
+            }
+            self.snapshot_struct(&storage, &su, span, &mut slots)
+        };
+        Some((snapshot, Some(Self::intra_release_stmt(&slots, span))))
+    }
+
+    fn struct_has_collection_member(&self, su: &StructUnionType) -> bool {
+        su.members.iter().any(|member| {
+            member.declarators.iter().any(|decl| {
+                self.member_dims(&member.data_type, &decl.dimensions)
+                    .iter()
+                    .any(|dim| Self::coll_kind_of(std::slice::from_ref(dim)).is_some())
+            }) || self
+                .unpacked_struct_of(&member.data_type)
+                .is_some_and(|nested| self.struct_has_collection_member(&nested))
+        })
+    }
+
+    fn snapshot_struct_rows(
+        &mut self,
+        names: &[Option<String>],
+        extents: &[usize],
+        su: &StructUnionType,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let Some((_, remaining)) = extents.split_first() else {
+            return self.snapshot_struct(names[0].as_deref().unwrap(), su, span, slots);
+        };
+        let stride = remaining.iter().product::<usize>();
+        let items = names
+            .chunks(stride)
+            .map(|row| {
+                AssignmentPatternItem::Ordered(
+                    self.snapshot_struct_rows(row, remaining, su, span, slots),
+                )
+            })
+            .collect();
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
+    fn snapshot_struct(
+        &mut self,
+        name: &str,
+        su: &StructUnionType,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let mut items = Vec::new();
+        for member in &su.members {
+            for decl in &member.declarators {
+                let path = format!("{name}.{}", decl.name.name);
+                let dims = self.member_dims(&member.data_type, &decl.dimensions);
+                let value =
+                    self.snapshot_struct_member(&path, &member.data_type, &dims, span, slots);
+                items.push(AssignmentPatternItem::Ordered(value));
+            }
+        }
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
+    fn snapshot_struct_member(
+        &mut self,
+        name: &str,
+        dt: &DataType,
+        dims: &[UnpackedDimension],
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let Some((dim, tail)) = dims.split_first() else {
+            if let Some(su) = self.unpacked_struct_of(dt) {
+                return self.snapshot_struct(name, &su, span, slots);
+            }
+            let v = self.struct_leaf_value(name).unwrap_or_else(|| {
+                let width = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                self.formal_type_default(dt, width.max(1))
+            });
+            return self.kept_item(v, span, slots);
+        };
+        let mut items = Vec::new();
+        let dim = std::slice::from_ref(dim);
+        match Self::coll_kind_of(dim) {
+            Some(StructCollKind::Assoc) => {
+                for key in self.assoc_top_level_keys(name) {
+                    let key_value = if self.is_string_keyed_array(name) {
+                        Expression::new(
+                            ExprKind::StringLiteral(Self::name_key_value(&key).to_sv_string()),
+                            span,
+                        )
+                    } else {
+                        let key_value = self.assoc_foreach_key_value(name, &key);
+                        self.value_method_arg_expr(&key_value)
+                    };
+                    let value = self.snapshot_struct_member(
+                        &format!("{name}[{key}]"),
+                        dt,
+                        tail,
+                        span,
+                        slots,
+                    );
+                    items.push(AssignmentPatternItem::Keyed(key_value, value));
+                }
+                let default = self.class_assoc_defaults.get(name).cloned().or_else(|| {
+                    self.module
+                        .assoc_defaults
+                        .get(name)
+                        .cloned()
+                        .map(|e| self.eval_expr(&e))
+                });
+                if let Some(default) = default {
+                    items.push(AssignmentPatternItem::Default(
+                        self.value_method_arg_expr(&default),
+                    ));
+                }
+            }
+            kind => {
+                let indices = if kind.is_some() {
+                    (0..self.get_queue_size(name) as i64).collect()
+                } else {
+                    self.member_dim_indices(dim)
+                        .and_then(|mut dims| dims.pop())
+                        .unwrap_or_default()
+                };
+                for index in indices {
+                    let value = self.snapshot_struct_member(
+                        &format!("{name}[{index}]"),
+                        dt,
+                        tail,
+                        span,
+                        slots,
+                    );
+                    items.push(AssignmentPatternItem::Ordered(value));
+                }
+            }
+        }
+        Expression::new(ExprKind::AssignmentPattern(items), span)
     }
 
     /// §7.6 and §9.4.5: a whole queue or dynamic array of unpacked

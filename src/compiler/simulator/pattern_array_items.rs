@@ -160,6 +160,69 @@ impl Simulator {
     /// outside the declared range reads as x. None when `e` is anything else
     /// (a call, a single element, a dynamic or associative array).
     pub(super) fn unpacked_array_leaves(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        let (el, extents, rank) = self.fixed_array_snapshot_shape(e)?;
+        let elem_su = self
+            .class_member_coll_type(&el.root_name)
+            .cloned()
+            .or_else(|| self.p_elem_type(&el.root_name))
+            .and_then(|dt| self.unpacked_struct_of(&dt));
+        let class_owner = elem_su
+            .as_ref()
+            .and_then(|_| Self::class_storage_owner(&el.root_name));
+        let flat_first = rank > 1;
+        let mut out = Vec::new();
+        for (pos, name) in el.names.iter().enumerate() {
+            let mut path = String::new();
+            let mut rest = pos;
+            let mut steps = Vec::with_capacity(extents.len());
+            for &n in extents.iter().rev() {
+                steps.push(rest % n);
+                rest /= n;
+            }
+            for k in steps.iter().rev() {
+                path.push_str(&format!("[{k}]"));
+            }
+            match &elem_su {
+                Some(su) => {
+                    let Some(name) = name else {
+                        return None;
+                    };
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaves(name, e, su, 0, &mut leaves);
+                    for (key, _, w, _) in leaves {
+                        // §7.6: one-dimensional class-property arrays keep
+                        // their leaves in the heap. Multidimensional writes
+                        // populate the flat store, overriding heap defaults.
+                        let heap = || {
+                            class_owner.and_then(|handle| self.class_array_heap_leaf(handle, &key))
+                        };
+                        let flat = || self.get_signal_value_by_name(&key);
+                        let v = if flat_first {
+                            flat().or_else(heap)
+                        } else {
+                            heap().or_else(flat)
+                        }
+                        .unwrap_or_else(|| Value::new(w.max(1)));
+                        out.push((format!("{path}{}", &key[name.len()..]), v));
+                    }
+                }
+                None => {
+                    let v = name
+                        .as_ref()
+                        .and_then(|n| self.get_signal_value_by_name(n))
+                        .unwrap_or_else(|| Value::new(el.ew));
+                    out.push((path, v));
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Positions and extents below a fixed-array operand, in declared order.
+    pub(super) fn fixed_array_snapshot_shape(
+        &mut self,
+        e: &Expression,
+    ) -> Option<(super::unpacked_slices::UnpackedElems, Vec<usize>, usize)> {
         let e = Self::unparen(e);
         // A select with a side effect anywhere in the chain (`m[i++]`, or
         // `objs[i++].v` below a member, §11.4.2) is left to the caller's
@@ -225,61 +288,7 @@ impl Simulator {
         if extents.iter().product::<usize>() != el.names.len() {
             return None;
         }
-        let elem_su = self
-            .class_member_coll_type(&el.root_name)
-            .cloned()
-            .or_else(|| self.p_elem_type(&el.root_name))
-            .and_then(|dt| self.unpacked_struct_of(&dt));
-        let class_owner = elem_su
-            .as_ref()
-            .and_then(|_| Self::class_storage_owner(&el.root_name));
-        let flat_first = dims.len() > 1;
-        let mut out = Vec::new();
-        for (pos, name) in el.names.iter().enumerate() {
-            let mut path = String::new();
-            let mut rest = pos;
-            let mut steps = Vec::with_capacity(extents.len());
-            for &n in extents.iter().rev() {
-                steps.push(rest % n);
-                rest /= n;
-            }
-            for k in steps.iter().rev() {
-                path.push_str(&format!("[{k}]"));
-            }
-            match &elem_su {
-                Some(su) => {
-                    let Some(name) = name else {
-                        return None;
-                    };
-                    let mut leaves = Vec::new();
-                    self.unpacked_struct_leaves(name, e, su, 0, &mut leaves);
-                    for (key, _, w, _) in leaves {
-                        // §7.6: one-dimensional class-property arrays keep
-                        // their leaves in the heap. Multidimensional writes
-                        // populate the flat store, overriding heap defaults.
-                        let heap = || {
-                            class_owner.and_then(|handle| self.class_array_heap_leaf(handle, &key))
-                        };
-                        let flat = || self.get_signal_value_by_name(&key);
-                        let v = if flat_first {
-                            flat().or_else(heap)
-                        } else {
-                            heap().or_else(flat)
-                        }
-                        .unwrap_or_else(|| Value::new(w.max(1)));
-                        out.push((format!("{path}{}", &key[name.len()..]), v));
-                    }
-                }
-                None => {
-                    let v = name
-                        .as_ref()
-                        .and_then(|n| self.get_signal_value_by_name(n))
-                        .unwrap_or_else(|| Value::new(el.ew));
-                    out.push((path, v));
-                }
-            }
-        }
-        (!out.is_empty()).then_some(out)
+        Some((el, extents, dims.len()))
     }
 
     fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {

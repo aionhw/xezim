@@ -559,13 +559,23 @@ impl Simulator {
                     *width,
                     is_str,
                     cd.queue_property_names.contains(name),
+                    cd.queue_property_bounds.get(name).and_then(|bound| {
+                        super::elaborate::const_eval_i64_with_params(
+                            bound,
+                            Some(&self.module.parameters),
+                        )
+                        .and_then(Self::bounded_queue_capacity)
+                    }),
                 ));
             }
         }
         self.register_struct_member_collections();
-        for (name, is_assoc, width, is_str, is_queue) in static_cols {
+        for (name, is_assoc, width, is_str, is_queue, capacity) in static_cols {
             if is_queue {
                 self.module.queue_vars.insert(name.clone());
+                if let Some(capacity) = capacity {
+                    self.module.queue_max_sizes.insert(name.clone(), capacity);
+                }
             }
             if is_assoc {
                 self.module

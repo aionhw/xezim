@@ -1493,14 +1493,17 @@ impl Simulator {
             }
             self.class_context_stack.push(Some(cname.clone()));
             self.this_stack.push(None);
-            let Some((key_type, is_queue, default_iw, elem_type)) = self.module.classes.get(&cname).map(|cd| {
-                (
-                    cd.static_assoc_key_types.get(&prop).cloned(),
-                    cd.queue_property_names.contains(&prop),
-                    cd.static_assoc_index_props.get(&prop).copied(),
-                    self.class_prop_elem_type(cd, &prop).cloned(),
-                )
-            }) else {
+            let Some((key_type, is_queue, default_iw, elem_type, queue_bound)) =
+                self.module.classes.get(&cname).map(|cd| {
+                    (
+                        cd.static_assoc_key_types.get(&prop).cloned(),
+                        cd.queue_property_names.contains(&prop),
+                        cd.static_assoc_index_props.get(&prop).copied(),
+                        self.class_prop_elem_type(cd, &prop).cloned(),
+                        cd.queue_property_bounds.get(&prop).cloned(),
+                    )
+                })
+            else {
                 self.this_stack.pop();
                 self.class_context_stack.pop();
                 continue;
@@ -1525,6 +1528,19 @@ impl Simulator {
                 .unwrap_or_else(|| default_w.max(1));
             if is_queue {
                 self.module.queue_vars.insert(spec_key.clone());
+                if let Some(bound) = queue_bound {
+                    let params = self.class_spec_value_params();
+                    let env = self.spec_param_env(&params);
+                    if let Some(capacity) =
+                        super::elaborate::const_eval_i64_with_params_env(&bound, Some(&env))
+                            .or_else(|| self.eval_expr(&bound).to_i64())
+                            .and_then(Self::bounded_queue_capacity)
+                    {
+                        self.module
+                            .queue_max_sizes
+                            .insert(spec_key.clone(), capacity);
+                    }
+                }
             }
             if is_assoc {
                 // §7.8 and §8.25: a key type parameter belongs to this

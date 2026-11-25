@@ -4810,7 +4810,7 @@ impl Simulator {
     }
 
     /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
-    fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
+    pub(super) fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
         let Some((w, signed, two_state)) = info else {
             return val;
         };
@@ -6200,7 +6200,7 @@ impl Simulator {
 
     /// Evaluate the items of the row value `e` (a pattern or a concatenation)
     /// whose store is discarded, for their side effects only.
-    fn eval_row_value_for_effects(&mut self, e: &Expression) {
+    pub(super) fn eval_row_value_for_effects(&mut self, e: &Expression) {
         match &self.unpacked_pattern(e).kind {
             ExprKind::AssignmentPattern(items) => {
                 for item in items {
