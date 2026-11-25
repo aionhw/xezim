@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Bounded queues retain their capacity in class specializations, local
+  declarations and struct members. Inserting into a full queue drops the
+  highest-index element, and an input expression can read the queue before
+  the insertion changes it (§7.10.5, §8.25, §13.5.1).
+- Delayed blocking copies of unpacked structs preserve nested dynamic arrays,
+  queues and associative arrays, including their keys and lengths, when
+  copying whole values, fixed arrays, slices or queue elements (§7.2.1,
+  §7.6, §9.4.5).
 - Overlapping unpacked-struct array slices retain the original field values,
   and copies between a queue and a descending fixed array follow the latter's
   declared order (§7.4.6, §7.6, §7.10).
