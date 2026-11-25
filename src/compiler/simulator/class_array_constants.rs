@@ -670,20 +670,29 @@ impl Simulator {
         init: &Expression,
         layout: &ClassArrayLayout,
     ) {
-        let values = match &Self::unparen(init.peel_typed_pattern()).kind {
-            ExprKind::AssignmentPattern(items) => self.class_array_pattern_values(items, layout),
-            ExprKind::Concatenation(items) => {
-                let values = self.unpacked_concat_operand_values(items.iter().collect(), true, None);
-                let indices = layout.indices();
-                if values.len() != indices.len() {
-                    return;
+        let init = Self::unparen(init.peel_typed_pattern());
+        let values = if let ExprKind::AssignmentPattern(items) = &init.kind {
+            self.class_array_pattern_values(items, layout)
+        } else {
+            let values = match &init.kind {
+                ExprKind::Concatenation(items) => {
+                    self.unpacked_concat_operand_values(items.iter().collect(), true, None)
                 }
-                indices
-                    .into_iter()
-                    .zip(values.into_iter().map(|v| self.fit_class_array_element(v, layout)))
-                    .collect()
+                _ => {
+                    let Some(values) = self.unpacked_item_values(init) else {
+                        return;
+                    };
+                    values
+                }
+            };
+            let indices = layout.indices();
+            if values.len() != indices.len() {
+                return;
             }
-            _ => return,
+            indices
+                .into_iter()
+                .zip(values.into_iter().map(|v| self.fit_class_array_element(v, layout)))
+                .collect()
         };
         for (index, value) in values {
             self.signals.insert(format!("{key}[{index}]"), value);
