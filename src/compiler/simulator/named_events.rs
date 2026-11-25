@@ -2102,13 +2102,17 @@ impl Simulator {
         // silent no-op.
         if mname == "putc" && args.len() == 2 {
             let mut b = self.eval_expr(recv).sv_string_bytes();
-            let idx = self.eval_expr(&args[0]).to_i64().unwrap_or(-1);
-            let ch = (self.eval_expr(&args[1]).to_u64().unwrap_or(0) & 0xFF) as u8;
+            let idx = Self::sv_int_arg(&self.eval_expr(&args[0]));
+            let mut cv = self.eval_expr(&args[1]).resize_for_assign(8);
+            if cv.has_xz() {
+                cv = cv.to_two_state();
+            }
+            let ch = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
             // §6.16.4: an out-of-range index or a null character leaves the
             // string unchanged.
             if idx >= 0 && (idx as usize) < b.len() && ch != 0 {
                 b[idx as usize] = ch;
-                let v = Self::sv_string_from_bytes(&b);
+                let v = Value::from_bytes(&b);
                 self.assign_value(recv, &v);
             }
             return Some(Value::zero(1));
@@ -2117,79 +2121,37 @@ impl Simulator {
         // 0 when equal, negative/positive otherwise. Neither was implemented,
         // so both returned 0 and `compare()` looked case-insensitive.
         if matches!(mname, "compare" | "icompare") && args.len() == 1 {
-            let a = self.eval_expr(recv).to_sv_string();
-            let b = self.eval_expr(&args[0]).to_sv_string();
-            let d: i64 = Self::sv_strcmp(&a, &b, mname == "icompare");
+            let a = self.eval_expr(recv);
+            let mut b = self.eval_expr(&args[0]);
+            if !self.operand_has_string_type(&args[0]) && !b.is_real {
+                b = b.sv_string_strip_nul();
+            }
+            let d = a.sv_string_cmp(&b, mname == "icompare");
             let mut v = Value::from_u64(d as u64, 32);
             v.is_signed = true;
             return Some(v);
         }
         if matches!(mname, "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa") && args.len() == 1 {
             let v = self.eval_expr(&args[0]);
-            let text = match mname {
-                // `itoa` renders a SIGNED decimal; the others are unsigned
-                // radix conversions of the bit pattern.
-                "itoa" => {
-                    if v.width > 32 {
-                        format!("{}", v.to_i64().unwrap_or(0))
-                    } else {
-                        format!("{}", v.to_u64().unwrap_or(0) as u32 as i32)
-                    }
-                }
-                "hextoa" => format!("{:x}", v.to_u64().unwrap_or(0)),
-                "octtoa" => format!("{:o}", v.to_u64().unwrap_or(0)),
-                "bintoa" => format!("{:b}", v.to_u64().unwrap_or(0)),
+            let sv = match mname {
+                "itoa" => Self::sv_int_toa(&v, 10),
+                "hextoa" => Self::sv_int_toa(&v, 16),
+                "octtoa" => Self::sv_int_toa(&v, 8),
+                "bintoa" => Self::sv_int_toa(&v, 2),
                 // §6.16.10 `realtoa`: the ASCII DECIMAL representation, which
                 // is `%g` (6 significant digits, trailing zeros stripped,
                 // exponent form when needed) — not `%f`. It printed
                 // "11.100000" for 11.1, and "100000000000000000000.000000"
                 // where 1e+20 was wanted (ivtest sv_string6).
-                _ => Self::format_g(v.to_f64(), 6, false),
+                _ => Value::from_string(&Self::format_g(v.to_f64(), 6, false)),
             };
-            let sv = Value::from_string(&text);
             self.assign_value(recv, &sv);
             return Some(Value::zero(1));
         }
         // §6.16.9 `atoreal` — the longest valid real prefix, 0.0 on no match.
         if mname == "atoreal" && args.is_empty() {
-            let raw = self.eval_expr(recv).to_sv_string();
-            let t = raw.trim();
-            let b = t.as_bytes();
-            let mut i = 0usize;
-            let mut end = 0usize;
-            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-                i += 1;
-            }
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-                end = i;
-            }
-            if i < b.len() && b[i] == b'.' {
-                i += 1;
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                    end = i;
-                }
-            }
-            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-                let save = i;
-                i += 1;
-                if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-                    i += 1;
-                }
-                let ds = i;
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i > ds {
-                    end = i;
-                } else {
-                    i = save;
-                    let _ = i;
-                }
-            }
-            let val: f64 = t.get(..end).and_then(|p| p.parse().ok()).unwrap_or(0.0);
-            return Some(Value::from_f64(val));
+            let recv_val = self.eval_expr(recv);
+            return Some(Value::from_f64(Self::sv_atoreal(&recv_val)));
         }
         None
     }

@@ -1619,9 +1619,14 @@ impl Simulator {
             ExprKind::StringLiteral(_) => true,
             // `{a, b, ...}`: a string concatenation if any operand is a string.
             ExprKind::Concatenation(parts) => parts.iter().any(|p| self.expr_is_string_valued(p)),
-            ExprKind::SystemCall { name, .. } => {
-                matches!(name.as_str(), "$sformatf" | "$psprintf")
-            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$sformatf" | "$psprintf" => true,
+                "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_is_string(args),
+                _ => false,
+            },
+            ExprKind::Replication { exprs, .. } => exprs
+                .iter()
+                .any(|p| !matches!(p.kind, ExprKind::StringLiteral(_)) && self.expr_is_string_valued(p)),
             ExprKind::Paren(inner) => self.expr_is_string_valued(inner),
             ExprKind::Conditional {
                 then_expr,
@@ -2173,6 +2178,106 @@ impl Simulator {
             }
         }
         true
+    }
+
+    pub(super) fn cast_arg_is_string(&self, args: &[Expression]) -> bool {
+        let Some(arg) = args.first() else {
+            return false;
+        };
+        let is_str_dt = |dt: &DataType| -> bool {
+            matches!(
+                self.resolve_dt_ref(dt),
+                DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    ..
+                }
+            )
+        };
+        match &arg.kind {
+            ExprKind::TypeLiteral(dt) => is_str_dt(dt),
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                self.module
+                    .typedef_types
+                    .get(&h.path[0].name.name)
+                    .is_some_and(is_str_dt)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `lvalue` targets a scalar `string` variable/property/member
+    /// or an element of a `string` collection (excluding character selects
+    /// `s[i]` and whole collection objects `q` / `arr`).
+    pub(super) fn lvalue_is_string_target(&mut self, lvalue: &Expression) -> bool {
+        let unp = Self::unparen(lvalue);
+        if !self.operand_has_string_type(unp) {
+            return false;
+        }
+        let mut selects = 0usize;
+        let mut root = unp;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        let mut probe_expr = None;
+        let inline_selects = match &root.kind {
+            ExprKind::Ident(h)
+                if h.path.last().is_some_and(|seg| !seg.selects.is_empty()) =>
+            {
+                let mut h2 = h.clone();
+                let n = h2.path.last_mut().map(|seg| {
+                    let k = seg.selects.len();
+                    seg.selects.clear();
+                    k
+                }).unwrap_or(0);
+                probe_expr = Some(Expression::new(ExprKind::Ident(h2), root.span));
+                n
+            }
+            _ => 0,
+        };
+        let total_selects = selects + inline_selects;
+        let probe_ref = probe_expr.as_ref().unwrap_or(root);
+        if let Some((is_string, dims, var_root)) = self.string_receiver_shape(probe_ref) {
+            if !is_string || total_selects != dims {
+                return false;
+            }
+            if var_root && total_selects > 0 {
+                if let Some(fm) = self.flat_member_name(unp)
+                    && self.is_collection_store(&fm)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if total_selects == 0
+            && let ExprKind::Ident(h) = &root.kind
+            && self.is_collection_store(&self.resolve_hier_name(h))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// §6.16: strip NUL bytes when assigning/binding a non-`string`-typed
+    /// expression (string literal or integral) into a `string` target, while
+    /// preserving any `%u`/`%z` NUL bytes already inside a `string`-typed value.
+    pub(super) fn fit_rhs_for_string_target(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        val: Value,
+    ) -> Value {
+        if !val.is_real
+            && !self.operand_has_string_type(rvalue)
+            && self.lvalue_is_string_target(lvalue)
+        {
+            val.sv_string_strip_nul()
+        } else {
+            val
+        }
     }
 
     /// Is `name` the storage name of a collection (fixed, dynamic,

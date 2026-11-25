@@ -5,6 +5,25 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    pub(super) fn fit_string_formal_arg(
+        &mut self,
+        dt: &DataType,
+        dims_empty: bool,
+        expr: &Expression,
+        val: Value,
+    ) -> Value {
+        if dims_empty
+            && !val.is_real
+            && self.method_return_is_string(dt)
+            && !matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == INTRA_SAVED_MARKER)
+            && !self.operand_has_string_type(expr)
+        {
+            val.sv_string_strip_nul()
+        } else {
+            val
+        }
+    }
+
     /// Refcounted handle to a module-scope function declaration. Clones the
     /// AST at most once per name; every later call is a pointer copy. Returns
     /// `None` for a name this module does not declare, exactly like the map
@@ -476,6 +495,12 @@ impl Simulator {
                         None => self.eval_expr(&args[i]),
                     },
                 };
+                let value = self.fit_string_formal_arg(
+                    &port.data_type,
+                    port.dimensions.is_empty(),
+                    &args[i],
+                    value,
+                );
                 self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
@@ -485,11 +510,19 @@ impl Simulator {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                     sim.push_pending_formal_dyn(&formal_dyn);
                     let value = sim.eval_formal_default(port, def);
+                    let value = sim.fit_string_formal_arg(
+                        &port.data_type,
+                        port.dimensions.is_empty(),
+                        def,
+                        value,
+                    );
                     let value = sim.vif_argument_value(port, def, value);
                     sim.pop_pending_formal_dyn();
                     sim.pop_local_frame();
                     value
                 })
+            } else if port.dimensions.is_empty() && self.method_return_is_string(&port.data_type) {
+                Value::zero(0)
             } else {
                 Value::zero(32)
             };
@@ -3087,6 +3120,12 @@ impl Simulator {
                             && !self.vif_collection_formal(port);
                         if arg_supplied(i) {
                             let value = self.eval_expr(&args[i]);
+                            let value = self.fit_string_formal_arg(
+                                &port.data_type,
+                                port.dimensions.is_empty(),
+                                &args[i],
+                                value,
+                            );
                             self.vif_argument_value_resolved(is_vif, false, &args[i], value)
                         } else if let Some(default) = &port.default {
                             self.in_subroutine_default_scope(
@@ -3096,6 +3135,12 @@ impl Simulator {
                                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                                     sim.push_pending_formal_dyn(&formal_dyn);
                                     let value = sim.eval_expr(default);
+                                    let value = sim.fit_string_formal_arg(
+                                        &port.data_type,
+                                        port.dimensions.is_empty(),
+                                        default,
+                                        value,
+                                    );
                                     let value = sim.vif_argument_value_resolved(
                                         is_vif, false, default, value,
                                     );
@@ -3104,6 +3149,10 @@ impl Simulator {
                                     value
                                 },
                             )
+                        } else if port.dimensions.is_empty()
+                            && self.method_return_is_string(&port.data_type)
+                        {
+                            Value::zero(0)
                         } else {
                             Value::zero(32)
                         }
@@ -3189,6 +3238,12 @@ impl Simulator {
                                 None => self.eval_expr(&args[i]),
                             },
                         };
+                        let value = self.fit_string_formal_arg(
+                            &port.data_type,
+                            port.dimensions.is_empty(),
+                            &args[i],
+                            value,
+                        );
                         self.vif_argument_value_resolved(is_vif, false, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default
@@ -3202,6 +3257,12 @@ impl Simulator {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                                 sim.push_pending_formal_dyn(&formal_dyn);
                                 let value = sim.eval_formal_default(port, def);
+                                let value = sim.fit_string_formal_arg(
+                                    &port.data_type,
+                                    port.dimensions.is_empty(),
+                                    def,
+                                    value,
+                                );
                                 let value =
                                     sim.vif_argument_value_resolved(is_vif, false, def, value);
                                 sim.pop_pending_formal_dyn();
@@ -3209,6 +3270,10 @@ impl Simulator {
                                 value
                             },
                         )
+                    } else if port.dimensions.is_empty()
+                        && self.method_return_is_string(&port.data_type)
+                    {
+                        Value::zero(0)
                     } else {
                         Value::zero(32)
                     };

@@ -3714,26 +3714,6 @@ impl Simulator {
         }
     }
 
-    /// IEEE 1800-2023 §6.16.6 and Table 6-9 use unsigned byte ordering.
-    /// The text representation stores one Latin-1 character per SV byte.
-    pub(super) fn sv_strcmp(a: &str, b: &str, icase: bool) -> i64 {
-        let byte = |c: char| {
-            let b = c as u8;
-            i64::from(if icase { b.to_ascii_lowercase() } else { b })
-        };
-        for (ca, cb) in a.chars().zip(b.chars()) {
-            let (ca, cb) = (byte(ca), byte(cb));
-            if ca != cb {
-                return ca - cb;
-            }
-        }
-        match a.chars().count().cmp(&b.chars().count()) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }
-    }
-
     /// §6.16: a string character is a `byte` — SIGNED 8-bit. `s[i]` and
     /// `s.getc(i)` of `"\xff"` read -1, and `s[0] + s[1]` is an 8-bit signed
     /// sum.
@@ -3744,25 +3724,123 @@ impl Simulator {
         v
     }
 
-    /// §6.16: a string `Value` built from raw BYTES. The text form of a
-    /// string (`to_sv_string`) holds one Latin-1 char per byte, so bytes
-    /// round-trip through chars, never through UTF-8: `from_utf8_lossy` made
-    /// every byte >= 0x80 a U+FFFD, and `String::into_bytes` of a text form
-    /// yields two bytes for each of them.
+    /// §6.16: a string `Value` built from raw BYTES (big-endian, MSB = byte 0).
     pub(super) fn sv_string_from_bytes(b: &[u8]) -> Value {
-        let s: String = b.iter().map(|&c| char::from(c)).collect();
-        Value::from_string(&s)
+        Value::from_bytes(b)
     }
 
     /// §6.16: integral-to-string conversion removes all NUL characters.
     pub(super) fn sv_string_cast(value: &Value) -> Value {
-        let text: String = value
-            .sv_string_bytes()
-            .into_iter()
-            .filter(|&byte| byte != 0)
-            .map(char::from)
-            .collect();
-        Value::from_string(&text)
+        value.sv_string_strip_nul()
+    }
+
+    /// §6.16.4 / §6.16.8 / §6.16.10: coerce an operand to a 32-bit `int` formal
+    /// (sign-extends signed narrower values, zero-extends unsigned narrower
+    /// values, truncates wider values to low 32 bits, maps X/Z bits to 0).
+    pub(super) fn sv_int_arg(v: &Value) -> i32 {
+        let mut v32 = if v.is_real {
+            Self::real_to_int(v.to_f64(), 32)
+        } else {
+            v.resize_for_assign(32)
+        };
+        if v32.has_xz() {
+            v32 = v32.to_two_state();
+        }
+        v32.to_u64().unwrap_or(0) as u32 as i32
+    }
+
+    /// §6.16.10: `itoa` / `hextoa` / `octtoa` / `bintoa` using 32-bit `integer`
+    /// formal casting (`sv_int_arg`).
+    pub(super) fn sv_int_toa(v: &Value, radix: u32) -> Value {
+        let iv = Self::sv_int_arg(v);
+        let text = match radix {
+            16 => format!("{:x}", iv as u32),
+            8 => format!("{:o}", iv as u32),
+            2 => format!("{:b}", iv as u32),
+            _ => format!("{}", iv),
+        };
+        Value::from_bytes(text.as_bytes())
+    }
+
+    /// §6.16.9 `atoreal` — longest valid SystemVerilog real prefix (supporting `_`
+    /// digit separators after a digit), returning `0.0` on no match.
+    pub(super) fn sv_atoreal(v: &Value) -> f64 {
+        let raw = v.to_sv_string();
+        let t = raw.trim();
+        let b = t.as_bytes();
+        let mut i = 0usize;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let mut saw_int_digit = false;
+        let mut valid_end = 0usize;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                saw_int_digit = true;
+                i += 1;
+                valid_end = i;
+            } else if b[i] == b'_' && saw_int_digit {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let mut saw_frac_digit = false;
+        if i < b.len() && b[i] == b'.' && (saw_int_digit || (i + 1 < b.len() && b[i + 1].is_ascii_digit())) {
+            i += 1;
+            if saw_int_digit {
+                valid_end = i;
+            }
+            while i < b.len() {
+                if b[i].is_ascii_digit() {
+                    saw_frac_digit = true;
+                    i += 1;
+                    valid_end = i;
+                } else if b[i] == b'_' && saw_frac_digit {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let has_mantissa = saw_int_digit || saw_frac_digit;
+        if has_mantissa && i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+            let mut j = i + 1;
+            if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                j += 1;
+            }
+            let mut saw_exp_digit = false;
+            while j < b.len() {
+                if b[j].is_ascii_digit() {
+                    saw_exp_digit = true;
+                    j += 1;
+                    valid_end = j;
+                } else if b[j] == b'_' && saw_exp_digit {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !has_mantissa {
+            return 0.0;
+        }
+        let clean: String = t[..valid_end].bytes().filter(|&c| c != b'_').map(char::from).collect();
+        clean.parse::<f64>().unwrap_or(0.0)
+    }
+
+    /// §6.16.3 `s[i]` string indexing: returns signed 8-bit `byte` `0` when `idx`
+    /// contains X/Z or is out of range (`idx < 0` or `idx >= s.len()`).
+    #[inline]
+    pub(super) fn sv_index_read(base: &Value, idx: &Value) -> Value {
+        if idx.has_xz() {
+            return Self::sv_byte(0);
+        }
+        let byte = match idx.to_i64() {
+            Some(i) if i >= 0 => base.sv_string_getc(i as usize),
+            _ => 0,
+        };
+        Self::sv_byte(byte)
     }
 
     /// §6.16 `toupper`/`tolower`: ASCII letters only; every other byte,

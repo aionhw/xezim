@@ -16,39 +16,30 @@ impl Simulator {
         use super::bytecode::StrOpKind as K;
         let v = |i: usize| -> &Value { &regs[args[i] as usize] };
         match kind {
-            K::Len => Self::int_count(v(0).sv_string_bytes().len() as u64),
+            K::Len => Self::int_count(v(0).sv_string_len() as u64),
             K::GetC => {
-                let idx = v(1).to_u64().unwrap_or(0) as usize;
-                let b = v(0).sv_string_bytes().get(idx).copied().unwrap_or(0);
+                let idx = Self::sv_int_arg(v(1));
+                let b = if idx >= 0 {
+                    v(0).sv_string_getc(idx as usize)
+                } else {
+                    0
+                };
                 Self::sv_byte(b)
             }
+            K::Index => Self::sv_index_read(v(0), v(1)),
             K::Substr => {
-                // Mirror of the AST rule: length from the highest set bit,
-                // inclusive [start, end] byte slice, "" out of range.
-                let base = v(0);
-                let start = v(1).to_u64().unwrap_or(0) as usize;
-                let end = v(2).to_u64().unwrap_or(0) as usize;
-                let mut highest_bit = 0usize;
-                for i in (0..base.width as usize).rev() {
-                    if base.get_bit(i) != LogicBit::Zero {
-                        highest_bit = i;
-                        break;
-                    }
-                }
-                let actual_len = highest_bit.div_ceil(8);
-                if actual_len > 0 && start < actual_len && end < actual_len && start <= end {
-                    let l = (actual_len - 1 - start) * 8 + 7;
-                    let r = (actual_len - 1 - end) * 8;
-                    base.range_select(l, r)
-                } else {
+                let start = Self::sv_int_arg(v(1));
+                let end = Self::sv_int_arg(v(2));
+                if start < 0 || end < start {
                     Value::zero(0)
+                } else {
+                    v(0).sv_string_slice(start as usize, end as usize)
                 }
             }
             K::ToUpper => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), true)),
             K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
             K::Compare | K::ICompare | K::Order => {
-                let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
-                let d = Self::sv_strcmp(&a, &b, matches!(kind, K::ICompare));
+                let d = v(0).sv_string_cmp(v(1), matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
                 out.is_signed = true;
                 out
@@ -60,35 +51,30 @@ impl Simulator {
             K::Concat => {
                 let mut bytes: Vec<u8> = Vec::new();
                 for &r in args {
-                    bytes.extend(regs[r as usize].sv_string_bytes());
+                    bytes.extend_from_slice(&regs[r as usize].sv_string_bytes());
                 }
-                let text: String = bytes.into_iter().map(|b| b as char).collect();
-                Value::from_string(&text)
+                Value::from_bytes(&bytes)
             }
             K::PutC => {
                 let mut b = v(0).sv_string_bytes();
-                let idx = v(1).to_i64().unwrap_or(-1);
-                let ch = (v(2).to_u64().unwrap_or(0) & 0xFF) as u8;
+                let idx = Self::sv_int_arg(v(1));
+                let mut cv = v(2).resize_for_assign(8);
+                if cv.has_xz() {
+                    cv = cv.to_two_state();
+                }
+                let ch = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
                 if idx >= 0 && (idx as usize) < b.len() && ch != 0 {
                     b[idx as usize] = ch;
-                    Self::sv_string_from_bytes(&b)
+                    Value::from_bytes(&b)
                 } else {
                     v(0).clone()
                 }
             }
-            K::IToA => {
-                let x = v(0);
-                let text = if x.width > 32 {
-                    format!("{}", x.to_i64().unwrap_or(0))
-                } else {
-                    format!("{}", x.to_u64().unwrap_or(0) as u32 as i32)
-                };
-                Value::from_string(&text)
-            }
-            K::HexToA => Value::from_string(&format!("{:x}", v(0).to_u64().unwrap_or(0))),
-            K::OctToA => Value::from_string(&format!("{:o}", v(0).to_u64().unwrap_or(0))),
-            K::BinToA => Value::from_string(&format!("{:b}", v(0).to_u64().unwrap_or(0))),
-            K::ToStr => Self::sv_string_cast(v(0)),
+            K::IToA => Self::sv_int_toa(v(0), 10),
+            K::HexToA => Self::sv_int_toa(v(0), 16),
+            K::OctToA => Self::sv_int_toa(v(0), 8),
+            K::BinToA => Self::sv_int_toa(v(0), 2),
+            K::ToStr => v(0).sv_string_strip_nul(),
         }
     }
 

@@ -1246,6 +1246,7 @@ impl Simulator {
             w
         };
         let val = self.eval_expr_ctx(rvalue, w);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         if rhs_call && self.assign_pending_ret_collection(lvalue) {
             return true;
         }
@@ -1410,6 +1411,7 @@ impl Simulator {
             if iw == 0 { 32 } else { iw }
         };
         let val = self.eval_expr_ctx(rvalue, w);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         if rhs_call {
             // The full path takes a returned collection here; a member
             // target is never its destination.
@@ -3360,22 +3362,17 @@ impl Simulator {
                 || self
                     .instance_assoc_member(&lname)
                     .is_some_and(|scoped| !in_frame && self.class_queue_prop(&scoped));
-            if !lhs_is_queue
-                && (self.string_signals.contains(&*lname)
-                    || self.string_signals.contains(
-                        &lh.path
-                            .last()
-                            .map(|s| s.name.name.clone())
-                            .unwrap_or_default(),
-                    )
-                    || self.expr_is_string_valued(rvalue))
-            {
-                let mut s = String::new();
+            if !lhs_is_queue && parts.iter().any(|p| self.operand_has_string_type(p)) {
+                let mut out: Vec<u8> = Vec::new();
                 for p in parts {
                     let pv = self.eval_expr(p);
-                    s.push_str(&pv.to_sv_string());
+                    if self.operand_has_string_type(p) {
+                        out.extend_from_slice(&pv.sv_string_bytes());
+                    } else {
+                        out.extend(pv.sv_string_bytes().into_iter().filter(|&b| b != 0));
+                    }
                 }
-                let sval = Value::from_string(&s);
+                let sval = Value::from_bytes(&out);
                 // Store the byte-concat result with correct scoping:
                 //  - a method-LOCAL string lives in the current call frame
                 //    (VarDecl frame isolation), and reads consult the frame
@@ -3419,6 +3416,7 @@ impl Simulator {
                     None => self.eval_expr(rvalue),
                 };
                 let v = self.fill_into_real_target(lvalue, v);
+                let v = self.fit_rhs_for_string_target(lvalue, rvalue, v);
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
@@ -4711,6 +4709,7 @@ impl Simulator {
             self.eval_assign_rhs(lvalue, rvalue, w)
         };
         let val = self.fill_into_real_target(lvalue, val);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         // A collection RETURNED by the call in `rvalue` (recorded at
         // its `return` statement): copy it into a collection lvalue.
         if matches!(&rvalue.kind, ExprKind::Call { .. }) {

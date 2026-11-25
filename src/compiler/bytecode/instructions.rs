@@ -115,6 +115,8 @@ pub enum StrOpKind {
     /// every NUL removed (§6.16 — `string'(24'hab0063)` is 2 characters,
     /// not 3). Appended last so cached bytecode keeps its variant indices.
     ToStr,
+    /// [s, i] -> 8-bit signed byte at index `i`, 0 if `i` has X/Z or is out of range (§6.16.3).
+    Index,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

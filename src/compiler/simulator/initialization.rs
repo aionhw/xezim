@@ -3597,6 +3597,16 @@ impl Simulator {
                             shortreal_signals.insert(id);
                         }
                     }
+                } else if matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                ) {
+                    for id in first_id..signal_table.len() {
+                        signal_table[id] = Value::zero(0);
+                    }
                 }
             }
         }
@@ -3803,6 +3813,18 @@ impl Simulator {
                         shortreal_signals.insert(id);
                     }
                 }
+            } else if let Some(dt) = module.var_decl_types.get(base)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(0);
+                }
             }
         }
         let mut arrays_nd_sorted: Vec<(&String, &(Vec<(i64, i64)>, u32))> =
@@ -3871,6 +3893,18 @@ impl Simulator {
                     if is_shortreal {
                         shortreal_signals.insert(id);
                     }
+                }
+            } else if let Some(dt) = module.var_decl_types.get(base)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(0);
                 }
             }
         }

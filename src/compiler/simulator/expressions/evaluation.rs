@@ -501,14 +501,16 @@ impl Simulator {
                 v
             }
             ExprKind::StringLiteral(s) => {
-                // IEEE 1800-2017 §6.16: A string literal is a packed array of
-                // bytes (8 bits per character).  An empty string "" has width
-                // 0 (zero characters), *not* 8.  `Value::from_string` also
-                // maps chars above 0x7F to their Latin-1 byte — one byte per
-                // char, matching the §5.9.1 escape decoder — where the old
-                // per-`s.bytes()` loop counted UTF-8 bytes, so `"\xf1"` was
-                // 16 bits wide and truncated to the wrong byte (0xb1).
-                Value::from_string(s)
+                // IEEE 1800-2023 §5.9 / §6.16: A string literal is a packed array
+                // of 8-bit characters; an empty string literal `""` in an integral
+                // context is 8'h00 (`Value::zero(8)`). When converted to `string`,
+                // NUL bytes are removed. `Value::from_string` maps chars > 0x7F to
+                // Latin-1 bytes (1 byte per char).
+                if s.is_empty() {
+                    Value::zero(8)
+                } else {
+                    Value::from_string(s)
+                }
             }
             ExprKind::Ident(hier) => {
                 // §14.3: the flat spelling of `cb.sig[i]` (the select on the
@@ -2442,21 +2444,6 @@ impl Simulator {
                 // corrupts code such as hierarchical scope-string walking.
                 // Both string probes below ask the same questions of an
                 // unchanged state; answer each at most once.
-                let mut left_is_str: Option<bool> = None;
-                let mut right_is_str: Option<bool> = None;
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && *left_is_str.get_or_insert_with(|| self.operand_is_string(left))
-                    && *right_is_str.get_or_insert_with(|| self.operand_is_string(right))
-                {
-                    let ls = l.to_sv_string();
-                    let rs = r.to_sv_string();
-                    let res = match op {
-                        BinaryOp::Eq => ls == rs,
-                        BinaryOp::Neq => ls != rs,
-                        _ => unreachable!(),
-                    };
-                    return Value::from_u64(res as u64, 1);
-                }
                 // IEEE 1800-2017 §11.8.1/§11.8.2: an expression is UNSIGNED as
                 // soon as ANY operand is unsigned, and §11.8.2 step 2 converts
                 // every operand to the EXPRESSION's signedness BEFORE it is
@@ -2512,19 +2499,28 @@ impl Simulator {
                         | BinaryOp::Neq
                 ) && (self.operand_has_string_type(left) || self.operand_has_string_type(right))
                 {
-                    // §6.16: string comparison is by TEXT. Equality also goes
-                    // through here because an out-of-bounds string-collection
-                    // read stores X bits whose text is "" — a bit-level
-                    // compare against "" then yielded X instead of 1 (§6.16
-                    // strings are 2-state).
-                    let (a, b) = (wl.to_sv_string(), wr.to_sv_string());
+                    // §6.16: string comparison is by TEXT (unsigned byte order).
+                    // Normalize non-string-typed operands (literals/integrals) by
+                    // stripping NULs while preserving any `%u`/`%z` NULs already
+                    // inside string-typed operands.
+                    let a = if self.operand_has_string_type(left) {
+                        wl
+                    } else {
+                        wl.sv_string_strip_nul()
+                    };
+                    let b = if self.operand_has_string_type(right) {
+                        wr
+                    } else {
+                        wr.sv_string_strip_nul()
+                    };
+                    let cmp = a.sv_string_cmp(&b, false);
                     let t = match op {
-                        BinaryOp::Lt => a < b,
-                        BinaryOp::Leq => a <= b,
-                        BinaryOp::Gt => a > b,
-                        BinaryOp::Geq => a >= b,
-                        BinaryOp::Eq => a == b,
-                        _ => a != b,
+                        BinaryOp::Lt => cmp < 0,
+                        BinaryOp::Leq => cmp <= 0,
+                        BinaryOp::Gt => cmp > 0,
+                        BinaryOp::Geq => cmp >= 0,
+                        BinaryOp::Eq => cmp == 0,
+                        _ => cmp != 0,
                     };
                     return Value::from_u64(t as u64, 1);
                 }
@@ -2678,6 +2674,11 @@ impl Simulator {
                         (else_expr, then_expr)
                     };
                     let mut v = self.eval_expr_typed(taken, arm_ctx, arms_unsigned);
+                    let str_result = self.operand_has_string_type(then_expr)
+                        || self.operand_has_string_type(else_expr);
+                    if str_result && !v.is_real && !self.operand_has_string_type(taken) {
+                        v = v.sv_string_strip_nul();
+                    }
                     // §11.4.11 + §11.8.1: BOTH branches determine the result
                     // type. If either is unsigned the result is unsigned, and
                     // the narrower branch is then extended by the RESULT's
@@ -2693,7 +2694,7 @@ impl Simulator {
                     // pass to TIMEOUT before this was narrowed).
                     let other_is_cheap =
                         matches!(&other.kind, ExprKind::Ident(_) | ExprKind::Number(_));
-                    if !v.is_real && other_is_cheap {
+                    if !str_result && !v.is_real && other_is_cheap {
                         let o = self.eval_expr_ctx(other, ctx_width);
                         if !o.is_real {
                             if !o.is_signed {
@@ -2708,15 +2709,21 @@ impl Simulator {
                 }
             }
             ExprKind::Concatenation(parts) => {
-                // String concatenation (`{indent, s, ...}`) when any operand is
-                // string-valued: join the operands' text. Bit-concat would
-                // byte-misalign (shifting 0x20 spaces into 0x40 '@').
-                if parts.iter().any(|p| self.expr_is_string_valued(p)) {
-                    let mut s = String::new();
+                // IEEE 1800-2023 §6.16 Table 6-9: concatenation with at least
+                // one `string`-typed operand is a string concatenation.
+                // Literal-only / literal+integral concats stay integral bit-vector
+                // concatenations.
+                if parts.iter().any(|p| self.operand_has_string_type(p)) {
+                    let mut out: Vec<u8> = Vec::new();
                     for p in parts {
-                        s.push_str(&self.eval_expr(p).to_sv_string());
+                        let pv = self.eval_expr(p);
+                        if self.operand_has_string_type(p) {
+                            out.extend_from_slice(&pv.sv_string_bytes());
+                        } else {
+                            out.extend(pv.sv_string_bytes().into_iter().filter(|&b| b != 0));
+                        }
                     }
-                    return Value::from_string(&s);
+                    return Value::from_bytes(&out);
                 }
                 let mut r = Value::zero(0);
                 for p in parts.iter().rev() {
@@ -2836,6 +2843,32 @@ impl Simulator {
                 //    resize handle it.
                 const MAX_REPL: u64 = 1 << 20;
                 let count_val = self.eval_expr(count);
+                if exprs.iter().any(|e| self.operand_has_string_type(e)) {
+                    let Some(c) = count_val.to_i64() else {
+                        return Value::zero(0);
+                    };
+                    if count_val.has_xz() || c <= 0 || (c as u64) > MAX_REPL {
+                        return Value::zero(0);
+                    }
+                    let mut unit: Vec<u8> = Vec::new();
+                    for e in exprs {
+                        let pv = self.eval_expr(e);
+                        if self.operand_has_string_type(e) {
+                            unit.extend_from_slice(&pv.sv_string_bytes());
+                        } else {
+                            unit.extend(pv.sv_string_bytes().into_iter().filter(|&b| b != 0));
+                        }
+                    }
+                    if unit.is_empty() {
+                        return Value::zero(0);
+                    }
+                    let n = c as usize;
+                    let mut out = Vec::with_capacity(unit.len().saturating_mul(n));
+                    for _ in 0..n {
+                        out.extend_from_slice(&unit);
+                    }
+                    return Value::from_bytes(&out);
+                }
                 let n_raw = count_val.to_u64().unwrap_or(1);
                 let n = if n_raw > MAX_REPL { 0 } else { n_raw };
                 let mut inner = Value::zero(0);
@@ -3751,10 +3784,9 @@ impl Simulator {
                         // string flag another frame left on the name is not it.
                         self.frame_name_is_string(nm)
                     } {
-                        let content = self.eval_expr(expr).sv_string_bytes();
-                        let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                        let byte = content.get(i).copied().unwrap_or(0);
-                        return Self::sv_byte(byte);
+                        let base = self.eval_expr(expr);
+                        let idx_val = self.eval_expr(index);
+                        return Self::sv_index_read(&base, &idx_val);
                     }
                 }
                 // Nested packed multi-D select (`a[i][j]` on
@@ -3998,10 +4030,9 @@ impl Simulator {
                 ) {
                     if let Some(fname) = self.flat_member_name(expr) {
                         if self.is_string_collection(&fname) {
-                            let text = self.eval_expr(expr).sv_string_bytes();
-                            let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                            let b = text.get(i).copied().unwrap_or(0);
-                            return Self::sv_byte(b);
+                            let base = self.eval_expr(expr);
+                            let idx_val = self.eval_expr(index);
+                            return Self::sv_index_read(&base, &idx_val);
                         }
                     }
                 }

@@ -801,6 +801,16 @@ impl Simulator {
             ExprKind::StringLiteral(_) => false,
             ExprKind::Paren(inner) => self.operand_has_string_type(inner),
             ExprKind::Concatenation(parts) => parts.iter().any(|e| self.operand_has_string_type(e)),
+            ExprKind::Replication { exprs, .. } => {
+                exprs.iter().any(|e| self.operand_has_string_type(e))
+            }
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.operand_has_string_type(then_expr) || self.operand_has_string_type(else_expr)
+            }
             _ => self.operand_is_string(e),
         }
     }

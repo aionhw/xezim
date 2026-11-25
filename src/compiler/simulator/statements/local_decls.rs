@@ -48,7 +48,7 @@ impl Simulator {
             };
         }
         if matches!(
-            data_type,
+            self.resolve_dt_ref(data_type),
             crate::ast::types::DataType::Simple {
                 kind: crate::ast::types::SimpleType::String,
                 ..
@@ -231,8 +231,17 @@ impl Simulator {
         // defaults to `null`, also when its type is a typedef alias
         // (`vif_t v;`) or an explicit `virtual bus_if v` declaration.
         let is_vif_handle = !is_class_handle && self.decl_is_virtual_iface(data_type);
+        let is_string_type = matches!(
+            self.resolve_dt_ref(data_type),
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        );
         let mut default_v = if is_real_type {
             Value::from_f64(0.0)
+        } else if is_string_type {
+            Value::zero(0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
         {
             Value::zero(w)
@@ -1803,7 +1812,18 @@ impl Simulator {
                             } else {
                                 None
                             };
-                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
+                            let mut raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
+                            if matches!(
+                                self.resolve_dt_ref(data_type),
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            ) && !raw.is_real
+                                && !self.operand_has_string_type(init_expr)
+                            {
+                                raw = raw.sv_string_strip_nul();
+                            }
                             self.fit_local_decl_init(
                                 raw,
                                 eff_w,

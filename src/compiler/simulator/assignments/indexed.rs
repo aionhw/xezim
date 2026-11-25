@@ -1560,13 +1560,27 @@ impl Simulator {
             if self.frame_name_is_string(&name) {
                 // Replace the i-th character of the string CONTENT (not
                 // a byte of the fixed-width container, which would write
-                // the wrong position and grow the string). Mirrors putc.
+                // the wrong position and grow the string). Mirrors putc,
+                // except an X/Z or negative index is out-of-range (no-op).
+                if idx_val.has_xz() {
+                    return false;
+                }
+                let Some(idx) = idx_val.to_i64() else {
+                    return false;
+                };
+                if idx < 0 {
+                    return false;
+                }
                 let mut b = self.eval_expr(expr).sv_string_bytes();
-                let i = idx_val.to_u64().unwrap_or(0) as usize;
-                let cbyte = (val.resize_for_assign(8).to_u64().unwrap_or(0) & 0xFF) as u8;
+                let mut cv = val.resize_for_assign(8);
+                if cv.has_xz() {
+                    cv = cv.to_two_state();
+                }
+                let cbyte = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
+                let i = idx as usize;
                 if i < b.len() && cbyte != 0 {
                     b[i] = cbyte;
-                    return self.assign_value(expr, &Self::sv_string_from_bytes(&b));
+                    return self.assign_value(expr, &Value::from_bytes(&b));
                 }
                 return false;
             }

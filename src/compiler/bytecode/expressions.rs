@@ -373,7 +373,11 @@ impl<'a> BytecodeCompiler<'a> {
                 None
             }
             ExprKind::StringLiteral(s) => {
-                let mut v = Value::from_string(s);
+                let mut v = if s.is_empty() {
+                    Value::zero(8)
+                } else {
+                    Value::from_string(s)
+                };
                 if ctx_width > 0 {
                     v = v.resize(ctx_width);
                 }
@@ -842,8 +846,26 @@ impl<'a> BytecodeCompiler<'a> {
                     // compare always was. Same StrOp routing as the
                     // relational arm below.
                     BinaryOp::Eq | BinaryOp::Neq if string_cmp => {
+                        let l_str = if self.expr_has_string_type_static(left) {
+                            l
+                        } else {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![l])));
+                            tr
+                        };
+                        let r_str = if self.expr_has_string_type_static(right) {
+                            r
+                        } else {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![r])));
+                            tr
+                        };
                         let cmp = self.alloc_reg();
-                        self.emit(Insn::StrOp(cmp, StrOpKind::Order, Box::new(vec![l, r])));
+                        self.emit(Insn::StrOp(
+                            cmp,
+                            StrOpKind::Order,
+                            Box::new(vec![l_str, r_str]),
+                        ));
                         let z = self.alloc_reg();
                         let mut zero = Value::from_u64(0, 32);
                         zero.is_signed = true;
@@ -871,8 +893,26 @@ impl<'a> BytecodeCompiler<'a> {
                     // numerically) — route through the native strcmp and
                     // compare its signed difference against zero.
                     BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq if string_cmp => {
+                        let l_str = if self.expr_has_string_type_static(left) {
+                            l
+                        } else {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![l])));
+                            tr
+                        };
+                        let r_str = if self.expr_has_string_type_static(right) {
+                            r
+                        } else {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![r])));
+                            tr
+                        };
                         let cmp = self.alloc_reg();
-                        self.emit(Insn::StrOp(cmp, StrOpKind::Order, Box::new(vec![l, r])));
+                        self.emit(Insn::StrOp(
+                            cmp,
+                            StrOpKind::Order,
+                            Box::new(vec![l_str, r_str]),
+                        ));
                         let z = self.alloc_reg();
                         let mut zero = Value::from_u64(0, 32);
                         zero.is_signed = true;
@@ -1026,8 +1066,22 @@ impl<'a> BytecodeCompiler<'a> {
                     let to_else = branch_on(self, 0);
                     pick = Some((to_then, to_else, self.alloc_reg()));
                 }
-                let then_reg = self.compile_expr_typed(then_expr, arm_ctx, arms_unsigned)?;
-                let else_reg = self.compile_expr_typed(else_expr, arm_ctx, arms_unsigned)?;
+                let str_cond = self.expr_has_string_type_static(then_expr)
+                    || self.expr_has_string_type_static(else_expr);
+                let mut then_reg = self.compile_expr_typed(then_expr, arm_ctx, arms_unsigned)?;
+                let mut else_reg = self.compile_expr_typed(else_expr, arm_ctx, arms_unsigned)?;
+                if str_cond {
+                    if !self.expr_has_string_type_static(then_expr) {
+                        let tr = self.alloc_reg();
+                        self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![then_reg])));
+                        then_reg = tr;
+                    }
+                    if !self.expr_has_string_type_static(else_expr) {
+                        let tr = self.alloc_reg();
+                        self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![else_reg])));
+                        else_reg = tr;
+                    }
+                }
                 // §11.8.1: a ternary with ANY unsigned arm is unsigned — both
                 // arms then ZERO-extend (a signed arm sign-extended, so
                 // `c ? sa : b` in a 32-bit context read ffffff9c for
@@ -1066,7 +1120,12 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Insn::BranchIfFalse(reg, _) = self.insns[at] {
                         self.insns[at] = Insn::BranchIfFalse(reg, here);
                     }
-                    let r = self.compile_expr_typed(arm, arm_ctx, arms_unsigned)?;
+                    let mut r = self.compile_expr_typed(arm, arm_ctx, arms_unsigned)?;
+                    if str_cond && !self.expr_has_string_type_static(arm) {
+                        let tr = self.alloc_reg();
+                        self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![r])));
+                        r = tr;
+                    }
                     if ctx_width > 0 {
                         if mixed && !arms_unsigned && !self.operand_scrub_is_noop(arm) {
                             self.emit(Insn::ClearSigned(r));
@@ -1894,6 +1953,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             },
             ExprKind::Replication { count, exprs } => {
+                if exprs.iter().any(|e| self.expr_has_string_type_static(e)) {
+                    self.bail("Repl_string");
+                    return None;
+                }
                 let n = match self.eval_const_expr(count) {
                     Some(val) => val,
                     _ => {
@@ -1931,18 +1994,13 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Concatenation(parts) => {
-                // LRM §11.4.12 — when any operand is a `string`, `{a, b, …}`
-                // is a string concat (byte-level), not a bit-vector concat.
-                // The bytecode `Concat` insn bit-concatenates and would
-                // shift the bytes (e.g. a 5-char "hello" gets sized to 40
-                // bits and aligned wrong), so for any string-valued operand
-                // we bail to the AST interpreter which has the special
-                // case at `eval_expr_ctx::Concatenation`.
-                if parts.iter().any(|p| self.expr_is_string_concat_operand(p)) {
+                // LRM §11.4.12 / §6.16 — only when at least one operand HAS
+                // `string` type is `{a, b, …}` a string concat; literal-only /
+                // literal+integral concats remain bit-vector concatenations.
+                if parts.iter().any(|p| self.expr_has_string_type_static(p)) {
                     // §11.4.12: with every operand statically string-valued,
-                    // this is a byte-level join — one native op. A MIXED
-                    // concat (some operands of unknown type) keeps the AST
-                    // path, whose type knowledge is authoritative.
+                    // this is a byte-level join — convert any non-string-typed
+                    // part via `ToStr` (stripping NULs on literals) and join.
                     if parts.iter().all(|p| self.expr_is_string_static(p)) {
                         let start = self.insns.len();
                         let start_reg = self.next_reg;
@@ -1950,7 +2008,19 @@ impl<'a> BytecodeCompiler<'a> {
                         let mut ok = true;
                         for p in parts {
                             match self.compile_expr(p, 0) {
-                                Some(r) => regs.push(r),
+                                Some(r) => {
+                                    if self.expr_has_string_type_static(p) {
+                                        regs.push(r);
+                                    } else {
+                                        let tr = self.alloc_reg();
+                                        self.emit(Insn::StrOp(
+                                            tr,
+                                            StrOpKind::ToStr,
+                                            Box::new(vec![r]),
+                                        ));
+                                        regs.push(tr);
+                                    }
+                                }
                                 None => {
                                     ok = false;
                                     break;
@@ -3320,13 +3390,30 @@ impl<'a> BytecodeCompiler<'a> {
                     // formals keep the self-determined compile.
                     let fn_scope = name.rsplit_once('.').map(|(s, _)| s.to_string());
                     for (ai, a) in args.iter().enumerate() {
-                        let ctx = if fd.ports[ai].dimensions.is_empty() {
+                        let port_dt = Self::port_effective_type(&fd.ports, ai);
+                        let port_is_str = fd.ports[ai].dimensions.is_empty()
+                            && self.decl_is_string(port_dt, fn_scope.as_deref());
+                        let ctx = if port_is_str {
+                            0
+                        } else if fd.ports[ai].dimensions.is_empty() {
                             self.port_effective_width(&fd.ports, ai, fn_scope.as_deref())
                         } else {
                             0
                         };
                         match self.compile_expr(a, ctx) {
-                            Some(r) => arg_values.push(r),
+                            Some(r) => {
+                                if port_is_str && !self.expr_has_string_type_static(a) {
+                                    let tr = self.alloc_reg();
+                                    self.emit(Insn::StrOp(
+                                        tr,
+                                        StrOpKind::ToStr,
+                                        Box::new(vec![r]),
+                                    ));
+                                    arg_values.push(tr);
+                                } else {
+                                    arg_values.push(r);
+                                }
+                            }
                             None => {
                                 ok = false;
                                 break;

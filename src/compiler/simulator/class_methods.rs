@@ -2022,6 +2022,12 @@ impl Simulator {
                                 None => self.eval_expr(&args[i]),
                             },
                         };
+                        let value = self.fit_string_formal_arg(
+                            &port.data_type,
+                            port.dimensions.is_empty(),
+                            &args[i],
+                            value,
+                        );
                         self.vif_argument_value_resolved(is_vif_formal, false, &args[i], value)
                     } else if let Some(def) = &port.default {
                         let saved_spec = self.seed_callee_spec_from_instance(handle, cname);
@@ -2031,6 +2037,12 @@ impl Simulator {
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
                         self.push_pending_formal_dyn(&formal_dyn);
                         let v = self.eval_formal_default(port, def);
+                        let v = self.fit_string_formal_arg(
+                            &port.data_type,
+                            port.dimensions.is_empty(),
+                            def,
+                            v,
+                        );
                         let v = self.vif_argument_value_resolved(is_vif_formal, false, def, v);
                         self.pop_pending_formal_dyn();
                         self.pop_local_frame();
@@ -2039,6 +2051,10 @@ impl Simulator {
                         self.this_stack.pop();
                         self.restore_spec_pooled(saved_spec);
                         v
+                    } else if port.dimensions.is_empty()
+                        && self.method_return_is_string(&port.data_type)
+                    {
+                        Value::zero(0)
                     } else {
                         Value::zero(32)
                     };

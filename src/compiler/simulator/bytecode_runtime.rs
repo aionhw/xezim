@@ -2279,13 +2279,15 @@ impl Simulator {
                         ));
                         out_slots.push((base + i, nm));
                     } else if port_is_string && !v.is_real {
-                        // A string actual must arrive as a STRING expression:
-                        // the callee's §13.5 binding and the DPI string
-                        // readers consume the text, not the packed bits.
-                        args.push(Expression::new(
-                            ExprKind::StringLiteral(v.to_sv_string()),
-                            crate::ast::Span::dummy(),
-                        ));
+                        if fd.is_some() {
+                            args.push(self.make_intra_saved_expr(v, crate::ast::Span::dummy()));
+                        } else {
+                            // DPI C import expects a StringLiteral.
+                            args.push(Expression::new(
+                                ExprKind::StringLiteral(v.to_sv_string()),
+                                crate::ast::Span::dummy(),
+                            ));
+                        }
                     } else {
                         args.push(self.value_method_arg_expr(&v));
                     }

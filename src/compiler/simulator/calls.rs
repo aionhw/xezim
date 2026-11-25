@@ -1650,7 +1650,7 @@ impl Simulator {
                         }
                     }
                 }
-                return Self::int_count(base.sv_string_bytes().len() as u64);
+                return Self::int_count(base.sv_string_len() as u64);
             }
 
             // §6.16 query methods on a receiver that is not a plain identifier
@@ -1680,34 +1680,47 @@ impl Simulator {
                     | "icompare"
             ) && (!matches!(expr.kind, ExprKind::Ident(_)) || self.expr_is_string_valued(expr))
             {
-                let text = self.eval_expr(expr).to_sv_string();
+                let recv_val = self.eval_expr(expr);
                 match mname {
                     "substr" => {
                         let a = args
                             .first()
-                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .map(|e| Self::sv_int_arg(&self.eval_expr(e)))
                             .unwrap_or(0);
                         let b = args
                             .get(1)
-                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
-                            .unwrap_or(0);
-                        let bytes = Value::from_string(&text).sv_string_bytes();
+                            .map(|e| Self::sv_int_arg(&self.eval_expr(e)))
+                            .unwrap_or(-1);
                         // §6.16.8: an out-of-range or inverted range yields "".
-                        if a > b || b >= bytes.len() {
-                            return Value::from_string("");
+                        if a < 0 || b < a {
+                            return Value::zero(0);
                         }
-                        return Self::sv_string_from_bytes(&bytes[a..=b]);
+                        return recv_val.sv_string_slice(a as usize, b as usize);
                     }
                     "getc" => {
                         let i = args
                             .first()
-                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .map(|e| Self::sv_int_arg(&self.eval_expr(e)))
                             .unwrap_or(0);
-                        let b = text.chars().nth(i).map_or(0, |c| c as u32 as u8);
+                        let b = if i >= 0 {
+                            recv_val.sv_string_getc(i as usize)
+                        } else {
+                            0
+                        };
                         return Self::sv_byte(b);
                     }
-                    "toupper" => return Value::from_string(&Self::sv_ascii_case(&text, true)),
-                    "tolower" => return Value::from_string(&Self::sv_ascii_case(&text, false)),
+                    "toupper" => {
+                        return Value::from_string(&Self::sv_ascii_case(
+                            &recv_val.to_sv_string(),
+                            true,
+                        ));
+                    }
+                    "tolower" => {
+                        return Value::from_string(&Self::sv_ascii_case(
+                            &recv_val.to_sv_string(),
+                            false,
+                        ));
+                    }
                     "atoi" | "atohex" | "atooct" | "atobin" => {
                         let radix = match mname {
                             "atohex" => 16,
@@ -1715,15 +1728,19 @@ impl Simulator {
                             "atobin" => 2,
                             _ => 10,
                         };
-                        return sv_ato_value(&text, radix);
+                        return sv_ato_value(&recv_val.to_sv_string(), radix);
                     }
-                    "atoreal" => return Value::from_f64(text.trim().parse::<f64>().unwrap_or(0.0)),
+                    "atoreal" => return Value::from_f64(Self::sv_atoreal(&recv_val)),
                     "compare" | "icompare" => {
-                        let other = args
-                            .first()
-                            .map(|e| self.eval_expr(e).to_sv_string())
-                            .unwrap_or_default();
-                        let c: i64 = Self::sv_strcmp(&text, &other, mname == "icompare");
+                        let c: i64 = if let Some(arg) = args.first() {
+                            let mut other = self.eval_expr(arg);
+                            if !self.operand_has_string_type(arg) && !other.is_real {
+                                other = other.sv_string_strip_nul();
+                            }
+                            recv_val.sv_string_cmp(&other, mname == "icompare")
+                        } else {
+                            recv_val.sv_string_cmp(&Value::zero(0), mname == "icompare")
+                        };
                         let mut v = Value::from_u64(c as u64, 32);
                         v.is_signed = true;
                         return v;
@@ -2319,31 +2336,28 @@ impl Simulator {
                     // class method's formal `name`, so UVM's resource-name
                     // check read the wrong string.
                     if matches!(m.as_str(), "len" | "getc" | "substr") && !recv.has_xz() {
-                        let bytes = recv.sv_string_bytes();
-                        let arg = |this: &mut Self, k: usize| -> Option<i64> {
+                        let arg = |this: &mut Self, k: usize| -> i32 {
                             args.get(k)
-                                .map(|a| this.eval_expr(a).to_i64().unwrap_or(-1))
+                                .map(|a| Self::sv_int_arg(&this.eval_expr(a)))
+                                .unwrap_or(-1)
                         };
                         match m.as_str() {
-                            "len" => return Self::int_count(bytes.len() as u64),
+                            "len" => return Self::int_count(recv.sv_string_len() as u64),
                             "getc" => {
-                                let i = arg(self, 0).unwrap_or(-1);
+                                let i = arg(self, 0);
                                 let b = if i >= 0 {
-                                    bytes.get(i as usize).copied().unwrap_or(0)
+                                    recv.sv_string_getc(i as usize)
                                 } else {
                                     0
                                 };
                                 return Self::sv_byte(b);
                             }
                             _ => {
-                                let (i, j) =
-                                    (arg(self, 0).unwrap_or(-1), arg(self, 1).unwrap_or(-1));
-                                let out: &[u8] = if i < 0 || j < i || j as usize >= bytes.len() {
-                                    &[]
-                                } else {
-                                    &bytes[i as usize..=j as usize]
-                                };
-                                return Self::sv_string_from_bytes(out);
+                                let (i, j) = (arg(self, 0), arg(self, 1));
+                                if i < 0 || j < i {
+                                    return Value::zero(0);
+                                }
+                                return recv.sv_string_slice(i as usize, j as usize);
                             }
                         }
                     }
@@ -2363,8 +2377,7 @@ impl Simulator {
                         // member name `str` is not a standalone signal).
                         // Compute len/size directly from the string value bytes.
                         if matches!(m.as_str(), "len" | "size") {
-                            let bytes = recv.sv_string_bytes();
-                            return Self::int_count(bytes.len() as u64);
+                            return Self::int_count(recv.sv_string_len() as u64);
                         }
                     } else if let Some(v) = self.string_method(&base_expr, &m, args) {
                         return v;
