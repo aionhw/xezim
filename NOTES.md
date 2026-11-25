@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Apply the active `default_nettype` to each definition, including implicit
+  nets in instances, bound connections and primitive terminals. Diagnose
+  invalid directives and expose the definition's default through VPI
+  (§6.10, §22.8, §23.2.2, #1635).
+- Accept implicit-logic `var` declarations with unpacked dimensions, initialize
+  chandle members and two-state enum aliases correctly, and use exact rounding
+  for constant integral casts. Static scalar local initializers execute once
+  (§6.8, §6.12, §6.19, §6.21, §6.24, #1638).
 - Bounded queues retain their capacity in class specializations, local
   declarations and struct members. Inserting into a full queue drops the
   highest-index element, and an input expression can read the queue before
