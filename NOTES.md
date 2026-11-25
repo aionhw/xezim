@@ -10,6 +10,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Packed-struct input ports preserve their member layout when connected to
+  packed vector elements (§7.2.1, §23.3.3, #1645).
+- Nonblocking assignments between overlapping unpacked array slices sample
+  the source elements before updating the destination (§7.4.6, §10.4.2, #1644).
+- Diagnose constructor syntax used as a call argument (§8.7, #1643).
+- `$itor` preserves the operand's width and signedness and rounds real
+  arguments consistently during elaboration and simulation (§6.12, §20.5,
+  #1641).
+- Compiled `foreach` comparisons preserve the element width of collections
+  accessed through other objects (§11.8.1, §12.7.3, #1640).
+
 - Apply the active `default_nettype` to each definition, including implicit
   nets in instances, bound connections and primitive terminals. Diagnose
   invalid directives and expose the definition's default through VPI

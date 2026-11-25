@@ -5139,14 +5139,11 @@ impl Simulator {
                 Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
             }
             "$itor" => {
-                // §20.4: convert a (signed) integer to real. `to_u64` read a
-                // negative arg as a huge unsigned value ($itor(-5) -> 4.29e9);
-                // `to_i64` honors the operand's signedness so -5 -> -5.0.
                 let v = args
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
-                Value::from_f64(v.to_i64().unwrap_or(0) as f64)
+                v.itor()
             }
             // §11.4.13: a bound of a tolerance range `[A +/- B]`/`[A +%- B]`.
             n if n == xezim_core::ast::expr::TOLERANCE_BOUND_FN && args.len() == 3 => {

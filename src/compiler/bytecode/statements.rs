@@ -634,6 +634,14 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nba_intra_timing");
                     return self.emit_fallback(stmt);
                 }
+                // Unpacked copies snapshot the RHS and schedule one update
+                // per element. The scalar NBA instructions cannot do that.
+                if self.names_unpacked_collection(lvalue)
+                    || self.names_unpacked_collection(rvalue)
+                {
+                    self.bail("nba_unpacked_collection");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;

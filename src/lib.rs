@@ -239,6 +239,8 @@ fn design_cache_key_for(
     hash.bytes(&[sv_parser::strict_checks() as u8]);
     // §5.6.1, §23.6: distinguish escaped ports from hierarchical paths.
     hash.text("escaped-port-path-resolution-v1");
+    // Revalidate constructor arguments and refresh packed port layouts and folded $itor.
+    hash.text("constructor-arguments-packed-port-layout-itor-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());

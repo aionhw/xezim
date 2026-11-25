@@ -1070,6 +1070,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // comparing 0 < 0. The plan's element-width fact
                     // (`coll_elem_widths`) is the missing table.
                     .or_else(|| self.member_elem_plan_width_of(hier))
+                    .or_else(|| self.member_coll_elem_width(base))
                     .unwrap_or(1),
                 // issue-301: a select INTO a member-collection element
                 // (`arr[i][2]` on `bit [8:0][7:0] arr[3]`) — the width is
@@ -1093,6 +1094,9 @@ impl<'a> BytecodeCompiler<'a> {
                         .or_else(|| self.member_elem_plan_width(&member.name, true))
                         .unwrap_or(1)
                 }
+                // A collection reached through a handle has the element
+                // width of the receiver's declared class.
+                ExprKind::MemberAccess { .. } => self.member_coll_elem_width(base).unwrap_or(1),
                 _ => 1,
             },
             ExprKind::Replication { count, exprs } => {

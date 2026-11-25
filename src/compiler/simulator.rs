@@ -196,7 +196,8 @@ thread_local! {}
 // Bounded class queues retain their declared capacities and local bounds.
 // Delayed struct assignments retain nested collection members.
 // Implicit-logic collection elements have integral types in compiled methods.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318b;
+// Unpacked NBA copies use the interpreter; dotted collection elements retain their width.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318c;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
