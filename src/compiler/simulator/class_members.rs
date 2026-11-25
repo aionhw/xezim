@@ -4022,7 +4022,7 @@ impl Simulator {
     /// is assignment-compatible with `dest`'s declared class type. Permissive
     /// when types are unknown (null src, non-class handle, untracked dest type)
     /// so only a definite type mismatch fails (IEEE 1800-2023 §8.16).
-    pub(super) fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+    pub(super) fn cast_type_ok(&mut self, dest: &Expression, src: &Value) -> bool {
         self.cast_type_ok_ex(dest, src, None)
     }
 
@@ -4032,33 +4032,21 @@ impl Simulator {
     /// Ident arm; all downstream checks (type-param resolution, value-param
     /// specialization, hierarchy) are unchanged.
     pub(super) fn cast_type_ok_ex(
-        &self,
+        &mut self,
         dest: &Expression,
         src: &Value,
         ovr: Option<&str>,
     ) -> bool {
-        // §6.24.1: casting to an ENUM succeeds only when the value is one of
-        // its members. Checked before the class logic, whose "not a live class
-        // object" escape hatch would otherwise wave every integer through.
-        if let ExprKind::Ident(hh) = &dest.kind {
-            if hh.path.len() == 1 {
-                // Resolve the destination variable's ENUM type name through
-                // every available registry (module signal/local, recorded
-                // method-local decl, or a property of the current `this`
-                // object) and validate the source against that enum's members.
-                if let Some(tn) = self.enum_typename_of_var(&hh.path[0].name.name) {
-                    if let Some(members) = self.module.enum_members.get(&tn) {
-                        // An x or z bit matches no member.
-                        if src.has_xz() {
-                            return false;
-                        }
-                        return match src.to_u64() {
-                            Some(x) => members.iter().any(|(_, mv)| *mv == x),
-                            None => false,
-                        };
-                    }
-                }
-            }
+        // §6.24.2: casting to an ENUM succeeds only when the value matches one
+        // of its members. Resolve `dest`'s declared type through scalar vars,
+        // struct/class fields, array elements, and typedef aliases (avoiding
+        // stale overlay lookups when `ovr` names a known class handle local).
+        let ovr_is_class = ovr.is_some_and(|c| {
+            let base = c.split('#').next().unwrap_or(c);
+            self.module.classes.contains_key(base)
+        });
+        if !ovr_is_class && let Some(ty) = self.enum_receiver_type(dest) {
+            return ty.matches_cast_src(src);
         }
         let h = src.to_u64().unwrap_or(0) as usize;
         if h == 0 {

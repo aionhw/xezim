@@ -3888,36 +3888,54 @@ impl Simulator {
         start_class: &str,
         member: &str,
     ) -> Option<Value> {
-        let mut enum_tds: Vec<(String, u32)> = Vec::new();
-        {
-            let mut cur: Option<&str> = Some(start_class);
-            while let Some(cn) = cur {
-                match self.module.classes.get(cn) {
-                    Some(cd) => {
-                        for (td_name, dt) in &cd.typedef_targets {
-                            if matches!(dt, DataType::Enum(_)) {
-                                let w = self
-                                    .module
-                                    .typedefs
-                                    .get(td_name)
-                                    .copied()
-                                    .unwrap_or(32)
-                                    .max(1);
-                                enum_tds.push((td_name.clone(), w));
-                            }
-                        }
-                        cur = cd.extends.as_deref();
+        let mut cur: Option<&str> = Some(start_class);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(cn).filter(|_| guard < 64) else {
+                break;
+            };
+            for (td_name, dt) in &cd.typedef_targets {
+                let DataType::Enum(et) = dt else {
+                    continue;
+                };
+                let qual_td = format!("{}::{}", cn, td_name);
+                if let Some(members) = self.module.enum_members.get(&qual_td)
+                    && let Some((_, val)) = members.iter().find(|(n, _)| n == member)
+                {
+                    if let Some(pv) = self.module.parameters.get(&format!("{}::{}", cn, member)) {
+                        return Some(pv.clone());
                     }
-                    None => break,
+                    let w = self
+                        .module
+                        .typedefs
+                        .get(&qual_td)
+                        .or_else(|| self.module.typedefs.get(td_name))
+                        .copied()
+                        .unwrap_or(32)
+                        .max(1);
+                    let mut v = Value::from_u64(*val, w);
+                    v.is_signed =
+                        super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+                    return Some(v);
+                }
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                let signed =
+                    super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+                if let Some((_, _, v)) =
+                    super::elaborate::enum_members_values(et, w, signed, &self.module.parameters)
+                        .into_iter()
+                        .find(|(n, _, _)| n == member)
+                {
+                    return Some(v);
                 }
             }
-        }
-        for (td_name, w) in &enum_tds {
-            if let Some(members) = self.module.enum_members.get(td_name) {
-                if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
-                    return Some(Value::from_u64(*val, *w));
-                }
-            }
+            cur = cd.extends.as_deref();
         }
         None
     }

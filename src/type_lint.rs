@@ -2003,7 +2003,23 @@ impl<'a> Ck<'a> {
                 self.walk_value(rvalue, true);
                 self.check_assign(lvalue, rvalue);
             }
-            ExprKind::Unary { operand, .. } => self.walk_value(operand, true),
+            ExprKind::Unary { op, operand } => {
+                // §6.19.4: an enum variable shall not have `++`/`--` applied
+                // without first casting or operating in an integral type.
+                if matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) && let Ty::Enum { name, .. } = self.ty_of(operand)
+                {
+                    self.report(
+                        operand.span,
+                        format!(
+                            "increment/decrement operator cannot be applied to enum variable of type '{name}' (IEEE 1800-2023 §6.19.4)"
+                        ),
+                    );
+                }
+                self.walk_value(operand, true);
+            }
             ExprKind::Binary { left, right, .. } => {
                 self.walk_value(left, true);
                 self.walk_value(right, true);

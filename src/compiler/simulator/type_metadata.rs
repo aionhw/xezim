@@ -2218,6 +2218,41 @@ impl Simulator {
         }
     }
 
+    /// A `TypeReference` naming `tn`, splitting any `a::b::c` qualifiers into
+    /// `scopes` so `lookup_scoped_type` finds qualified package or class types.
+    pub(super) fn scoped_type_ref(tn: &str) -> DataType {
+        if !tn.contains("::") {
+            return Self::class_type_ref(tn);
+        }
+        let span = crate::ast::Span::dummy();
+        let mut parts = tn.split("::").collect::<Vec<_>>();
+        let leaf = parts.pop().unwrap_or(tn);
+        let scopes = parts
+            .into_iter()
+            .map(|s| crate::ast::types::TypeScope {
+                name: crate::ast::Identifier {
+                    name: s.to_string(),
+                    span,
+                },
+                type_args: Vec::new(),
+            })
+            .collect();
+        DataType::TypeReference {
+            name: Box::new(crate::ast::types::TypeName {
+                scopes,
+                name: crate::ast::Identifier {
+                    name: leaf.to_string(),
+                    span,
+                },
+                span,
+                bound: Default::default(),
+            }),
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span,
+        }
+    }
+
     /// The declared type and unpacked dimensions of the variable `name`
     /// heading an array-query operand (see `query_operand_decl_dims`): a
     /// formal or local of the running subroutine, else a property of the

@@ -1751,7 +1751,15 @@ fn check_enum_values(et: &EnumType, scope: ConstScope, errs: &mut Vec<String>) {
             } else {
                 seen.insert(key, m.name.name.clone());
             }
-            next = val + 1;
+            // §6.19: auto-increment follows the value AFTER casting to the
+            // enum base type (e.g. `-4'sd1` on unsigned `bit [3:0]` is 15 -> 16
+            // overflows; `4'd15` on `bit signed [3:0]` is -1 -> 0 fits).
+            let cast_val: i128 = if signed && (key & (1u128 << (width - 1))) != 0 {
+                (key as i128) - (1i128 << width)
+            } else {
+                key as i128
+            };
+            next = cast_val + 1;
         }
     }
 }

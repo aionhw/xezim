@@ -9,14 +9,13 @@ use crate::harness::{Order, check};
 // §6.19.5: Enum name() of a value not in the enum
 #[test]
 fn c6_19_enum_name_other_type() {
-    // Known gap (§6.19.5): `r1` reference `[] 001`, xezim `[XB] 001`
     check(
         "6.19_enum_name_other_type",
         include_str!("sv/6.19_enum_name_other_type.sv"),
         "ren",
         Order::Exact,
-        &["T|r2|[] 101"],
-        &["T|r1|"],
+        &["T|r1|[] 001", "T|r2|[] 101"],
+        &[],
     );
 }
 
@@ -267,7 +266,6 @@ fn c6_data_types() {
 fn c6_types_more() {
     // Known gap (§6.20.2): `6.20.2`: 3 reference lines differ from xezim's 3, e.g. reference `c06x.t1 arr='{1, 2, 3}`, xezim `c06x.t1 arr=x`
     // Known gap (§6.12.1): `6.12.1c` reference `7766279631452241920`, xezim `9223372036854775807`
-    // Known gap (§6.19): `6.19b` reference `[] 001`, xezim `[XB] 001`
     // Known gap (§6.24.1): `6.24.1l` reference `4`, xezim `0`
     // IEEE 1800-2023 over the reference (§6.12, #1463): `shortreal` holds an
     // IEEE 754 binary32 value, so `6.12a` reads `0.3333333433` and `6.12b`
@@ -290,6 +288,7 @@ fn c6_types_more() {
             "T|6.12.1e|1.844674e+19",
             "T|6.12.1f|0.000000",
             "T|6.19a|RUN 011",
+            "T|6.19b|[] 001",
             "T|6.19c|4",
             "T|6.19d|x1 XB",
             "T|6.25|5",
@@ -305,7 +304,6 @@ fn c6_types_more() {
         &[
             "T|6.20.2|",
             "T|6.12.1c|",
-            "T|6.19b|",
             "T|6.24.1l|",
             "T|6.12a|",
             "T|6.12b|",

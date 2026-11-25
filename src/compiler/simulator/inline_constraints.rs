@@ -4128,69 +4128,6 @@ impl Simulator {
         None
     }
 
-    /// Resolve a declared `DataType` to the ENUM typedef name it names, if it
-    /// is (or aliases to) an enum — following typedef chains. Used by `$cast`
-    /// to range-check a value against an enum destination whose variable is a
-    /// class-member / method-local (not tracked by `type_name_of_var`).
-    pub(super) fn data_type_enum_name(&self, dt: &crate::ast::types::DataType) -> Option<String> {
-        use crate::ast::types::DataType;
-        let mut cur = dt.clone();
-        let mut seen: Vec<String> = Vec::new();
-        loop {
-            match &cur {
-                DataType::TypeReference { name, .. } => {
-                    let n = name.name.name.clone();
-                    if self.module.enum_members.contains_key(&n) {
-                        return Some(n);
-                    }
-                    if seen.contains(&n) {
-                        return None; // typedef cycle
-                    }
-                    seen.push(n.clone());
-                    // Follow an aliasing typedef to its underlying type.
-                    match self.module.typedef_types.get(&n) {
-                        Some(next) => cur = next.clone(),
-                        None => return None,
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    /// Resolve a variable to its ENUM typedef name, if any, for `$cast` range
-    /// validation. Tries every type registry in order — module signal / local
-    /// (`type_name_of_var`), a runtime-recorded method-local declaration
-    /// (`var_decl_types`), and a property of the current `this` object (a
-    /// class member like `uvm_report_handler::l_verbosity`).
-    pub(super) fn enum_typename_of_var(&self, vname: &str) -> Option<String> {
-        if let Some(tn) = self.type_name_of_var(vname) {
-            if self.module.enum_members.contains_key(&tn) {
-                return Some(tn);
-            }
-        }
-        if let Some(dt) = self.module.var_decl_types.get(vname).cloned() {
-            if let Some(tn) = self.data_type_enum_name(&dt) {
-                return Some(tn);
-            }
-        }
-        if let Some(h) = self.this_stack.last().copied().flatten() {
-            if let Some(cls) = self
-                .heap
-                .get(h)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name.clone())
-            {
-                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
-                    if self.module.enum_members.contains_key(&tn) {
-                        return Some(tn);
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Build the VPI object for one `$systf` argument.
     ///
     /// A signal-backed argument gets a real signal handle, so a systf can

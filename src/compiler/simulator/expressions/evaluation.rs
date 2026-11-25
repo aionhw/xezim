@@ -941,6 +941,13 @@ impl Simulator {
                         mname.as_str(),
                         "num" | "first" | "last" | "next" | "prev" | "name"
                     ) {
+                        // §5.13, §6.19.5: paren-less enum methods read their
+                        // declared enum type directly (matching paren'd calls),
+                        // before falling back to collection/hierarchical lookup.
+                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
+                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
+                            return v;
+                        }
                         let head = hier_prefix(hier);
                         if head
                             .path
@@ -954,16 +961,6 @@ impl Simulator {
                                 .map(|tn| self.module.enum_members.contains_key(&tn))
                                 .unwrap_or(false)
                                 || self.module.enum_members.contains_key(&bare)
-                                // A PROCEDURAL local's enum typedef is only in
-                                // the typedef overlay/global —
-                                // `type_name_of_var` reads var_class_types and
-                                // the signal tables, none of which know it. So
-                                // `e_t l; l.name` fell through to a
-                                // hierarchical read (""), while the same
-                                // declaration at module scope worked. Frame
-                                // overlay first, as `local_class_type_of`
-                                // orders it; this is the map
-                                // `enum_typed_receiver` already keys on.
                                 || self
                                     .local_typedef_type_of(&bare)
                                     .or_else(|| self.var_typedef_types.get(&bare).cloned())
@@ -974,23 +971,8 @@ impl Simulator {
                                 if let Some(v) = self.eval_builtin_method(&bare, &mname, &[]) {
                                     return v;
                                 }
-                                // `name` has no `BuiltinM` arm: §6.19.5.7's
-                                // enum-method evaluator lives on the CALL
-                                // path, which already decomposes this exact
-                                // multi-segment Ident. A parenless method is
-                                // the zero-argument call §13.5.5 says it is,
-                                // so dispatch it as one rather than reading
-                                // the name as hierarchical storage — that read
-                                // returned "" for `.name` at every scope.
                                 return self.eval_call_inner(expr, &[]);
                             }
-                        }
-                        // §5.13, §6.19.5: any other receiver (a class
-                        // property, a struct member, an element) takes the
-                        // methods from its declared type, as the call does.
-                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
-                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
-                            return v;
                         }
                     }
                 }
@@ -1286,6 +1268,15 @@ impl Simulator {
                                 .contains(&hier.path[0].name.name)
                             && let Some(v) =
                                 self.class_scope_member_value(&hier.path[0].name.name, prop)
+                        {
+                            return v;
+                        }
+                        if hier.path[0].selects.is_empty()
+                            && hier.path[1].selects.is_empty()
+                            && self.module.classes.contains_key(cls)
+                            && !self.signal_name_to_id.contains_key(&format!("{}.{}", cls, prop))
+                            && !self.signal_name_to_id.contains_key(cls)
+                            && let Some(v) = self.class_scoped_enum_literal(cls, prop)
                         {
                             return v;
                         }
