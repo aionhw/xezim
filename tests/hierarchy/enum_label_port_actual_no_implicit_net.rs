@@ -19,10 +19,10 @@ use std::process::Command;
 /// `{CONN}` is the `ff` instance's connection list, `{PRE}` comes first in
 /// the file.
 const SRC: &str = r#"{PRE}
-module ff (input logic clk, input logic din, output logic dout);
+module ff (input wire logic clk, input wire logic din, output logic dout);
   always_ff @(posedge clk) dout <= din;
 endmodule
-module thr (input logic clk);
+module thr (input wire logic clk);
   typedef enum logic [3:0] {IDLE = 4'd0, STREAM = 4'd6} st_t;
   st_t miss_state = STREAM;
   enum logic [1:0] {DA, DB} d = DB;
@@ -109,7 +109,7 @@ package pk;
   typedef enum logic [2:0] { SYS_CSR, SYS_ERET } sys_op_e;
 endpackage
 typedef enum logic [1:0] { U_A, U_B } u_e;
-module probe (input wire i);
+module probe (input i);
 endmodule
 `define CHECK(LBL, OTHER) \
   logic [2:0] op = 3'd0; \
