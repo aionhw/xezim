@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Validate drive and charge strength syntax and retain gate, pull, and UDP
+  strengths through elaboration. Resolve wired nets and supply drivers using
+  their declared strengths (§6.7, §6.6.3, §6.6.6, §28.12, Clause 29, #1638).
+- Detect overlapping drivers on unresolved net bits and reject connections
+  to bidirectional switches (§6.6.2, #1638).
+- Diagnose more procedural net writes without mistaking a block-local variable
+  for an outer net. Check variable declaration initializers against continuous
+  drivers (§6.5, §10.4, #1638).
+
 - Packed-struct input ports preserve their member layout when connected to
   packed vector elements (§7.2.1, §23.3.3, #1645).
 - Nonblocking assignments between overlapping unpacked array slices sample

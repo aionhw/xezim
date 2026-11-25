@@ -4660,7 +4660,12 @@ impl Simulator {
             // §28.12 `$__sres(width, pair, ctl, value, ...)`: a net whose
             // drivers carry strengths, resolved by strength (see
             // `strength_bit`).
-            "$__sres" => {
+            "$__sres" | "$__sres_and" | "$__sres_or" => {
+                let wired_and = match name.as_str() {
+                    "$__sres_and" => Some(true),
+                    "$__sres_or" => Some(false),
+                    _ => None,
+                };
                 let w = args
                     .first()
                     .and_then(|a| self.eval_expr(a).to_u64())
@@ -4676,7 +4681,8 @@ impl Simulator {
                     self.eval_strength_drivers(w, drv.into_iter().map(|(c, k, v)| (c, Some(k), v)));
                 let mut out = Value::zero(w);
                 for i in 0..w as usize {
-                    out.set_bit(i, Self::strength_value_bit(Self::strength_bit(&ds, i)));
+                    let strength = Self::resolve_strength_bit(&ds, i, wired_and);
+                    out.set_bit(i, Self::strength_value_bit(strength));
                 }
                 out
             }

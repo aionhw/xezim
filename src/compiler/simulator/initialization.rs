@@ -3645,8 +3645,14 @@ impl Simulator {
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
                     signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
-                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
-                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri0
+                            | super::elaborate::ResolvedNetKind::Supply0,
+                        ) => Value::zero(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri1
+                            | super::elaborate::ResolvedNetKind::Supply1,
+                        ) => Value::ones(signal_widths_vec[id]),
                         _ => Value::all_z(signal_widths_vec[id]),
                     };
                 }
@@ -3889,8 +3895,14 @@ impl Simulator {
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
                     signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
-                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
-                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri0
+                            | super::elaborate::ResolvedNetKind::Supply0,
+                        ) => Value::zero(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri1
+                            | super::elaborate::ResolvedNetKind::Supply1,
+                        ) => Value::ones(signal_widths_vec[id]),
                         _ => Value::all_z(signal_widths_vec[id]),
                     };
                 }

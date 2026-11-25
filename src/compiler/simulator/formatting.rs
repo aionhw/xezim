@@ -474,7 +474,8 @@ impl Simulator {
                         .iter()
                         .map(|d| (d.s0 * 8 + d.s1, d.ctl.as_ref(), &d.value)),
                 );
-                let (lo, hi) = Self::strength_bit(&ds, 0).unwrap_or((0, 0));
+                let wired_and = self.strength_resolution_mode(&name);
+                let (lo, hi) = Self::resolve_strength_bit(&ds, 0, wired_and).unwrap_or((0, 0));
                 return Self::strength_text(lo, hi);
             }
             // §6.6.6: a supply net drives at supply strength.
@@ -566,7 +567,19 @@ impl Simulator {
     /// span of both its levels for an x, nothing for a z, and its value-or-z
     /// (`L`/`H`) when its tristate control is unknown. Drivers combine by
     /// §28.12.2 (see `combine_strength`). `None` when nothing drives it.
-    pub(super) fn strength_bit(ds: &[(i8, i8, Option<bool>, Value)], i: usize) -> Option<(i8, i8)> {
+    fn strength_resolution_mode(&self, name: &str) -> Option<bool> {
+        match self.module.resolved_net_kinds.get(name) {
+            Some(super::elaborate::ResolvedNetKind::Wand) => Some(true),
+            Some(super::elaborate::ResolvedNetKind::Wor) => Some(false),
+            _ => None,
+        }
+    }
+
+    pub(super) fn resolve_strength_bit(
+        ds: &[(i8, i8, Option<bool>, Value)],
+        i: usize,
+        wired_and: Option<bool>,
+    ) -> Option<(i8, i8)> {
         let mut acc: Option<(i8, i8)> = None;
         for (s0, s1, on, v) in ds {
             // §5.7: an unsized `'1`/`'z`/`'x`/`'0` driver value is a FILL —
@@ -589,7 +602,7 @@ impl Simulator {
             }
             acc = Some(match acc {
                 None => r,
-                Some(a) => Self::combine_strength(a, r),
+                Some(a) => Self::combine_strength(a, r, wired_and),
             });
         }
         acc
@@ -606,7 +619,7 @@ impl Simulator {
     }
 
     /// §28.12.2: combine two strength ranges point by point.
-    pub(super) fn combine_strength(a: (i8, i8), b: (i8, i8)) -> (i8, i8) {
+    pub(super) fn combine_strength(a: (i8, i8), b: (i8, i8), wired_and: Option<bool>) -> (i8, i8) {
         let (mut lo, mut hi) = (i8::MAX, i8::MIN);
         for p in a.0..=a.1 {
             for q in b.0..=b.1 {
@@ -614,6 +627,9 @@ impl Simulator {
                     [p, p]
                 } else if q.abs() > p.abs() {
                     [q, q]
+                } else if let Some(and) = wired_and {
+                    let value = if and { p.min(q) } else { p.max(q) };
+                    [value, value]
                 } else {
                     [p, q]
                 };

@@ -87,7 +87,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &local_types,
                     &mut errs,
                 );
-                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs);
+                check_proc_net_assign(&m.name.name, &m.ports, &m.items, elab, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
@@ -499,31 +499,49 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
     }
 }
 
-/// §6.5: a net (an explicit `wire`/`tri`/... declaration) may not be the target
-/// of a procedural assignment (`=`/`<=` inside always/initial) — only a
-/// continuous assignment or `force`. Catches `wire w; initial w = ...;`.
-/// Nets are the explicit NetDeclarations and the ANSI output ports that
-/// §23.2.2.3 makes nets (`output b`, `output [3:0] c`, `output wire d`, and
-/// the ports inheriting from one); `output logic q` / `output reg q` are
-/// variables. Only `=`/`<=` targets are checked (force/release/assign are
-/// separate statement kinds).
-fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
-    use std::collections::HashSet;
-    if !items.iter().any(|it| {
+/// §6.5/§10.4: procedural writes require variable lvalues.
+fn check_proc_net_assign(
+    module: &str,
+    ports: &PortList,
+    items: &[ModuleItem],
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if !items.iter().any(|item| {
         matches!(
-            it,
-            ModuleItem::AlwaysConstruct(_) | ModuleItem::InitialConstruct(_)
+            item,
+            ModuleItem::AlwaysConstruct(_)
+                | ModuleItem::InitialConstruct(_)
+                | ModuleItem::FinalConstruct(_)
+                | ModuleItem::FunctionDeclaration(_)
+                | ModuleItem::TaskDeclaration(_)
         )
     }) {
         return;
     }
-    let mut nets: HashSet<&str> = HashSet::new();
-    let mut implicit_output_nets: HashSet<&str> = HashSet::new();
-    for it in items {
-        if let ModuleItem::NetDeclaration(nd) = it {
-            for d in &nd.declarators {
-                nets.insert(d.name.name.as_str());
+    let mut nets = HashSet::new();
+    let mut implicit_output_nets = HashSet::new();
+    for item in items {
+        match item {
+            ModuleItem::NetDeclaration(nd) => {
+                nets.extend(nd.declarators.iter().map(|d| d.name.name.as_str()));
             }
+            ModuleItem::DataDeclaration(d) => {
+                // User nettypes use the data declaration syntax. The top's
+                // elaborated net table distinguishes them from typedefs.
+                for decl in &d.declarators {
+                    let name = decl.name.name.as_str();
+                    if d.net_type.is_some()
+                        || (module == elab.name
+                            && matches!(d.data_type, DataType::TypeReference { .. })
+                            && elab.nets.contains(name)
+                            && !elab.implicit_nets.contains(name))
+                    {
+                        nets.insert(name);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if let PortList::Ansi(ps) = ports {
@@ -532,67 +550,183 @@ fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], e
         for p in ps {
             let omitted =
                 p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
-            // A port that carries a variable type is a variable: the parser
-            // copies a net kind into a port that inherits `output reg` from
-            // its predecessor (`output reg q, r`), so the net kind alone
-            // does not decide.
+            let implicit = p.net_type.is_none()
+                && p.direction == Some(PortDirection::Output)
+                && !p.var_kw
+                && matches!(p.data_type, None | Some(DataType::Implicit { .. }));
             let net = if omitted {
                 prev_net
             } else {
-                p.direction == Some(PortDirection::Output)
-                    && !p.var_kw
-                    && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
+                p.net_type.is_some() && !p.var_kw || implicit
             };
             if net {
                 nets.insert(p.name.name.as_str());
             }
-            let implicit_net = net
-                && if omitted { prev_implicit_net } else { p.net_type.is_none() };
-            if implicit_net {
+            if implicit || (omitted && prev_implicit_net) {
                 implicit_output_nets.insert(p.name.name.as_str());
             }
             prev_net = net;
-            prev_implicit_net = implicit_net;
-        }
-        // A body declaration of the same name is not a net port (and is
-        // diagnosed elsewhere if illegal).
-        for it in items {
-            if let ModuleItem::DataDeclaration(d) = it {
-                for dc in &d.declarators {
-                    nets.remove(dc.name.name.as_str());
-                }
-            }
+            prev_implicit_net = implicit || (omitted && prev_implicit_net);
         }
     }
     if nets.is_empty() {
         return;
     }
-    let mut flagged: HashSet<String> = HashSet::new();
-    for it in items {
-        let stmt = match it {
-            ModuleItem::AlwaysConstruct(a) => &a.stmt,
-            ModuleItem::InitialConstruct(i) => &i.stmt,
-            ModuleItem::FinalConstruct(_) => continue,
-            _ => continue,
-        };
-        for_each_proc_assign_lhs(stmt, &mut |lv| {
-            if let Some(b) = base_ident(lv) {
-                if nets.contains(b.as_str()) && flagged.insert(b.clone()) {
-                    let mut message = format!(
-                        "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
-                         §6.5 — nets need a continuous assignment)",
-                        b
-                    );
-                    if implicit_output_nets.contains(b.as_str()) {
-                        use std::fmt::Write;
-                        let _ = write!(message,
-                            ". Output port '{b}' in module '{module}' is a net because its declaration has no explicit data type (§23.2.2.3). Use an explicit variable type such as `output logic` for procedural assignments"
-                        );
-                    }
-                    errs.push(message);
+    let mut flagged = HashSet::new();
+    let mut emit = |name: &str| {
+        if nets.contains(name) && flagged.insert(name.to_owned()) {
+            let mut message = format!(
+                "net '{name}' is the target of a procedural assignment (LRM 1800-2017 §6.5 — nets need a continuous assignment)"
+            );
+            if implicit_output_nets.contains(name) {
+                use std::fmt::Write;
+                let _ = write!(
+                    message,
+                    ". Output port '{name}' in module '{module}' is a net because its declaration has no explicit data type (§23.2.2.3). Use an explicit variable type such as `output logic` for procedural assignments"
+                );
+            }
+            errs.push(message);
+        }
+    };
+    for item in items {
+        let mut locals = Vec::new();
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => {
+                visit_proc_net_writes(&ac.stmt, &mut locals, &mut emit)
+            }
+            ModuleItem::InitialConstruct(ic) => {
+                visit_proc_net_writes(&ic.stmt, &mut locals, &mut emit)
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                visit_proc_net_writes(&fc.stmt, &mut locals, &mut emit)
+            }
+            ModuleItem::FunctionDeclaration(func) => {
+                locals.extend(func.ports.iter().map(|port| port.name.name.as_str()));
+                locals.extend(func.strict_body_ports.iter().map(|port| port.name.as_str()));
+                visit_proc_net_write_list(&func.items, &mut locals, &mut emit);
+            }
+            ModuleItem::TaskDeclaration(task) => {
+                locals.extend(task.ports.iter().map(|port| port.name.name.as_str()));
+                locals.extend(task.strict_body_ports.iter().map(|port| port.name.as_str()));
+                visit_proc_net_write_list(&task.items, &mut locals, &mut emit);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn visit_proc_net_write_list<'a>(
+    statements: &'a [Statement],
+    locals: &mut Vec<&'a str>,
+    emit: &mut dyn FnMut(&str),
+) {
+    let restore = locals.len();
+    for stmt in statements {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &stmt.kind
+        {
+            locals.extend(declarators.iter().map(|decl| decl.name.name.as_str()));
+        }
+        visit_proc_net_writes(stmt, locals, emit);
+    }
+    locals.truncate(restore);
+}
+
+fn proc_net_write_target(lvalue: &Expression, locals: &[&str], emit: &mut dyn FnMut(&str)) {
+    match &lvalue.kind {
+        ExprKind::Concatenation(parts) => {
+            for part in parts {
+                proc_net_write_target(part, locals, emit);
+            }
+        }
+        ExprKind::Ident(h) if h.path.len() == 1 && h.root.is_none() => {
+            let name = h.path[0].name.name.as_str();
+            if !locals.contains(&name) {
+                emit(name);
+            }
+        }
+        ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) => {
+            proc_net_write_target(expr, locals, emit);
+        }
+        _ => {}
+    }
+}
+
+fn proc_net_expr_writes(expr: &Expression, locals: &[&str], emit: &mut dyn FnMut(&str)) {
+    use xezim_core::ast::expr::UnaryOp;
+    xezim_core::elaborate::for_each_sub_expr(expr, &mut |node| match &node.kind {
+        ExprKind::AssignExpr { lvalue, .. } => proc_net_write_target(lvalue, locals, emit),
+        ExprKind::Unary {
+            op: UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr,
+            operand,
+        } => proc_net_write_target(operand, locals, emit),
+        _ => {}
+    });
+}
+
+fn visit_proc_net_writes<'a>(
+    stmt: &'a Statement,
+    locals: &mut Vec<&'a str>,
+    emit: &mut dyn FnMut(&str),
+) {
+    use StatementKind as K;
+    use xezim_core::ast::stmt::{ForInit, ProceduralContinuous};
+    match &stmt.kind {
+        K::BlockingAssign { lvalue, rvalue }
+        | K::NonblockingAssign { lvalue, rvalue, .. }
+        | K::ProceduralContinuous(ProceduralContinuous::Assign { lvalue, rvalue }) => {
+            proc_net_write_target(lvalue, locals, emit);
+            proc_net_expr_writes(rvalue, locals, emit);
+        }
+        K::Expr(expr) => proc_net_expr_writes(expr, locals, emit),
+        K::If {
+            condition,
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            proc_net_expr_writes(condition, locals, emit);
+            visit_proc_net_writes(then_stmt, locals, emit);
+            if let Some(other) = else_stmt {
+                visit_proc_net_writes(other, locals, emit);
+            }
+        }
+        K::Case { items, .. } => {
+            for item in items {
+                visit_proc_net_writes(&item.stmt, locals, emit);
+            }
+        }
+        K::For {
+            init, step, body, ..
+        } => {
+            let restore = locals.len();
+            for item in init {
+                match item {
+                    ForInit::VarDecl { name, .. } => locals.push(name.name.as_str()),
+                    ForInit::Assign { lvalue, .. } => proc_net_write_target(lvalue, locals, emit),
                 }
             }
-        });
+            for expr in step {
+                proc_net_expr_writes(expr, locals, emit);
+            }
+            visit_proc_net_writes(body, locals, emit);
+            locals.truncate(restore);
+        }
+        K::Foreach { body, .. }
+        | K::While { body, .. }
+        | K::DoWhile { body, .. }
+        | K::Repeat { body, .. }
+        | K::Forever { body } => visit_proc_net_writes(body, locals, emit),
+        K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+            visit_proc_net_write_list(stmts, locals, emit);
+        }
+        K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => {
+            visit_proc_net_writes(stmt, locals, emit);
+        }
+        _ => {}
     }
 }
 
@@ -629,53 +763,6 @@ fn for_each_assign_pair(stmt: &Statement, f: &mut dyn FnMut(&Expression, &Expres
         }
         StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
             for_each_assign_pair(stmt, f)
-        }
-        _ => {}
-    }
-}
-
-/// Root identifier of an lvalue, peeling index/part-select/member access.
-fn base_ident(e: &Expression) -> Option<String> {
-    match &e.kind {
-        ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
-        ExprKind::Index { expr, .. }
-        | ExprKind::RangeSelect { expr, .. }
-        | ExprKind::MemberAccess { expr, .. }
-        | ExprKind::Paren(expr) => base_ident(expr),
-        _ => None,
-    }
-}
-
-/// Call `f` on the lvalue of each procedural assignment (`=`/`<=`) in a
-/// statement tree.
-fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
-    match &stmt.kind {
-        StatementKind::BlockingAssign { lvalue, .. }
-        | StatementKind::NonblockingAssign { lvalue, .. } => f(lvalue),
-        StatementKind::If {
-            then_stmt,
-            else_stmt,
-            ..
-        } => {
-            for_each_proc_assign_lhs(then_stmt, f);
-            if let Some(e) = else_stmt {
-                for_each_proc_assign_lhs(e, f);
-            }
-        }
-        StatementKind::Case { items, .. } => items
-            .iter()
-            .for_each(|it| for_each_proc_assign_lhs(&it.stmt, f)),
-        StatementKind::For { body, .. }
-        | StatementKind::Foreach { body, .. }
-        | StatementKind::While { body, .. }
-        | StatementKind::DoWhile { body, .. }
-        | StatementKind::Repeat { body, .. }
-        | StatementKind::Forever { body } => for_each_proc_assign_lhs(body, f),
-        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-            stmts.iter().for_each(|s| for_each_proc_assign_lhs(s, f))
-        }
-        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
-            for_each_proc_assign_lhs(stmt, f)
         }
         _ => {}
     }
