@@ -740,39 +740,46 @@ impl Simulator {
         }
         let dt = dt?;
         let inst = self.heap.get(handle)?.as_ref()?;
-        // Gather the parameter bindings this instance carries, leaf class
-        // first so a derived class's parameter shadows an ancestor's.
-        let mut params: HashMap<String, Value> = HashMap::default();
+        // Gather parameter names/values leaf-first for the cache lookup key
+        // without allocating a HashMap or cloning Values on cache hits.
         let mut fingerprint = String::new();
+        let mut seen_params: Vec<&str> = Vec::new();
         let mut cur: Option<&str> = Some(decl_class);
-        let mut seen: HashSet<String> = HashSet::default();
+        let mut guard = 0usize;
         while let Some(cn) = cur {
-            if !seen.insert(cn.to_string()) {
+            guard += 1;
+            if guard > 64 {
                 break;
             }
             let Some(c) = self.module.classes.get(cn) else {
                 break;
             };
             for (pname, _) in &c.param_defaults {
-                if params.contains_key(pname) {
+                if seen_params.contains(&pname.as_str()) {
                     continue;
                 }
+                seen_params.push(pname.as_str());
                 if let Some(v) = inst.properties.get(pname) {
                     fingerprint.push_str(pname);
                     fingerprint.push('=');
                     fingerprint.push_str(&v.to_dec_string());
                     fingerprint.push(';');
-                    params.insert(pname.clone(), v.clone());
                 }
             }
             cur = c.extends.as_deref();
         }
-        if params.is_empty() {
+        if fingerprint.is_empty() {
             return None;
         }
         let key = (decl_class.to_string(), prop.to_string(), fingerprint);
         if let Some(hit) = self.spec_prop_width_cache.borrow().get(&key) {
             return *hit;
+        }
+        let mut params: HashMap<String, Value> = HashMap::default();
+        for pname in seen_params {
+            if let Some(v) = inst.properties.get(pname) {
+                params.insert(pname.to_string(), v.clone());
+            }
         }
         // The instance carries only the CLASS parameters. A range that also
         // references an enclosing-scope parameter (`bit [W+MW-1:0]`) cannot be
@@ -949,28 +956,39 @@ impl Simulator {
         {
             return None;
         }
-        // `respec_packed_width` answers only for a range that is not constant
-        // on its own (its classification, without the instance) when the
-        // declaring class chain actually has value parameters.
-        let respec = self.class_chain_has_value_params(cn.as_str())
-            && self.module.classes.get(cn.as_str()).is_none_or(|c| {
-                let dims = match self.class_prop_decl_type(c, prop) {
-                    Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
-                        dimensions
-                    }
-                    Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => {
-                        dimensions
-                    }
-                    _ => return false,
-                };
-                dims.iter().any(|d| {
-                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-                })
-            });
-        if respec {
+        let raw_dt = cd.property_types.get(prop);
+        let decl_dt = self.class_prop_decl_type(cd, prop);
+        let resolved_typedef = matches!(raw_dt, Some(DataType::TypeReference { dimensions, type_args, .. }) if dimensions.is_empty() && type_args.is_empty())
+            && decl_dt.is_some_and(|resolved| !std::ptr::eq(resolved, raw_dt.unwrap()));
+        let dims = match decl_dt {
+            Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                Some(dimensions)
+            }
+            Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => {
+                Some(dimensions)
+            }
+            _ => None,
+        };
+        let has_param_dims = dims.is_some_and(|dims| {
+            dims.iter().any(|d| {
+                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+            })
+        });
+        if has_param_dims && self.class_chain_has_value_params(cn.as_str()) {
             return None;
+        }
+        if resolved_typedef
+            && !has_param_dims
+            && let Some(dt) = decl_dt
+            && (dims.is_some()
+                || matches!(self.resolve_dt(dt), DataType::Struct(su) if su.packed))
+        {
+            let w = crate::elaborate::resolve_type_width(dt, None, Some(&self.module.typedefs));
+            if w > 0 && w != sig.width {
+                return Some(Some(w));
+            }
         }
         Some(Some(sig.width).filter(|w| *w > 0))
     }

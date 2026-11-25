@@ -75,6 +75,101 @@ impl Simulator {
         }
     }
 
+    /// Resolve a property's packed width from its declaration (following
+    /// class-local typedefs and class/instance value parameters) when
+    /// elaboration's static width may differ (inherited packed typedefs or
+    /// parameter-sized ranges).
+    fn resolve_prop_packed_width(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        prop: &str,
+        instance: &ClassInstance,
+        params_cache: &mut Option<Option<HashMap<String, Value>>>,
+    ) -> Option<u32> {
+        let raw_dt = cdef.property_types.get(prop)?;
+        let decl_dt = self.class_prop_decl_type(cdef, prop)?;
+        let via_typedef = !std::ptr::eq(decl_dt, raw_dt);
+        let (dims, is_packed_struct) = match decl_dt {
+            DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
+                (dimensions.as_slice(), false)
+            }
+            DataType::Implicit { dimensions, .. } if !dimensions.is_empty() => {
+                (dimensions.as_slice(), false)
+            }
+            DataType::Struct(su) if su.packed && via_typedef => (su.dimensions.as_slice(), true),
+            _ => return None,
+        };
+        let param_dependent = dims.iter().any(|d| {
+            matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                if super::elaborate::const_eval_i64_with_params(left, None).is_none()
+                    || super::elaborate::const_eval_i64_with_params(right, None).is_none())
+        });
+        if !param_dependent && !is_packed_struct && !via_typedef {
+            return None;
+        }
+        if !param_dependent && !is_packed_struct {
+            let w = super::elaborate::resolve_type_width(decl_dt, None, Some(&self.module.typedefs));
+            return (w > 0).then_some(w);
+        }
+        let params = params_cache
+            .get_or_insert_with(|| {
+                let mut params: HashMap<String, Value> = HashMap::default();
+                let mut cur = Some(cdef.name.as_str());
+                let mut guard = 0usize;
+                while let Some(cn) = cur {
+                    guard += 1;
+                    if guard > 64 {
+                        break;
+                    }
+                    let Some(c) = self.module.classes.get(cn) else {
+                        break;
+                    };
+                    for (pname, _) in &c.param_defaults {
+                        if let Some(v) = instance.properties.get(pname) {
+                            params.entry(pname.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    cur = c.extends.as_deref();
+                }
+                (!params.is_empty()).then_some(params)
+            })
+            .as_ref();
+        if param_dependent && params.is_none() {
+            return None;
+        }
+        let env_opt = params.map(|p| super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: p,
+        });
+        if param_dependent
+            && !dims.iter().all(|d| match d {
+                crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                    super::elaborate::const_eval_i64_with_params_env(left, env_opt.as_ref())
+                        .is_some()
+                        && super::elaborate::const_eval_i64_with_params_env(
+                            right,
+                            env_opt.as_ref(),
+                        )
+                        .is_some()
+                }
+                _ => true,
+            })
+        {
+            return None;
+        }
+        let w = match env_opt {
+            Some(env) => super::elaborate::resolve_type_width_env(
+                decl_dt,
+                Some(&env),
+                Some(&self.module.typedefs),
+            ),
+            None => {
+                super::elaborate::resolve_type_width(decl_dt, None, Some(&self.module.typedefs))
+            }
+        };
+        (w > 0).then_some(w)
+    }
+
     /// Shallow copy constructor: clone `src_handle`'s instance (scalar
     /// properties plus instance-scoped queue/assoc members) into a fresh heap
     /// object. Returns the new handle.
@@ -2902,60 +2997,37 @@ impl Simulator {
         // complete now, after the loop above, so re-resolve those ranges here.
         // With no parameter anywhere on the chain the bindings gathered below
         // are always empty and every property is skipped.
-        let chain_has_params = classes_to_init.iter().any(|c| !c.param_defaults.is_empty());
-        for cdef in classes_to_init.iter().filter(|_| chain_has_params) {
-            for (prop, dt) in &cdef.property_types {
-                let dt = self.class_prop_decl_type(cdef, prop).unwrap_or(dt);
-                let dims = match dt {
-                    DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
-                        dimensions
+        let scan_prop_widths = classes_to_init
+            .iter()
+            .any(|c| !c.param_defaults.is_empty() || !c.typedef_targets.is_empty());
+        let mut cdef_params: Vec<Option<Option<HashMap<String, Value>>>> =
+            vec![None; classes_to_init.len()];
+        if scan_prop_widths {
+            for (ci, cdef) in classes_to_init.iter().enumerate() {
+                let pcache = &mut cdef_params[ci];
+                for prop in cdef.property_types.keys() {
+                    if cdef.queue_properties.contains_key(prop)
+                        || cdef.array_properties.contains_key(prop)
+                        || cdef.array_nd_properties.contains_key(prop)
+                        || cdef.assoc_properties.contains_key(prop)
+                    {
+                        continue;
                     }
-                    DataType::Implicit { dimensions, .. } if !dimensions.is_empty() => dimensions,
-                    _ => continue,
-                };
-                // Only ranges that are NOT constant on their own can move with
-                // a parameter; a literal range already elaborated correctly.
-                let param_dependent = dims.iter().any(|d| {
-                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                        if super::elaborate::const_eval_i64_with_params(left, None).is_none()
-                            || super::elaborate::const_eval_i64_with_params(right, None).is_none())
-                });
-                if !param_dependent {
-                    continue;
-                }
-                // Bindings visible to this declaring class, leaf first so a
-                // derived class's parameter shadows an ancestor's.
-                let mut params: HashMap<String, Value> = HashMap::default();
-                let mut cur = Some(cdef.name.clone());
-                let mut seen: HashSet<String> = HashSet::default();
-                while let Some(cn) = cur {
-                    if !seen.insert(cn.clone()) {
-                        break;
-                    }
-                    let Some(c) = self.module.classes.get(&cn) else {
-                        break;
+                    let Some(w) =
+                        self.resolve_prop_packed_width(cdef, prop, &instance, pcache)
+                    else {
+                        continue;
                     };
-                    for (pname, _) in &c.param_defaults {
-                        if let Some(v) = instance.properties.get(pname) {
-                            params.entry(pname.clone()).or_insert_with(|| v.clone());
+                    if let Some(v) = instance.properties.get_mut(prop) {
+                        if !v.is_real && v.width != w {
+                            *v = v.clone().resize(w);
                         }
-                    }
-                    cur = c.extends.clone();
-                }
-                if params.is_empty() {
-                    continue;
-                }
-                let w = super::elaborate::resolve_type_width(
-                    dt,
-                    Some(&params),
-                    Some(&self.module.typedefs),
-                );
-                if w == 0 {
-                    continue;
-                }
-                if let Some(v) = instance.properties.get_mut(prop) {
-                    if !v.is_real && v.width != w {
-                        *v = v.clone().resize(w);
+                    } else if let Some(v) =
+                        instance.properties.get_mut(&format!("{}::{}", cdef.name, prop))
+                    {
+                        if !v.is_real && v.width != w {
+                            *v = v.clone().resize(w);
+                        }
                     }
                 }
             }
@@ -2964,7 +3036,7 @@ impl Simulator {
         // instance-scoped name `<handle>#<member>` so the existing
         // signal-keyed assoc machinery gives each instance its own map.
         let mut hidden_collections: HashSet<&str> = HashSet::default();
-        for cdef in classes_to_init {
+        for (ci, cdef) in classes_to_init.iter().enumerate() {
             for (prop, &is_str) in &cdef.assoc_properties {
                 if hidden_collections.contains(prop.as_str()) {
                     continue;
@@ -2994,6 +3066,12 @@ impl Simulator {
                 if hidden_collections.contains(prop.as_str()) {
                     continue;
                 }
+                let width = if scan_prop_widths {
+                    self.resolve_prop_packed_width(cdef, prop, &instance, &mut cdef_params[ci])
+                        .unwrap_or(width)
+                } else {
+                    width
+                };
                 let scoped = format!("{}#{}", handle, prop);
                 if cdef.property_types.get(prop).is_some_and(|dt| {
                     matches!(
@@ -3007,15 +3085,19 @@ impl Simulator {
                     self.module.queue_vars.insert(scoped.clone());
                 }
                 self.module.dynamic_arrays.insert(scoped.clone());
-                // The object is not on the heap yet: its value parameters
-                // are read from the instance being built.
-                let mut overrides: HashMap<String, Value> = HashMap::default();
-                for (pn, _) in &cdef.param_defaults {
-                    if let Some(v) = instance.properties.get(pn) {
-                        overrides.insert(pn.clone(), v.clone());
+                if cdef.dynamic_tail_properties.contains_key(prop) {
+                    // The object is not on the heap yet: its value parameters
+                    // are read from the instance being built.
+                    let mut overrides: HashMap<String, Value> = HashMap::default();
+                    for (pn, _) in &cdef.param_defaults {
+                        if let Some(v) = instance.properties.get(pn) {
+                            overrides.insert(pn.clone(), v.clone());
+                        }
                     }
+                    self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
+                } else {
+                    self.module.arrays.insert(scoped.clone(), (0, 63, width));
                 }
-                self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }
@@ -3028,6 +3110,12 @@ impl Simulator {
                 if hidden_collections.contains(prop.as_str()) {
                     continue;
                 }
+                let width = if scan_prop_widths {
+                    self.resolve_prop_packed_width(cdef, prop, &instance, &mut cdef_params[ci])
+                        .unwrap_or(width)
+                } else {
+                    width
+                };
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's size.
                 let (lo, hi) = match cdef
@@ -3058,8 +3146,14 @@ impl Simulator {
                 if shared_width {
                     self.widths.declare_fixed(&scoped, lo as u64, hi as u64, width);
                 }
+                let mut elem = String::with_capacity(scoped.len() + 12);
+                elem.push_str(&scoped);
+                elem.push('[');
+                let elem_pfx = elem.len();
                 for i in lo..=hi {
-                    let elem = format!("{}[{}]", scoped, i);
+                    elem.truncate(elem_pfx);
+                    Self::push_i64(&mut elem, i);
+                    elem.push(']');
                     if let Some(su) = &elem_su {
                         let mut cells = Vec::new();
                         self.struct_leaf_plain_defaults(
@@ -3075,7 +3169,7 @@ impl Simulator {
                     if !shared_width {
                         self.widths.insert(elem.clone(), width);
                     }
-                    self.signals.insert(elem, fill.clone());
+                    self.signals.insert(elem.clone(), fill.clone());
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
@@ -3086,6 +3180,12 @@ impl Simulator {
                 if hidden_collections.contains(prop.as_str()) {
                     continue;
                 }
+                let width = if scan_prop_widths {
+                    self.resolve_prop_packed_width(cdef, prop, &instance, &mut cdef_params[ci])
+                        .unwrap_or(*width)
+                } else {
+                    *width
+                };
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's shape.
                 let own_shape = cdef
@@ -3098,15 +3198,15 @@ impl Simulator {
                 if shape.len() == 2 {
                     self.module
                         .arrays_2d
-                        .insert(scoped.clone(), (shape[0], shape[1], *width));
+                        .insert(scoped.clone(), (shape[0], shape[1], width));
                 } else {
                     self.module
                         .arrays_nd
-                        .insert(scoped.clone(), (shape.clone(), *width));
+                        .insert(scoped.clone(), (shape.clone(), width));
                 }
                 let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
                 // §6.8, §7.4: x for a 4-state element type (see above).
-                let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, *width);
+                let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
                 if total > 0 && total <= 65536 {
                     let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
                     'fill: loop {
@@ -3122,7 +3222,7 @@ impl Simulator {
                                 instance.properties.insert(k, v);
                             }
                         }
-                        self.widths.insert(name.clone(), *width);
+                        self.widths.insert(name.clone(), width);
                         self.signals.insert(name, fill.clone());
                         let mut k = shape.len();
                         loop {

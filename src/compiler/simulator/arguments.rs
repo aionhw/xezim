@@ -1351,12 +1351,7 @@ impl Simulator {
     /// its fields into the leaf, as a packed-struct variable does.
     pub(super) fn register_packed_leaf_layout(&mut self, key: &str, dt: &DataType) {
         self.meta_note(key);
-        if let Some(fields) = super::elaborate::packed_struct_field_layout(
-            dt,
-            &self.module.parameters,
-            &self.module.typedefs,
-            &self.module.typedef_types,
-        ) {
+        if let Some(fields) = self.packed_struct_layout_in_ctx(dt) {
             if !fields.is_empty() {
                 self.module
                     .packed_struct_fields
