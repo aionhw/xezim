@@ -4937,9 +4937,10 @@ impl Simulator {
     /// packed struct or union.
     pub(super) fn integral_dt(dt: &DataType) -> bool {
         match dt {
-            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Enum(_) => {
-                true
-            }
+            DataType::IntegerVector { .. }
+            | DataType::IntegerAtom { .. }
+            | DataType::Implicit { .. }
+            | DataType::Enum(_) => true,
             DataType::Struct(su) => su.packed,
             _ => false,
         }

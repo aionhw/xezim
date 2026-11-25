@@ -4974,6 +4974,7 @@ impl Simulator {
         for k in stale {
             self.signals.remove(&k);
             self.widths.remove(&k);
+            self.signed_signals.remove(&k);
         }
         if has_size {
             self.signals.remove(&size_key);
@@ -4993,6 +4994,8 @@ impl Simulator {
         }
         self.module.assoc_index_widths.remove(key);
         self.module.queue_max_sizes.remove(key);
+        self.module.queue_vars.remove(key);
+        self.module.unpacked_decl_dims.remove(key);
         self.module.descending_arrays.remove(key);
         self.module.var_decl_types.remove(key);
         self.module.packed_full_dims.remove(key);
@@ -5018,6 +5021,7 @@ impl Simulator {
         self.signals.remove(&size_key);
         self.widths.remove(key);
         self.string_signals.remove(key);
+        self.signed_signals.remove(key);
         self.dyn_key_scratch = size_key;
     }
 

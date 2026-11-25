@@ -42,6 +42,7 @@ pub(super) mod vpi {
     pub const RELEASE_FLAG: c_int = 6;
 
     // vpi_get properties.
+    pub const DEF_NET_TYPE: c_int = 13;
     pub const UNDEFINED: c_int = -1;
     pub const TYPE: c_int = 1;
     pub const NAME: c_int = 2;
@@ -1824,6 +1825,14 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
     };
+    // §37.3: this property is available for source and compiled designs.
+    if property == vpi::DEF_NET_TYPE && h.kind == VpiKind::Module {
+        return try_active_sim("vpi_get", |sim| {
+            vpi_model::default_net_type(sim, h.inst_idx)
+        })
+        .flatten()
+        .unwrap_or(vpi::UNDEFINED);
+    }
     // VPI object model (vpi_model.rs): the properties of every object it
     // knows, including the declared type.
     let model = match vpi_model::get_static(property, h) {

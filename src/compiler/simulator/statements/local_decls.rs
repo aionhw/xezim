@@ -600,6 +600,27 @@ impl Simulator {
     /// Outlined from `exec_statement` so the dispatcher's stack frame
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
+    /// §6.21/§8.25: a subroutine's static cell is shared across calls of
+    /// the same specialization.
+    fn static_local_storage_key(&self, name: &str) -> Option<String> {
+        if self.in_const_param_eval {
+            return None;
+        }
+        let (sub, _) = self.static_local_syncs.last()?;
+        Some(
+            match (
+                self.class_context_stack.last().and_then(Option::as_ref),
+                &self.current_spec,
+            ) {
+                (Some(class), Some((base, sig))) if base == class => {
+                    format!("{class}#{sig}::{sub}::{name}")
+                }
+                (Some(class), _) => format!("{class}::{sub}::{name}"),
+                _ => format!("{sub}::{name}"),
+            },
+        )
+    }
+
     #[inline(never)]
     pub(in crate::compiler::simulator) fn exec_stmt_var_decl(
         &mut self,
@@ -1647,8 +1668,22 @@ impl Simulator {
                     && !plain
                     && self.is_virtual_iface_type(data_type);
                 let eff_w = w;
-                let v = if let Some(init_expr) =
-                    d.init.as_ref().filter(|_| !struct_init_later && !vif_init_later)
+                let saved_static = if explicit_static
+                    && d.init.is_some()
+                    && (Self::integral_dt(self.resolve_dt_ref(data_type)) || is_real_type)
+                {
+                    self.static_local_storage_key(&d.name.name)
+                        .and_then(|key| self.static_local_vars.get(&key))
+                        .cloned()
+                } else {
+                    None
+                };
+                let v = if let Some(saved) = saved_static {
+                    saved
+                } else if let Some(init_expr) = d
+                    .init
+                    .as_ref()
+                    .filter(|_| !struct_init_later && !vif_init_later)
                 {
                     let produced = self.init_class_or_covergroup_local(
                         data_type,
@@ -1890,8 +1925,8 @@ impl Simulator {
         // §6.21 / §13.3.1: a `static` local declared inside a subroutine
         // keeps ONE persistent storage across all runtime calls, and its
         // initializer runs only once. On the FIRST call we persist the
-        // just-initialized value; on later calls we restore the persisted
-        // value (undoing this call's re-initialization). The final value
+        // just-initialized value; later calls read the persisted scalar
+        // without evaluating its initializer again. The final value
         // is written back on return by `sync_static_locals`. Only scalar
         // integral/real statics are tracked — arrays/queues keep per-call
         // storage.
@@ -1899,11 +1934,6 @@ impl Simulator {
             && !self.static_local_syncs.is_empty()
             && !self.in_const_param_eval
         {
-            let sub_name = self
-                .static_local_syncs
-                .last()
-                .map(|(n, _)| n.clone())
-                .unwrap_or_default();
             for d in declarators {
                 let nm = &d.name.name;
                 // Hoisted declarations already use their shared global cell;
@@ -1919,24 +1949,8 @@ impl Simulator {
                 {
                     continue;
                 }
-                // Build the persistent key. A free function keeps
-                // `"<subroutine>::<var>"` (its class context is None).
-                // A METHOD of a parameterized class appends the active
-                // specialization: `static this_type m_inst;` inside
-                // `C#(P)::get()` must be one shared cell per
-                // specialization (shared across calls of the SAME spec,
-                // distinct across DIFFERENT specs) — IEEE 1800-2023
-                // §8.25/§6.21. The class prefix also keeps two classes'
-                // same-named method locals from colliding.
-                let key = match (
-                    self.class_context_stack.last().and_then(|c| c.as_ref()),
-                    self.current_spec.as_ref(),
-                ) {
-                    (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
-                        format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
-                    }
-                    (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
-                    _ => format!("{}::{}", sub_name, nm),
+                let Some(key) = self.static_local_storage_key(nm) else {
+                    continue;
                 };
                 if let Some(pv) = self.static_local_vars.get(&key).cloned() {
                     if let Some(l) = self.local_stack.last_mut() {

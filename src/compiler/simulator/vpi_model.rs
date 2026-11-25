@@ -6017,6 +6017,21 @@ fn op_type(e: &Expression) -> c_int {
 /// Integer properties. For a model scope or object every property is
 /// answered here (`vpiUndefined` when it does not apply); for other handles
 /// `None` leaves the call to the flat-table code.
+/// §37.3: definition metadata remains available in a compiled design.
+pub(super) fn default_net_type(sim: &Simulator, instance: isize) -> Option<c_int> {
+    let kind = if instance < 0 {
+        sim.module.default_net_type
+    } else {
+        let def = &sim.module.instances.get(instance as usize)?.def_name;
+        sim.module
+            .default_net_types
+            .get(def.as_str())
+            .copied()
+            .unwrap_or(Some(NetType::Wire))
+    };
+    Some(kind.map_or(c::NONE_NET, Builder::net_type_code))
+}
+
 /// The properties answered without the simulator: the location of a
 /// `$systf` call, its constant arguments and an iterator (none the model
 /// knows), and those of the objects made on the fly.

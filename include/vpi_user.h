@@ -135,6 +135,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiName                2
 #define vpiFullName            3
 #define vpiSize                4
+#define vpiDefNetType          13
 #define vpiDefName             9   /* module definition name */
 #define vpiTimeUnit           11   /* module time unit; NULL: the simulation's */
 #define vpiTimePrecision      12   /* module time precision; NULL: the simulation's */

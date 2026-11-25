@@ -94,7 +94,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
-                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                    check_implicit_ports(
+                        &m.ports,
+                        &m.items,
+                        m.default_net_type.is_some(),
+                        &port_map,
+                        &mut errs,
+                    );
                 }
             }
             SourceDefinition::Interface(m) => {
@@ -126,7 +132,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
-                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                    check_implicit_ports(
+                        &m.ports,
+                        &m.items,
+                        m.default_net_type.is_some(),
+                        &port_map,
+                        &mut errs,
+                    );
                 }
             }
             SourceDefinition::Program(m) => {
@@ -159,7 +171,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
-                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                    check_implicit_ports(
+                        &m.ports,
+                        &m.items,
+                        m.default_net_type.is_some(),
+                        &port_map,
+                        &mut errs,
+                    );
                 }
             }
             SourceDefinition::Package(p) => {
@@ -2796,7 +2814,11 @@ fn check_instantiations(
 /// Names visible in a module scope for implicit-port matching. Returns None
 /// (bailing the check) when the scope can gain names we don't track here — any
 /// package import or generate construct — to avoid false positives.
-fn collect_scope_names(ports: &PortList, items: &[ModuleItem]) -> Option<HashSet<String>> {
+fn collect_scope_names(
+    ports: &PortList,
+    items: &[ModuleItem],
+    allow_implicit_nets: bool,
+) -> Option<HashSet<String>> {
     use xezim_core::ast::decl::ParameterKind;
     let mut names: HashSet<String> = HashSet::new();
     match ports {
@@ -2855,7 +2877,7 @@ fn collect_scope_names(ports: &PortList, items: &[ModuleItem]) -> Option<HashSet
                     // §6.10: an undeclared identifier in an instance's port
                     // connection list is an implicit scalar net of this scope,
                     // so a `.name` / `.*` elsewhere in the scope binds to it.
-                    if !xezim_core::sv_parser::default_nettype_none_seen() {
+                    if allow_implicit_nets {
                         for conn in &inst.connections {
                             match conn {
                                 xezim_core::ast::decl::PortConnection::Ordered(Some(e))
@@ -2919,10 +2941,11 @@ fn collect_implicit_net_names(e: &Expression, out: &mut HashSet<String>) {
 fn check_implicit_ports(
     ports: &PortList,
     items: &[ModuleItem],
+    allow_implicit_nets: bool,
     port_map: &HashMap<String, HashSet<String>>,
     errs: &mut Vec<String>,
 ) {
-    let Some(scope) = collect_scope_names(ports, items) else {
+    let Some(scope) = collect_scope_names(ports, items, allow_implicit_nets) else {
         return;
     };
     for it in items {
@@ -4709,19 +4732,25 @@ fn check_nettype_partial_drivers(
     fn nets_in(
         items: &[ModuleItem],
         is_nettype: &dyn Fn(&DataType) -> bool,
-        out: &mut HashSet<String>,
+        out: &mut HashMap<String, usize>,
     ) {
         for it in items {
             match it {
-                ModuleItem::DataDeclaration(d) if is_nettype(&d.data_type) => {
-                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
-                }
-                ModuleItem::NetDeclaration(d) if is_nettype(&d.data_type) => {
-                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
-                }
-                ModuleItem::PortDeclaration(d) if is_nettype(&d.data_type) => {
-                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
-                }
+                ModuleItem::DataDeclaration(d) if is_nettype(&d.data_type) => out.extend(
+                    d.declarators
+                        .iter()
+                        .map(|x| (x.name.name.clone(), x.dimensions.len())),
+                ),
+                ModuleItem::NetDeclaration(d) if is_nettype(&d.data_type) => out.extend(
+                    d.declarators
+                        .iter()
+                        .map(|x| (x.name.name.clone(), x.dimensions.len())),
+                ),
+                ModuleItem::PortDeclaration(d) if is_nettype(&d.data_type) => out.extend(
+                    d.declarators
+                        .iter()
+                        .map(|x| (x.name.name.clone(), x.dimensions.len())),
+                ),
                 ModuleItem::GenerateRegion(g) => nets_in(&g.items, is_nettype, out),
                 ModuleItem::GenerateIf(g) => {
                     for (_, its) in &g.branches {
@@ -4733,32 +4762,42 @@ fn check_nettype_partial_drivers(
             }
         }
     }
-    /// The nettype net a target selects into, if it does.
-    fn partial_target(e: &Expression, nets: &HashSet<String>) -> Option<String> {
-        let root_net = |x: &Expression| match &x.kind {
-            ExprKind::Ident(h) if h.root.is_none() && nets.contains(&h.path[0].name.name) => {
-                Some(h.path[0].name.name.clone())
-            }
-            _ => None,
-        };
+    /// §10.3: consume unpacked indices before testing whether this LHS
+    /// selects into the data type of an individual atomic net.
+    fn partial_target(
+        e: &Expression,
+        nets: &HashMap<String, usize>,
+        indices: usize,
+        selects_inside_value: bool,
+    ) -> Option<String> {
         match &e.kind {
-            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
-                let n = &h.path[0].name.name;
-                (nets.contains(n) && (h.path.len() > 1 || !h.path[0].selects.is_empty()))
-                    .then(|| n.clone())
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let root = h.path.first()?;
+                let rank = *nets.get(&root.name.name)?;
+                let partial = h.path.len() > 1
+                    || selects_inside_value
+                    || indices + root.selects.len() > rank
+                    || root
+                        .selects
+                        .iter()
+                        .any(|s| matches!(s.kind, ExprKind::RangeSelect { .. }));
+                partial.then(|| root.name.name.clone())
             }
-            ExprKind::MemberAccess { expr, .. }
-            | ExprKind::Index { expr, .. }
-            | ExprKind::RangeSelect { expr, .. } => {
-                root_net(expr).or_else(|| partial_target(expr, nets))
+            ExprKind::Index { expr, .. } => {
+                partial_target(expr, nets, indices + 1, selects_inside_value)
             }
-            ExprKind::Concatenation(xs) => xs.iter().find_map(|x| partial_target(x, nets)),
+            ExprKind::MemberAccess { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                partial_target(expr, nets, indices, true)
+            }
+            ExprKind::Concatenation(xs) => {
+                xs.iter().find_map(|x| partial_target(x, nets, 0, false))
+            }
             _ => None,
         }
     }
     fn walk(
         items: &[ModuleItem],
-        nets: &HashSet<String>,
+        nets: &HashMap<String, usize>,
         elab: &ElaboratedModule,
         errs: &mut Vec<String>,
     ) {
@@ -4766,7 +4805,7 @@ fn check_nettype_partial_drivers(
             match it {
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, _) in &ca.assignments {
-                        if let Some(n) = partial_target(l, nets) {
+                        if let Some(n) = partial_target(l, nets, 0, false) {
                             let at = xezim_core::elaborate::span_location(elab, l.span)
                                 .map(|a| format!(" (at {a})"))
                                 .unwrap_or_default();
@@ -4796,11 +4835,11 @@ fn check_nettype_partial_drivers(
             SourceDefinition::Program(m) => (&m.ports, &m.items),
             _ => continue,
         };
-        let mut nets = HashSet::new();
+        let mut nets = HashMap::new();
         if let PortList::Ansi(ps) = ports {
             for p in ps {
                 if p.data_type.as_ref().is_some_and(|dt| is_nettype(dt)) {
-                    nets.insert(p.name.name.clone());
+                    nets.insert(p.name.name.clone(), p.dimensions.len());
                 }
             }
         }
