@@ -113,3 +113,72 @@ endmodule
         ["module 1 4 3 2", "class 1 4 3 2", "updated 9 1", "rows 9 4 1 4"]
     );
 }
+
+/// §7.6 and §8.4: fixed unpacked struct arrays copy in declared order across
+/// class properties, module arrays and multidimensional rows.
+#[test]
+fn direct_class_struct_array_copies_preserve_fields() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+typedef struct { int a; byte b; } S;
+class C;
+  S src[3:2];
+  S d[5:4];
+  S rows[2][2];
+  function void run();
+    d = src;
+    rows[1] = this.src;
+    rows[0] = rows[1];
+    $display("in %0d %0d %0d %0d",d[5].a,d[4].b,rows[0][0].a,rows[1][1].b);
+  endfunction
+endclass
+C c; S md[2]; S src[2];
+initial begin
+  c=new;
+  c.src[3]='{11,12}; c.src[2]='{13,14};
+  src[0]='{21,22}; src[1]='{23,24};
+  md=c.src;
+  $display("out %0d %0d",md[0].a,md[1].b);
+  c.d=src;
+  $display("back %0d %0d",c.d[5].a,c.d[4].b);
+  c.run();
+end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["out 11 14", "back 21 24", "in 11 14 11 14"]);
+}
+
+/// §7.6: a direct array copy includes fixed-array fields of unpacked structs.
+#[test]
+fn direct_fixed_struct_array_copy_includes_nested_array_fields() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int val[2]; } S;
+  class C;
+    S src[1];
+    S dst[3:3];
+  endclass
+  C c;
+  S out_arr[7:7];
+  initial begin
+    c=new;
+    c.src[0].val[0]=42;
+    c.src[0].val[1]=17;
+    out_arr=c.src;
+    c.dst=out_arr;
+    $display("fixed nested %0d %0d %0d %0d",out_arr[7].val[0],out_arr[7].val[1],c.dst[3].val[0],c.dst[3].val[1]);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["fixed nested 42 17 42 17"]);
+}

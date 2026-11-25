@@ -187,3 +187,33 @@ endmodule
 "#);
     assert_eq!(lines, ["pending 0 0", "saved 1 2 3 4"]);
 }
+
+/// §7.6 and §9.4.5: sample an object array through a receiver call once,
+/// before delaying the store.
+#[test]
+fn procedural_delay_captures_a_function_returned_receiver() {
+    let lines = run(r#"
+module top;
+typedef struct { int a; byte b; } S;
+class C;
+  S src[2];
+endclass
+C c;
+int calls;
+S dst[2];
+function C pick();
+  calls++;
+  return c;
+endfunction
+initial begin
+  c=new; c.src[0]='{11,12}; c.src[1]='{13,14};
+  fork
+    dst = #3 pick().src;
+    #1 c.src[0].a=99;
+  join
+  $display("receiver %0d %0d %0d", calls,dst[0].a,dst[1].b);
+end
+endmodule
+"#);
+    assert_eq!(lines, ["receiver 1 11 14"]);
+}

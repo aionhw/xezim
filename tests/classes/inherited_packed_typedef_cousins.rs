@@ -186,3 +186,41 @@ endmodule
     let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert_eq!(lines, ["sizes=11121 out=7ff scope=11 3ff"]);
 }
+
+/// §6.18 and §8.25: a derived class may shadow a local parameter, but its
+/// inherited typedef still takes the parameter of its declaring specialization.
+#[test]
+fn inherited_typedef_uses_the_declaring_localparam() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+class Base #(int W=4);
+  localparam int L=W+1;
+  typedef bit[L-1:0] bits_t;
+  typedef struct packed { bit[L-1:0] p; bit flag; } st_t;
+endclass
+class Child #(int N=3) extends Base#(N+2);
+  localparam int L=55;
+  function void run(output bits_t out);
+    bits_t loc = '1;
+    st_t st = '1;
+    out = loc;
+    $display("method %0d %0d %0d %0h", $bits(loc),$bits(out),$bits(st),st.p);
+  endfunction
+endclass
+initial begin
+  Child#(8) c=new;
+  Base#(10)::bits_t out;
+  Child#(8)::bits_t x='1;
+  Child#(8)::st_t y='1;
+  c.run(out);
+  $display("scope %0d %0h %0d %0h out=%0h",$bits(x),x,$bits(y),y.p,out);
+end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["method 11 11 12 7ff", "scope 11 7ff 12 7ff out=7ff"]);
+}

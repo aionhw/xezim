@@ -90,3 +90,20 @@ fn runs_that_end_before_the_cap_are_unchanged() {
     let fin = run("fin", "module tb; initial #10 $finish; endmodule\n", "1000");
     assert_has(&fin, "Simulation finished at time 10 ($finish called)");
 }
+
+#[test]
+fn an_event_at_the_maximum_timestamp_still_stops_at_the_cap() {
+    let out = run(
+        "max_timestamp",
+        r#"
+module tb;
+  initial #(64'hffff_ffff_ffff_ffff) $display("late");
+  final $display("final %0t", $time);
+endmodule
+"#,
+        "1000",
+    );
+    assert!(!out.contains("late"), "{out}");
+    assert_has(&out, "final 1000");
+    assert_has(&out, "Simulation finished at time 1000");
+}

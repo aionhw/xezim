@@ -99,3 +99,26 @@ endmodule
     let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert_eq!(lines, ["specialized 8 9", "default 4 5", "plain 7 8"]);
 }
+
+/// §7.6 and §8.25: a fixed static array initializer copies the source
+/// specialization in declared index order.
+#[test]
+fn fixed_static_initializer_copies_a_specialized_array() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+class A #(int N=4);
+  static int src[3:2] = '{N,N+1};
+  static int dst[3:1] = {src,N+2};
+  static int dup[3:2] = src;
+  static bit[N-1:0] state[3:2] = '{1'b1+1'b1,'1};
+endclass
+initial $display("static %0d %0d %0d %0d %0d %0d %0h",A#(8)::dst[3],A#(8)::dst[2],A#(8)::dst[1],A#(8)::dup[3],A#(8)::dup[2],A#(8)::state[3],A#(8)::state[2]);
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["static 8 9 10 8 9 2 ff"]);
+}
