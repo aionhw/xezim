@@ -38,6 +38,14 @@ impl Simulator {
         let lo = pos
             .map(|p| p.saturating_mul(ew))
             .filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w))?;
+        let two_state = self.signal_two_state.get(id).copied().unwrap_or(false);
+        let coerced;
+        let val = if two_state && val.has_xz() {
+            coerced = val.to_two_state();
+            &coerced
+        } else {
+            val
+        };
         let mut cur = self.signal_table[id].clone();
         let prev = cur.clone();
         for b in 0..ew {

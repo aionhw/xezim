@@ -1320,7 +1320,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         );
                         let signed = self.type_is_signed_concrete(&m.data_type);
-                        Some(Self::fit_local_decl_init(
+                        Some(self.fit_local_decl_init(
                             raw,
                             mw.max(1),
                             &m.data_type,

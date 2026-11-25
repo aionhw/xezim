@@ -814,6 +814,7 @@ impl Simulator {
         view: &mut [Value],
         signal_widths: &[u32],
         signal_signed: &[bool],
+        signal_two_state: &[bool],
         shortreal_signals: &HashSet<usize>,
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
@@ -1440,7 +1441,10 @@ impl Simulator {
                     let sig_id = &(*sig_id as usize);
                     // §11.5.1: an x/z index modifies no bits.
                     if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
-                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let bit = Self::coerce_bit_two_state(
+                            vm_regs[*val_reg as usize].get_bit(0),
+                            signal_two_state.get(*sig_id).copied().unwrap_or(false),
+                        );
                         if view[*sig_id].get_bit(idx) != bit {
                             let mut new_val = view[*sig_id].clone();
                             new_val.set_bit(idx, bit);
@@ -1462,8 +1466,11 @@ impl Simulator {
                     let (hi, lo) = (hi as u32, lo as u32);
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                     let w = high - low + 1;
-                    let val = vm_regs[*val_reg as usize].resize(w);
+                    let mut val = vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
+                    if signal_two_state.get(id).copied().unwrap_or(false) && val.has_xz() {
+                        val = val.to_two_state();
+                    }
                     let sig_w = signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
                     if oob_write_discard(high as i64, low as i64, sig_w) {
@@ -3922,8 +3929,11 @@ impl Simulator {
                         continue;
                     }
                     let w = high - low + 1;
-                    let val = self.vm_regs[*val_reg as usize].resize(w);
+                    let mut val = self.vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
+                    if self.signal_two_state.get(id).copied().unwrap_or(false) && val.has_xz() {
+                        val = val.to_two_state();
+                    }
                     if self.signal_widths[id] <= 64 && !self.signal_real[id] {
                         let (src_v, src_x) = val.raw_bits();
                         if let Some(i) = self.nba_fast_index.get(id) {
@@ -3994,7 +4004,7 @@ impl Simulator {
                     let below = (-low_i).max(0) as u32;
                     let (low, high) = (low_i.max(0) as u32, high_i.min(u32::MAX as i64) as u32);
                     let w = high - low + 1;
-                    let val = if below > 0 {
+                    let mut val = if below > 0 {
                         self.vm_regs[*val_reg as usize]
                             .shift_right(&Value::from_u64(below as u64, 32))
                             .resize(w)
@@ -4002,6 +4012,9 @@ impl Simulator {
                         self.vm_regs[*val_reg as usize].resize(w)
                     };
                     let id = *sig_id;
+                    if self.signal_two_state.get(id).copied().unwrap_or(false) && val.has_xz() {
+                        val = val.to_two_state();
+                    }
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
@@ -4072,8 +4085,11 @@ impl Simulator {
                     let sig_id = &(*sig_id as usize);
                     // §11.5.1: an x/z index modifies no bits.
                     if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
-                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
                         let id = *sig_id;
+                        let bit = Self::coerce_bit_two_state(
+                            self.vm_regs[*val_reg as usize].get_bit(0),
+                            self.signal_two_state.get(id).copied().unwrap_or(false),
+                        );
                         if let Some(i) = self.nba_fast_index.get(id) {
                             self.nba_fast[i].value.set_bit(idx, bit);
                         } else {
@@ -4261,8 +4277,11 @@ impl Simulator {
                     // x bits to zero, so this cannot be folded into the range
                     // check below -- an unknown index looked like bit 0.
                     if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
-                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
                         let id = *sig_id;
+                        let bit = Self::coerce_bit_two_state(
+                            self.vm_regs[*val_reg as usize].get_bit(0),
+                            self.signal_two_state.get(id).copied().unwrap_or(false),
+                        );
                         // §10.6.2: a forced signal keeps its forced value
                         // (this writes the table directly, past `write_sig!`).
                         let forced = !self.forced_signals.is_empty()
@@ -4288,8 +4307,11 @@ impl Simulator {
                     let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
-                    let val = self.vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
+                    let mut val = self.vm_regs[*val_reg as usize].resize(w);
+                    if self.signal_two_state.get(id).copied().unwrap_or(false) && val.has_xz() {
+                        val = val.to_two_state();
+                    }
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
                     if oob_write_discard(high as i64, low as i64, sig_w) {
@@ -4390,7 +4412,7 @@ impl Simulator {
                     let below = (-low_i).max(0) as u32;
                     let (low, high) = (low_i.max(0) as u32, high_i.min(u32::MAX as i64) as u32);
                     let w = high - low + 1;
-                    let val = if below > 0 {
+                    let mut val = if below > 0 {
                         self.vm_regs[*val_reg as usize]
                             .shift_right(&Value::from_u64(below as u64, 32))
                             .resize(w)
@@ -4398,6 +4420,9 @@ impl Simulator {
                         self.vm_regs[*val_reg as usize].resize(w)
                     };
                     let id = *sig_id;
+                    if self.signal_two_state.get(id).copied().unwrap_or(false) && val.has_xz() {
+                        val = val.to_two_state();
+                    }
                     // §10.6.2: a forced signal keeps its forced value, as in
                     // `BlockingAssignRange`.
                     if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {

@@ -713,6 +713,14 @@ impl SignalMap {
         keys
     }
 
+    #[inline]
+    pub fn has_elem_keys(&self, base: &str) -> bool {
+        if self.elems.get(base).is_some_and(|s| !s.is_empty()) {
+            return true;
+        }
+        !base.contains('[') && self.runs_under(base).next().is_some()
+    }
+
     /// Borrowing form of `keys_with_elem_prefix`: the element keys under
     /// `prefix` (which must end in `[`), cloning none of the map-held ones.
     pub fn elem_keys_with_prefix<'a>(

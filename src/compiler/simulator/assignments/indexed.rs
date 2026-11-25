@@ -76,7 +76,10 @@ impl Simulator {
                 let Some((lo, width)) = range else {
                     return false;
                 };
-                let rhs = val.resize_for_assign(width as u32);
+                let mut rhs = val.resize_for_assign(width as u32);
+                if rhs.has_xz() && self.class_prop_two_state(h, prop) {
+                    rhs = rhs.to_two_state();
+                }
                 for bit in 0..width as usize {
                     cur.set_bit(lo as usize + bit, rhs.get_bit(bit));
                 }
@@ -106,7 +109,10 @@ impl Simulator {
                             if phys < 0 || phys >= cur.width as i64 {
                                 return false; // out-of-range bit write discarded
                             }
-                            let nb = val.get_bit(0);
+                            let nb = Self::coerce_bit_two_state(
+                                val.get_bit(0),
+                                self.name_is_two_state(&en),
+                            );
                             let changed = cur.get_bit(phys as usize) != nb;
                             if changed {
                                 let mut nv = cur;
@@ -169,7 +175,16 @@ impl Simulator {
                                 .packed_elem_lsb(&pkey, idx, elem_w)
                                 .filter(|lo| lo + (elem_w as usize) <= width as usize)
                             {
-                                let piece = val.resize_for_assign(elem_w);
+                                let mut piece = val.resize_for_assign(elem_w);
+                                let two_state = match store {
+                                    VarStore::Table(id) => {
+                                        self.signal_two_state.get(id).copied().unwrap_or(false)
+                                    }
+                                    VarStore::Frame => self.name_is_two_state(&base),
+                                };
+                                if two_state && piece.has_xz() {
+                                    piece = piece.to_two_state();
+                                }
                                 match store {
                                     VarStore::Frame => {
                                         if let Some(cur) = self
@@ -215,7 +230,10 @@ impl Simulator {
                         if let Some(mut cur) = self.get_local_or_signal(&key) {
                             if cur.width > elem_w {
                                 self.select_store_copies += u64::from(cur.width > 64);
-                                let piece = val.resize_for_assign(elem_w);
+                                let mut piece = val.resize_for_assign(elem_w);
+                                if piece.has_xz() && self.name_is_two_state(&key) {
+                                    piece = piece.to_two_state();
+                                }
                                 let Some(lo) = self.packed_elem_lsb(&pkey, idx, elem_w) else {
                                     return false;
                                 };
@@ -288,7 +306,10 @@ impl Simulator {
         if let Some((sig, lsb, w)) = self.packed_struct_elem_slice(expr, index) {
             if let Some(cur_sig) = self.get_signal_value_by_name(&sig) {
                 let mut cur = cur_sig.clone();
-                let piece = val.resize_for_assign(w);
+                let mut piece = val.resize_for_assign(w);
+                if piece.has_xz() && self.name_is_two_state(&sig) {
+                    piece = piece.to_two_state();
+                }
                 let mut changed = false;
                 for i in 0..w {
                     let nb = piece.get_bit(i as usize);
@@ -613,13 +634,14 @@ impl Simulator {
                         // of the whole local for each bit written made a
                         // bit loop over a wide local quadratic.
                         let bit = i as usize;
+                        let two_state_local = self.name_is_two_state(&base);
                         if let Some(cur) = self
                             .local_stack
                             .last_mut()
                             .and_then(|f| f.get_mut(base.as_ref()))
                             && bit < cur.width as usize
                         {
-                            let nb = val.bits_first();
+                            let nb = Self::coerce_bit_two_state(val.bits_first(), two_state_local);
                             let changed = cur.get_bit(bit) != nb;
                             if changed {
                                 cur.set_bit(bit, nb);
@@ -693,8 +715,12 @@ impl Simulator {
                     let i = idx_v.to_i64().unwrap_or(0);
                     if let Some(mut cur) = self.get_signal_value_by_name(&base) {
                         if i >= 0 && (i as u32) < cur.width {
+                            let nb = Self::coerce_bit_two_state(
+                                val.get_bit(0),
+                                self.name_is_two_state(&base),
+                            );
                             let prev = cur.clone();
-                            cur.set_bit(i as usize, val.get_bit(0));
+                            cur.set_bit(i as usize, nb);
                             let changed = cur != prev;
                             if changed {
                                 self.set_signal_value_by_name(&base, cur);
@@ -718,9 +744,13 @@ impl Simulator {
                     };
                     if i >= lo_l && i <= hi_l {
                         let pos = (hi_l - i) as usize;
+                        let nb = Self::coerce_bit_two_state(
+                            val.get_bit(0),
+                            self.signal_two_state.get(id).copied().unwrap_or(false),
+                        );
                         let mut cur = self.signal_table[id].clone();
                         let prev = cur.clone();
-                        cur.set_bit(pos, val.get_bit(0));
+                        cur.set_bit(pos, nb);
                         let changed = cur != prev;
                         if changed {
                             self.signal_table[id] = cur;
@@ -774,6 +804,9 @@ impl Simulator {
                 // element, which keeps the value).
                 Some(_) if val.is_real => match self.assoc_store_ctx_width(&an) {
                     Some(w) => Self::real_to_int(val.to_f64(), w),
+                    None if self.name_is_shortreal(&an) => {
+                        Value::from_f64(val.to_f64() as f32 as f64)
+                    }
                     None => val.clone(),
                 },
                 _ => self.fit_block_local_array_elem(&an, &elem_name, val.clone()),
@@ -822,8 +855,7 @@ impl Simulator {
                             name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
                         }
                         if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
-                            let width = self.signal_widths[id];
-                            let resized = val.resize_for_assign(width);
+                            let resized = self.fit_value_to_signal(id, val);
                             let changed = self.signal_table[id] != resized;
                             if changed {
                                 if !self.dirty_signals[id] {
@@ -836,9 +868,17 @@ impl Simulator {
                             }
                             return changed;
                         }
-                        let changed = self.signals.get(&*name).is_none_or(|p| *p != *val);
+                        let mut fitted = if self.name_is_shortreal(&base_name) {
+                            Value::from_f64(val.to_f64() as f32 as f64)
+                        } else {
+                            val.clone()
+                        };
+                        if self.name_is_two_state(&base_name) && fitted.has_xz() {
+                            fitted = fitted.to_two_state();
+                        }
+                        let changed = self.signals.get(&*name).is_none_or(|p| *p != fitted);
                         if changed {
-                            self.signals.insert(name.to_string(), val.clone());
+                            self.signals.insert(name.to_string(), fitted);
                             self.mark_dirty(&name);
                         }
                         return changed;
@@ -900,7 +940,10 @@ impl Simulator {
                                 if let Some(b) = bv.to_i64().filter(|_| !bv.has_xz()) {
                                     if b >= 0 && (b as u32) < cur.width {
                                         let mut nv = cur.clone();
-                                        let nb = val.get_bit(0);
+                                        let nb = Self::coerce_bit_two_state(
+                                            val.get_bit(0),
+                                            self.name_is_two_state(&base_name),
+                                        );
                                         let changed = nv.get_bit(b as usize) != nb;
                                         if changed {
                                             nv.set_bit(b as usize, nb);
@@ -989,7 +1032,10 @@ impl Simulator {
                                 if let Some(b) = bv.to_i64().filter(|_| !bv.has_xz()) {
                                     if b >= 0 && (b as u32) < cur.width {
                                         let mut nv = cur.clone();
-                                        let nb = val.get_bit(0);
+                                        let nb = Self::coerce_bit_two_state(
+                                            val.get_bit(0),
+                                            self.name_is_two_state(&name),
+                                        );
                                         let changed = nv.get_bit(b as usize) != nb;
                                         if changed {
                                             nv.set_bit(b as usize, nb);
@@ -1070,8 +1116,7 @@ impl Simulator {
                     }
                     let elem_name = format!("{}[{}][{}]", name, i, j);
                     if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                        let width = self.signal_widths[id];
-                        let resized = val.resize_for_assign(width);
+                        let resized = self.fit_value_to_signal(id, val);
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             if !self.dirty_signals[id] {
@@ -1084,9 +1129,17 @@ impl Simulator {
                         }
                         return changed;
                     }
-                    let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
+                    let mut fitted = if self.name_is_shortreal(&name) {
+                        Value::from_f64(val.to_f64() as f32 as f64)
+                    } else {
+                        val.clone()
+                    };
+                    if self.name_is_two_state(&name) && fitted.has_xz() {
+                        fitted = fitted.to_two_state();
+                    }
+                    let changed = self.signals.get(&elem_name).is_none_or(|p| *p != fitted);
                     if changed {
-                        self.signals.insert(elem_name.clone(), val.clone());
+                        self.signals.insert(elem_name.clone(), fitted);
                         self.mark_dirty(&elem_name);
                         // §9.2.2.2: a queue/dyn/assoc ELEMENT has no
                         // signal id of its own — comb readers depend on
@@ -1131,7 +1184,15 @@ impl Simulator {
                 return changed;
             }
             let fitted = match self.signals.get(&leaf) {
-                Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
+                Some(p) if p.is_real => {
+                    if self.name_is_shortreal(&leaf) {
+                        Value::from_f64(val.to_f64() as f32 as f64)
+                    } else if val.is_real {
+                        val.clone()
+                    } else {
+                        Value::from_f64(val.to_f64())
+                    }
+                }
                 Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                 Some(p) if !p.is_real && p.width > 0 => {
                     let mut f = val.resize_for_assign(p.width);
@@ -1163,7 +1224,10 @@ impl Simulator {
                 let total_w = cur_sig.width as usize;
                 if lo + w as usize <= total_w {
                     let mut nv = cur_sig.clone();
-                    let piece = val.resize_for_assign(w);
+                    let mut piece = val.resize_for_assign(w);
+                    if self.name_is_two_state(&base) && piece.has_xz() {
+                        piece = piece.to_two_state();
+                    }
                     let mut changed = false;
                     for i in 0..w as usize {
                         let nb = piece.get_bit(i);
@@ -1201,9 +1265,13 @@ impl Simulator {
                         let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let lo = i * (elem_w as usize) + j;
                         if lo < total_w {
+                            let nb = Self::coerce_bit_two_state(
+                                val.get_bit(0),
+                                self.signal_two_state.get(id).copied().unwrap_or(false),
+                            );
                             let mut cur = self.signal_table[id].clone();
                             let prev = cur.clone();
-                            cur.set_bit(lo, val.get_bit(0));
+                            cur.set_bit(lo, nb);
                             let changed = cur != prev;
                             if changed {
                                 self.signal_table[id] = cur;
@@ -1223,8 +1291,12 @@ impl Simulator {
                         let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let lo = i * (elem_w as usize) + j;
                         if lo < total_w {
+                            let nb = Self::coerce_bit_two_state(
+                                val.get_bit(0),
+                                self.name_is_two_state(&base),
+                            );
                             let mut nv = cur.clone();
-                            nv.set_bit(lo, val.get_bit(0));
+                            nv.set_bit(lo, nb);
                             let changed = nv != cur;
                             if changed {
                                 self.set_signal_value_by_name(&base, nv);
@@ -1277,7 +1349,10 @@ impl Simulator {
                         if let Some(prev) = self.get_signal_value_by_name(&target) {
                             let w = prev.width as usize;
                             if idx < w {
-                                let nb = val.get_bit(0);
+                                let nb = Self::coerce_bit_two_state(
+                                    val.get_bit(0),
+                                    self.name_is_two_state(&target),
+                                );
                                 let old = prev.get_bit(idx);
                                 let changed = old != nb;
                                 if changed {
@@ -1308,7 +1383,10 @@ impl Simulator {
                         if let Some((lsb, w)) =
                             Self::packed_chain_slice(cur.width as u64, &dims, &idx)
                         {
-                            let piece = val.resize_for_assign(w as u32);
+                            let mut piece = val.resize_for_assign(w as u32);
+                            if piece.has_xz() && self.class_prop_two_state(h, &prop) {
+                                piece = piece.to_two_state();
+                            }
                             let mut nv = cur.clone();
                             for i in 0..(w as usize) {
                                 nv.set_bit(lsb as usize + i, piece.get_bit(i));
@@ -1390,25 +1468,7 @@ impl Simulator {
                         if is_packed_id(id) {
                             return self.fast_signal_write_id(id, val);
                         }
-                        let width = self.signal_widths[id];
-                        // §6.16: a string element has no declared
-                        // length — the width is a placeholder.
-                        let mut resized = if self.signal_is_string.get(id).copied().unwrap_or(false)
-                        {
-                            val.clone()
-                        } else {
-                            val.resize_for_assign(width)
-                        };
-                        // §6.11.2/§10.7: a 2-state element (`int a[4]`)
-                        // stores an x or z bit of the RHS as 0. Stored
-                        // verbatim, `a[k] = a[k] * 3 + x_bit` kept x.
-                        if self.signal_two_state.get(id).copied().unwrap_or(false) {
-                            resized = resized.to_two_state();
-                        }
-                        // Adopt the element's declared signedness — a
-                        // signed RHS (e.g. an `integer`) stored verbatim
-                        // made `reg [15:0] a[]` elements read as signed.
-                        resized.is_signed = self.signal_signed[id];
+                        let resized = self.fit_value_to_signal(id, val);
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             if !self.dirty_signals[id] {
@@ -1424,17 +1484,7 @@ impl Simulator {
                 }
                 let elem_name = format!("{}[{}]", name, idx_str);
                 if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                    let width = self.signal_widths[id];
-                    let mut resized = if self.signal_is_string.get(id).copied().unwrap_or(false) {
-                        val.clone()
-                    } else {
-                        val.resize_for_assign(width)
-                    };
-                    // §6.11.2: a 2-state element takes x/z bits as 0.
-                    if self.signal_two_state.get(id).copied().unwrap_or(false) {
-                        resized = resized.to_two_state();
-                    }
-                    resized.is_signed = self.signal_signed[id];
+                    let resized = self.fit_value_to_signal(id, val);
                     let changed = self.signal_table[id] != resized;
                     if changed {
                         if !self.dirty_signals[id] {
@@ -1560,7 +1610,10 @@ impl Simulator {
                 if let Some(id) = sig_id {
                     let total_w = self.signal_widths[id];
                     let mut cur = self.signal_table[id].clone();
-                    let piece = val.resize_for_assign(elem_w);
+                    let mut piece = val.resize_for_assign(elem_w);
+                    if self.signal_two_state.get(id).copied().unwrap_or(false) && piece.has_xz() {
+                        piece = piece.to_two_state();
+                    }
                     // Normalized for ascending / non-zero-based outer
                     // dims (§7.4.1) — raw idx*w mirrored [0:N-1] slots.
                     let Some(lo) = self.packed_elem_lsb(&pkey, idx as i64, elem_w) else {
@@ -1597,8 +1650,12 @@ impl Simulator {
                         None
                     };
                     if let Some(key) = key {
+                        let two_state = self.name_is_two_state(&key);
                         if let Some(mut cur) = self.get_signal_value_by_name(&key) {
-                            let piece = val.resize_for_assign(elem_w);
+                            let mut piece = val.resize_for_assign(elem_w);
+                            if two_state && piece.has_xz() {
+                                piece = piece.to_two_state();
+                            }
                             let Some(lo) = self.packed_elem_lsb(&pkey, idx as i64, elem_w) else {
                                 return false;
                             };
@@ -1637,7 +1694,12 @@ impl Simulator {
                                 {
                                     let total_w = self.signal_widths[sid];
                                     let mut cur = self.signal_table[sid].clone();
-                                    let piece = val.resize_for_assign(elem_w);
+                                    let mut piece = val.resize_for_assign(elem_w);
+                                    if self.signal_two_state.get(sid).copied().unwrap_or(false)
+                                        && piece.has_xz()
+                                    {
+                                        piece = piece.to_two_state();
+                                    }
                                     let lo = (field_off as usize) + idx * (elem_w as usize);
                                     if lo + (elem_w as usize) <= total_w as usize {
                                         let prev = cur.clone();
@@ -1667,10 +1729,11 @@ impl Simulator {
             // task). Locals live in local_stack, not signal_table —
             // mutate the Value in place.
             if let (false, Some(hier)) = (self.local_stack.is_empty(), hier_opt) {
+                let two_state = self.name_is_two_state(&hier.path[0].name.name);
                 let last_idx = self.local_stack.len() - 1;
                 if let Some(cur) = self.local_stack[last_idx].get(&hier.path[0].name.name) {
                     if idx < cur.width as usize {
-                        let nb = val.bits_first();
+                        let nb = Self::coerce_bit_two_state(val.bits_first(), two_state);
                         let old = cur.get_bit(idx);
                         let c = old != nb;
                         if c {
@@ -1686,10 +1749,11 @@ impl Simulator {
             if let (Some(Some(handle)), Some(hier)) = (self.this_stack.last().copied(), hier_opt) {
                 if hier.path.len() == 1 {
                     let pname = hier.path[0].name.name.clone();
+                    let two_state = self.class_prop_two_state(handle, &pname);
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
                         if let Some(cur) = inst.properties.get(&pname).cloned() {
                             if idx < cur.width as usize {
-                                let nb = val.bits_first();
+                                let nb = Self::coerce_bit_two_state(val.bits_first(), two_state);
                                 let old = cur.get_bit(idx);
                                 let c = old != nb;
                                 if c {
@@ -1706,7 +1770,10 @@ impl Simulator {
             // Bit select needs signal_table
             if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                 if idx < self.signal_widths[id] as usize {
-                    let nb = val.bits_first();
+                    let nb = Self::coerce_bit_two_state(
+                        val.bits_first(),
+                        self.signal_two_state.get(id).copied().unwrap_or(false),
+                    );
                     let old = self.signal_table[id].get_bit(idx);
                     let c = old != nb;
                     if c {
@@ -1726,7 +1793,10 @@ impl Simulator {
             // would silently no-op.
             if let Some(cur) = self.signals.get(&*name).cloned() {
                 if idx < cur.width as usize {
-                    let nb = val.bits_first();
+                    let nb = Self::coerce_bit_two_state(
+                        val.bits_first(),
+                        self.name_is_two_state(&name),
+                    );
                     let old = cur.get_bit(idx);
                     let c = old != nb;
                     if c {
@@ -1752,7 +1822,10 @@ impl Simulator {
                 .cloned()
             {
                 if idx < cur.width as usize {
-                    let nb = val.bits_first();
+                    let nb = Self::coerce_bit_two_state(
+                        val.bits_first(),
+                        self.name_is_two_state(&name),
+                    );
                     let old = cur.get_bit(idx);
                     let c = old != nb;
                     if c {

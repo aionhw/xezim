@@ -239,6 +239,20 @@ impl Simulator {
         elem_name: &str,
         val: Value,
     ) -> Value {
+        if !self.is_string_collection(name)
+            && let Some(dt) = self.module.var_decl_types.get(name)
+        {
+            if super::elaborate::is_type_shortreal_resolved(dt, &self.module.typedef_types) {
+                return Value::from_f64(val.to_f64() as f32 as f64);
+            }
+            if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+                return if val.is_real {
+                    val
+                } else {
+                    Value::from_f64(val.to_f64())
+                };
+            }
+        }
         if val.is_real || self.is_associative_array(name) || self.is_string_collection(name) {
             return val;
         }
@@ -5088,6 +5102,7 @@ impl Simulator {
                 queue_max: self.module.queue_max_sizes.remove(name),
                 width: self.widths.get(name).copied(),
                 assoc_entry: self.module.associative_arrays.remove(name),
+                width_only: false,
             }
         } else {
             QueueLocalSave {
@@ -5098,6 +5113,7 @@ impl Simulator {
                 queue_max: self.module.queue_max_sizes.get(name).copied(),
                 width: self.widths.get(name).copied(),
                 assoc_entry: self.module.associative_arrays.get(name).copied(),
+                width_only: false,
             }
         };
         let mut key = self.queue_name_pool.pop().unwrap_or_default();
@@ -5116,10 +5132,47 @@ impl Simulator {
         &mut self,
         name: &str,
         data_type: &crate::ast::types::DataType,
+        is_scalar: bool,
+        decl_width: u32,
     ) {
         if !self.decl_shadow_log.is_empty() {
             self.note_decl_shadow(name, data_type);
         }
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        size_key.clear();
+        size_key.push_str(name);
+        size_key.push_str(".size");
+        let has_prior_coll = self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.descending_arrays.contains(name)
+            || self.module.queue_max_sizes.contains_key(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.signals.has_elem_keys(name)
+            || self.signals.contains_key(&size_key);
+        if is_scalar && !has_prior_coll {
+            self.queue_key_scratch = size_key;
+            if !self.module.packed_signal_elem_widths.is_empty() {
+                self.module.packed_signal_elem_widths.remove(name);
+            }
+            if let Some(frame) = self.queue_frame_saves.last() {
+                let prev_w = self.widths.get(name).copied();
+                if prev_w != Some(decl_width) && !frame.iter().any(|(n, _)| n == name) {
+                    let mut key = self.queue_name_pool.pop().unwrap_or_default();
+                    key.clear();
+                    key.push_str(name);
+                    self.queue_frame_saves.last_mut().unwrap().push((
+                        key,
+                        QueueLocalSave {
+                            width: prev_w,
+                            width_only: true,
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+            return;
+        }
+        self.queue_key_scratch = size_key;
         // If this local shares its bare name with a caller-frame queue,
         // preserve the caller's queue storage so it is restored when this
         // subroutine returns (queue locals are global-by-bare-name; see
@@ -5194,6 +5247,23 @@ impl Simulator {
         let mut frame = frame;
         let mut size_key = std::mem::take(&mut self.queue_key_scratch);
         for (name, save) in frame.drain(..) {
+            if save.width_only {
+                match save.width {
+                    Some(w) => match self.widths.get_mut(name.as_str()) {
+                        Some(slot) => *slot = w,
+                        None => {
+                            self.widths.insert(name.clone(), w);
+                        }
+                    },
+                    None => {
+                        self.widths.remove(&name);
+                    }
+                }
+                if self.queue_name_pool.len() < 64 {
+                    self.queue_name_pool.push(name);
+                }
+                continue;
+            }
             size_key.clear();
             size_key.push_str(&name);
             size_key.push_str(".size");
@@ -5214,6 +5284,7 @@ impl Simulator {
                 queue_max,
                 width,
                 assoc_entry,
+                width_only: _,
             } = save;
             for (k, v) in signals {
                 self.signals.insert(k, v);

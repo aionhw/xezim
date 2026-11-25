@@ -848,6 +848,9 @@ impl Simulator {
             let cn = cn.as_str();
             if let Some(sig) = cd.properties.get(prop) {
                 if sig.is_real
+                    || self.class_prop_decl_type(cd, prop).is_some_and(|dt| {
+                        super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+                    })
                     || sig
                         .type_name
                         .as_ref()
@@ -940,6 +943,9 @@ impl Simulator {
             return Some(None);
         };
         if sig.is_real
+            || self.class_prop_decl_type(cd, prop).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+            })
             || sig
                 .type_name
                 .as_ref()
@@ -1111,7 +1117,13 @@ impl Simulator {
                     f.is_signed = self.class_prop_signed_of(handle, prop);
                     f
                 }
-                None => val.clone(),
+                None => {
+                    if self.may_name_real_class_prop(prop) && self.class_prop_shortreal(handle, prop) {
+                        Value::from_f64(val.to_f64() as f32 as f64)
+                    } else {
+                        val.clone()
+                    }
+                }
             };
         }
         let fitted = match self.heap_prop_width(handle, prop) {
@@ -1120,7 +1132,17 @@ impl Simulator {
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
-            None => val.clone(),
+            None => {
+                if self.may_name_real_class_prop(prop) {
+                    if self.class_prop_shortreal(handle, prop) {
+                        return Value::from_f64(val.to_f64() as f32 as f64);
+                    }
+                    if self.class_prop_is_real(handle, prop) {
+                        return Value::from_f64(val.to_f64());
+                    }
+                }
+                val.clone()
+            }
         };
         // §6.11.1/§10.7: a 2-state property drops X/Z on every write.
         if fitted.has_xz() && self.class_prop_two_state(handle, prop) {
@@ -1257,6 +1279,65 @@ impl Simulator {
                 let bound =
                     self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
                 return super::elaborate::is_type_real_resolved(
+                    bound.as_ref().unwrap_or(dt),
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    pub(super) fn class_prop_shortreal(&self, handle: usize, prop: &str) -> bool {
+        if !self.may_name_real_class_prop(prop) {
+            return false;
+        }
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        let mut cur = Some(start);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                if let DataType::TypeReference { name, .. } = dt
+                    && !name.has_scope()
+                    && cd.type_param_names.iter().any(|t| *t == name.name.name)
+                    && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
+                {
+                    let b = b.trim();
+                    let td = cd
+                        .typedef_targets
+                        .get(b)
+                        .or_else(|| self.module.typedef_types.get(b))
+                        .or_else(|| {
+                            b.rsplit_once("::")
+                                .and_then(|(_, t)| self.module.typedef_types.get(t))
+                        });
+                    return b == "shortreal"
+                        || td.is_some_and(|td| {
+                            super::elaborate::is_type_shortreal_resolved(
+                                td,
+                                &self.module.typedef_types,
+                            )
+                        });
+                }
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
+                return super::elaborate::is_type_shortreal_resolved(
                     bound.as_ref().unwrap_or(dt),
                     &self.module.typedef_types,
                 );

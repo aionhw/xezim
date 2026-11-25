@@ -3038,10 +3038,9 @@ impl Simulator {
                             .and_then(|ty| module.typedef_types.get(ty.as_str()))
                     });
                     if sig.type_name.as_deref().map(String::as_str) == Some("shortreal")
-                        || declared.is_some_and(|dt| matches!(
-                            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
-                            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
-                        ))
+                        || declared.is_some_and(|dt| {
+                            super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types)
+                        })
                     {
                         shortreal_signals.insert(id);
                         val = Value::from_f64(val.to_f64() as f32 as f64);
@@ -3587,11 +3586,16 @@ impl Simulator {
                 // right). Everything keying on per-element `signal_real`
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
+                    let is_shortreal =
+                        super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                     for id in first_id..signal_table.len() {
                         // §6.8, Table 6-7: real/shortreal cells start at real
                         // 0.0; the value tag must agree with the metadata.
                         signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
+                        if is_shortreal {
+                            shortreal_signals.insert(id);
+                        }
                     }
                 }
             }
@@ -3787,12 +3791,17 @@ impl Simulator {
                 }
             }
             // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
-                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
-            }) {
+            if let Some(dt) = module.var_decl_types.get(base)
+                && super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            {
+                let is_shortreal =
+                    super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
+                    if is_shortreal {
+                        shortreal_signals.insert(id);
+                    }
                 }
             }
         }
@@ -3851,12 +3860,17 @@ impl Simulator {
                 }
             }
             // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
-                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
-            }) {
+            if let Some(dt) = module.var_decl_types.get(base)
+                && super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            {
+                let is_shortreal =
+                    super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
+                    if is_shortreal {
+                        shortreal_signals.insert(id);
+                    }
                 }
             }
         }
@@ -3864,8 +3878,11 @@ impl Simulator {
         // parameter, §6.20.2). Deliberately after the 2-D / N-D creation
         // loops: those rebuild storage for their names, so restoring earlier
         // left a multi-dimensional parameter array zero-filled.
-        for (nm, v) in array_elem_inits {
+        for (nm, mut v) in array_elem_inits {
             if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
+                if v.is_real && shortreal_signals.contains(&id) {
+                    v = Value::from_f64(v.to_f64() as f32 as f64);
+                }
                 signal_table[id] = v;
             }
         }

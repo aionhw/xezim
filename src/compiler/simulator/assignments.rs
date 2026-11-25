@@ -189,4 +189,104 @@ impl Simulator {
                 && super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
         })
     }
+
+    #[inline]
+    pub(super) fn coerce_bit_two_state(b: LogicBit, two_state: bool) -> LogicBit {
+        if two_state && matches!(b, LogicBit::X | LogicBit::Z) {
+            LogicBit::Zero
+        } else {
+            b
+        }
+    }
+
+    pub(super) fn name_is_two_state(&self, name: &str) -> bool {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return self.signal_two_state.get(id).copied().unwrap_or(false);
+        }
+        let lookup = |key: &str| {
+            self.module.var_decl_types.get(key).is_some_and(|dt| {
+                !self.dt_is_real(dt)
+                    && super::elaborate::is_type_two_state_resolved(
+                        dt,
+                        &self.module.typedef_types,
+                    )
+            })
+        };
+        if lookup(name) {
+            return true;
+        }
+        if let Some(dt) = self.struct_leaf_data_type(name) {
+            return !self.dt_is_real(&dt)
+                && super::elaborate::is_type_two_state_resolved(
+                    &dt,
+                    &self.module.typedef_types,
+                );
+        }
+        false
+    }
+
+    pub(super) fn lvalue_class_prop_two_state(&mut self, lhs: &Expression) -> bool {
+        let mut cur = match &lhs.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => expr.as_ref(),
+            _ => return false,
+        };
+        while let ExprKind::Index { expr: b, .. } = &cur.kind {
+            cur = b.as_ref();
+        }
+        let Some((h, prop)) = self.prop_chain_root(cur) else {
+            return false;
+        };
+        self.class_prop_two_state(h, &prop)
+    }
+
+    pub(super) fn struct_leaf_data_type(&self, name: &str) -> Option<DataType> {
+        let dot_pos = name.find('.')?;
+        fn strip_idx(s: &str) -> &str {
+            s.split('[').next().unwrap_or(s)
+        }
+        let mut root_end = None;
+        let first = strip_idx(&name[..dot_pos]);
+        if self.module.var_decl_types.contains_key(first) {
+            root_end = Some(dot_pos);
+        } else {
+            for (idx, _) in name.match_indices('.') {
+                let candidate = strip_idx(&name[..idx]);
+                if self.module.var_decl_types.contains_key(candidate) {
+                    root_end = Some(idx);
+                    break;
+                }
+            }
+        }
+        let end = root_end?;
+        let mut cur = self.module.var_decl_types.get(strip_idx(&name[..end]))?.clone();
+        for seg in name[end + 1..].split('.') {
+            let member = strip_idx(seg);
+            let next = match self.resolve_dt_ref(&cur) {
+                DataType::Struct(su) => Self::struct_member_decl_ref(su, member).map(|(mdt, _)| mdt.clone()),
+                _ => None,
+            }?;
+            cur = next;
+        }
+        Some(cur)
+    }
+
+    pub(super) fn name_is_shortreal(&self, name: &str) -> bool {
+        if let Some(dt) = self.module.var_decl_types.get(name) {
+            return super::elaborate::is_type_shortreal_resolved(dt, &self.module.typedef_types);
+        }
+        if let Some(base) = name.split('[').next()
+            && base != name
+            && !base.contains('.')
+            && let Some(dt) = self.module.var_decl_types.get(base)
+        {
+            return super::elaborate::is_type_shortreal_resolved(dt, &self.module.typedef_types);
+        }
+        if let Some(dt) = self.struct_leaf_data_type(name) {
+            return super::elaborate::is_type_shortreal_resolved(
+                &dt,
+                &self.module.typedef_types,
+            );
+        }
+        false
+    }
 }

@@ -4395,7 +4395,10 @@ impl Simulator {
         if low.saturating_add(elem_width as usize) > self.signal_widths[id] as usize {
             return true;
         }
-        let piece = val.resize_for_assign(elem_width);
+        let mut piece = val.resize_for_assign(elem_width);
+        if self.signal_two_state.get(id).copied().unwrap_or(false) && piece.has_xz() {
+            piece = piece.to_two_state();
+        }
         if let Some(entry_index) = self.nba_fast_index.get(id) {
             self.nba_fast[entry_index]
                 .value

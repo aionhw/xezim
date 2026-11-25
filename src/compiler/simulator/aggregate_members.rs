@@ -675,14 +675,24 @@ impl Simulator {
         if let Some(w) = vector_fragment_width(name) {
             return Some(w);
         }
+        if let Some(dt) = self.module.typedef_types.get(name) {
+            let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+            if matches!(
+                dt,
+                DataType::Real { .. }
+                    | DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+            ) {
+                return None;
+            }
+        }
         if let Some(&w) = self.module.typedefs.get(name) {
             return Some(w).filter(|w| *w > 0);
         }
         if let Some(dt) = self.module.typedef_types.get(name) {
             let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
-            if matches!(dt, DataType::Real { .. }) {
-                return None;
-            }
             let w = resolve_type_width(
                 &dt,
                 Some(&self.module.parameters),
@@ -2526,6 +2536,51 @@ impl Simulator {
         self.heap.get(handle)?.as_ref()?.properties.get(member).cloned()
     }
 
+    fn class_agg_key_shortreal(&self, handle: usize, key: &str) -> bool {
+        let suffix_path = key.split_once('#').map_or(key, |(_, rest)| rest);
+        let Some((head, rest)) = suffix_path.split_once('.') else {
+            return false;
+        };
+        let prop = head.split('[').next().unwrap_or(head);
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let mut cur_cls = Some(inst.class_name.as_str());
+        let mut prop_dt: Option<&DataType> = None;
+        while let Some(cn) = cur_cls {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                prop_dt = Some(match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                });
+                break;
+            }
+            cur_cls = cd.extends.as_deref();
+        }
+        let Some(mut cur_dt) = prop_dt.cloned() else {
+            return false;
+        };
+        for seg in rest.split('.') {
+            let m = seg.split('[').next().unwrap_or(seg);
+            let next = match self.resolve_dt_ref(&cur_dt) {
+                DataType::Struct(su) => {
+                    Self::struct_member_decl_ref(su, m).map(|(mdt, _)| mdt.clone())
+                }
+                _ => None,
+            };
+            let Some(n) = next else {
+                return false;
+            };
+            cur_dt = n;
+        }
+        super::elaborate::is_type_shortreal_resolved(&cur_dt, &self.module.typedef_types)
+    }
+
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try
@@ -3331,7 +3386,7 @@ impl Simulator {
         Self::struct_member_decl_ref(su, name).map(|(dt, dims)| (dt.clone(), dims.to_vec()))
     }
 
-    fn struct_member_decl_ref<'a>(
+    pub(super) fn struct_member_decl_ref<'a>(
         su: &'a crate::ast::types::StructUnionType,
         name: &str,
     ) -> Option<(&'a DataType, &'a [crate::ast::types::UnpackedDimension])> {
@@ -4155,13 +4210,14 @@ impl Simulator {
         if off.checked_add(elem_w)? > total {
             return None;
         }
+        let two_state = self.class_prop_two_state(handle, &prop);
         Some(ClassAggRef::Packed {
             handle,
             prop,
             off,
             w: elem_w,
             total,
-            two_state: false,
+            two_state,
             signed: false,
         })
     }
@@ -5460,21 +5516,33 @@ impl Simulator {
             ClassAggRef::Flat { handle, key, w } => {
                 let before = self.get_signal_value_by_name(key);
                 let prior = before.clone().or_else(|| self.class_array_heap_leaf(*handle, key));
+                let is_sr = self.class_agg_key_shortreal(*handle, key);
                 let fitted = match prior {
-                    Some(p) if p.is_real => Value::from_f64(val.to_f64()),
+                    Some(p) if p.is_real => {
+                        if is_sr {
+                            Value::from_f64(val.to_f64() as f32 as f64)
+                        } else {
+                            Value::from_f64(val.to_f64())
+                        }
+                    }
                     Some(p) if val.is_real => Self::real_into_slot(&p, val.to_f64()),
                     Some(p) => {
                         let mut v = val.resize_for_assign(*w);
                         v.is_signed = p.is_signed;
                         v
                     }
+                    None if is_sr => Value::from_f64(val.to_f64() as f32 as f64),
                     None => val.resize_for_assign(*w),
                 };
                 self.write_leaf_by_name(key, fitted);
                 self.get_signal_value_by_name(key) != before
             }
             ClassAggRef::Unpacked { handle, key, w } => {
-                let nv = val.resize_for_assign((*w).max(1));
+                let nv = if self.class_agg_key_shortreal(*handle, key) {
+                    Value::from_f64(val.to_f64() as f32 as f64)
+                } else {
+                    val.resize_for_assign((*w).max(1))
+                };
                 if let Some(Some(inst)) = self.heap.get_mut(*handle) {
                     let changed = inst.properties.get(key) != Some(&nv);
                     inst.properties.insert(key.clone(), nv);

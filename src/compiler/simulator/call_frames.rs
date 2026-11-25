@@ -392,4 +392,7 @@ pub(super) struct QueueLocalSave {
     /// keys): a same-named callee local drops it at its declaration, and an
     /// int-keyed array re-registered as string-keyed reads its keys as text.
     pub(super) assoc_entry: Option<bool>,
+    /// Fast save for scalar locals that did not shadow any collection metadata:
+    /// only `self.widths` needs restoring on return.
+    pub(super) width_only: bool,
 }

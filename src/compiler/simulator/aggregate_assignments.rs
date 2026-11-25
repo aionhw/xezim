@@ -205,7 +205,7 @@ impl Simulator {
                     .map(|(j, v)| {
                         (
                             j,
-                            Self::fit_local_decl_init(v, width, ty, two_state, real, signed),
+                            self.fit_local_decl_init(v, width, ty, two_state, real, signed),
                         )
                     })
                     .collect()
@@ -2201,7 +2201,7 @@ impl Simulator {
                         );
                         let is_real = self.dt_is_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
-                        let v = Self::fit_local_decl_init(
+                        let v = self.fit_local_decl_init(
                             raw,
                             w,
                             &m.data_type,
@@ -4767,7 +4767,53 @@ impl Simulator {
     /// interface) keeps the value as evaluated.
     #[inline(never)]
     pub(super) fn fit_queue_push_elem(&self, coll: &str, val: Value) -> Value {
-        Self::fit_queue_elem_to(self.integral_queue_elem(coll), val)
+        if let Some(info) = self.integral_queue_elem(coll) {
+            return Self::fit_queue_elem_to(Some(info), val);
+        }
+        if let Some(is_sr) = self.coll_elem_real_kind(coll) {
+            return Value::from_f64(if is_sr {
+                val.to_f64() as f32 as f64
+            } else {
+                val.to_f64()
+            });
+        }
+        val
+    }
+
+    fn coll_elem_real_kind(&self, coll: &str) -> Option<bool> {
+        if let Some((h, member)) = coll.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+        {
+            let member = member.split('[').next().unwrap_or(member);
+            if self.class_prop_shortreal(h, member) {
+                return Some(true);
+            }
+            if self.class_prop_is_real(h, member) {
+                return Some(false);
+            }
+            return None;
+        }
+        let leaf = coll.rsplit('.').next().unwrap_or(coll);
+        let dt = self
+            .module
+            .var_decl_types
+            .get(coll)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| {
+                let bare = coll.strip_prefix('@')?.rsplit_once('#')?.0;
+                self.module.var_decl_types.get(bare)
+            })
+            .or_else(|| {
+                let bare = coll.strip_prefix("$st:")?.rsplit_once("::")?.1;
+                self.module.var_decl_types.get(bare)
+            })?;
+        if super::elaborate::is_type_shortreal_resolved(dt, &self.module.typedef_types) {
+            Some(true)
+        } else if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// `fit_queue_push_elem` for a compiled element store (`StoreCollElem`).
@@ -4806,7 +4852,17 @@ impl Simulator {
                 info
             }
         };
-        Self::fit_queue_elem_to(info, val)
+        if info.is_some() {
+            return Self::fit_queue_elem_to(info, val);
+        }
+        if let Some(is_sr) = self.coll_elem_real_kind(coll) {
+            return Value::from_f64(if is_sr {
+                val.to_f64() as f32 as f64
+            } else {
+                val.to_f64()
+            });
+        }
+        val
     }
 
     /// Fit `val` to the integral element type `info` (`integral_queue_elem`).

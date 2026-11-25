@@ -3543,7 +3543,7 @@ impl Simulator {
                     super::elaborate::is_type_two_state_resolved(&mdt, &self.module.typedef_types);
                 let is_real = self.dt_is_real(&mdt);
                 let signed = self.type_is_signed_concrete(&mdt);
-                let v = Self::fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
+                let v = self.fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
                     inst.properties.insert(key, v);
                 }
