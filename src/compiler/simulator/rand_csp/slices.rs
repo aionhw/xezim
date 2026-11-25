@@ -1314,6 +1314,7 @@ impl Simulator {
                 ..
             } => (handle, key, off, w),
             ClassAggRef::Unpacked { handle, key, w } => (handle, key, 0, w),
+            ClassAggRef::Flat { .. } => return None,
         };
         let name = if owner == csp.handle {
             prop

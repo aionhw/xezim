@@ -2520,6 +2520,12 @@ impl Simulator {
         }
     }
 
+    /// The heap-backed value of a fully scoped class-array leaf.
+    pub(super) fn class_array_heap_leaf(&self, handle: usize, key: &str) -> Option<Value> {
+        let (_, member) = key.split_once('#')?;
+        self.heap.get(handle)?.as_ref()?.properties.get(member).cloned()
+    }
+
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try
@@ -2537,13 +2543,28 @@ impl Simulator {
         if !Self::spreads_member_wise(&su) {
             return None;
         }
-        // An ARRAY-of-structs property indexes the element first; the rest of
-        // the suffix addresses a leaf of the element's type.
-        let probe = if suffix.starts_with('[') {
-            format!("X{}", &suffix[suffix.find(']')? + 1..])
+        // §7.4.5: every leading index selects a dimension of the
+        // property before the suffix selects a field of the element.
+        let index_end = suffix.find('.').unwrap_or(suffix.len());
+        let indices = &suffix[..index_end];
+        let scoped = if indices.contains("][") {
+            let scoped = format!("{handle}#{prop}");
+            let (dims, _) = self.unpacked_decl_shape(&scoped)?;
+            let mut indices = indices.strip_prefix('[')?.strip_suffix(']')?.split("][");
+            for (left, right) in dims {
+                let index = indices.next()?.parse::<i64>().ok()?;
+                if !(left.min(right)..=left.max(right)).contains(&index) {
+                    return None;
+                }
+            }
+            if indices.next().is_some() {
+                return None;
+            }
+            Some(scoped)
         } else {
-            format!("X{}", suffix)
+            None
         };
+        let probe = format!("X{}", &suffix[index_end..]);
         let Some((_, w, _)) = self
             .unpacked_struct_leaf_keys("X", &su)
             .into_iter()
@@ -2557,6 +2578,14 @@ impl Simulator {
             let steps = Self::member_suffix_steps(suffix)?;
             return self.unpacked_member_select(handle, &prop, &su, &steps);
         };
+        if let Some(scoped) = scoped {
+            // Multidimensional property patterns already use flat cells.
+            return Some(ClassAggRef::Flat {
+                handle,
+                key: format!("{scoped}{suffix}"),
+                w: w.max(1),
+            });
+        }
         Some(ClassAggRef::Unpacked {
             handle,
             key: format!("{}{}", prop, suffix),
@@ -4521,9 +4550,15 @@ impl Simulator {
     /// `<prop>[i].<member>`, not under an instance-scoped SIGNAL name. Used to
     /// keep whole-element / whole-array writes in the same store the reads use.
     pub(super) fn class_unpacked_elem_is_heap_owned(&mut self, lvalue: &Expression) -> bool {
-        let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) else {
+        let Some((handle, prop, su)) = self.class_unpacked_array_prop_of(lvalue) else {
             return false;
         };
+        // The whole-array pattern probe adds one index. For an N-D
+        // property that only selects a row, whose leaves use the flat store.
+        let scoped = format!("{handle}#{prop}");
+        if self.module.arrays_2d.contains_key(&scoped) || self.module.arrays_nd.contains_key(&scoped) {
+            return false;
+        }
         let Some(first_key) = self
             .unpacked_struct_leaf_keys("X", &su)
             .into_iter()
@@ -4552,7 +4587,10 @@ impl Simulator {
                 probe = Self::append_member_expr(&probe, seg);
             }
         }
-        self.class_unpacked_leaf(&probe).is_some()
+        matches!(
+            self.class_unpacked_leaf(&probe),
+            Some(ClassAggRef::Unpacked { .. } | ClassAggRef::UnpackedSlice { .. })
+        )
     }
 
     /// Write one unpacked-struct value into a class-property element's leaf
@@ -5275,6 +5313,10 @@ impl Simulator {
                 out.is_signed = *signed;
                 out
             }
+            ClassAggRef::Flat { handle, key, w } => self
+                .get_signal_value_by_name(key)
+                .or_else(|| self.class_array_heap_leaf(*handle, key))
+                .unwrap_or_else(|| Value::zero(*w)),
             ClassAggRef::Unpacked { handle, key, w } => self
                 .heap
                 .get(*handle)
@@ -5364,6 +5406,22 @@ impl Simulator {
                     inst.properties.insert(prop.clone(), whole);
                 }
                 changed
+            }
+            ClassAggRef::Flat { handle, key, w } => {
+                let before = self.get_signal_value_by_name(key);
+                let prior = before.clone().or_else(|| self.class_array_heap_leaf(*handle, key));
+                let fitted = match prior {
+                    Some(p) if p.is_real => Value::from_f64(val.to_f64()),
+                    Some(p) if val.is_real => Self::real_into_slot(&p, val.to_f64()),
+                    Some(p) => {
+                        let mut v = val.resize_for_assign(*w);
+                        v.is_signed = p.is_signed;
+                        v
+                    }
+                    None => val.resize_for_assign(*w),
+                };
+                self.write_leaf_by_name(key, fitted);
+                self.get_signal_value_by_name(key) != before
             }
             ClassAggRef::Unpacked { handle, key, w } => {
                 let nv = val.resize_for_assign((*w).max(1));

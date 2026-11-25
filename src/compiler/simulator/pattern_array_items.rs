@@ -230,6 +230,10 @@ impl Simulator {
             .cloned()
             .or_else(|| self.p_elem_type(&el.root_name))
             .and_then(|dt| self.unpacked_struct_of(&dt));
+        let class_owner = elem_su
+            .as_ref()
+            .and_then(|_| Self::class_storage_owner(&el.root_name));
+        let flat_first = dims.len() > 1;
         let mut out = Vec::new();
         for (pos, name) in el.names.iter().enumerate() {
             let mut path = String::new();
@@ -250,9 +254,19 @@ impl Simulator {
                     let mut leaves = Vec::new();
                     self.unpacked_struct_leaves(name, e, su, 0, &mut leaves);
                     for (key, _, w, _) in leaves {
-                        let v = self
-                            .get_signal_value_by_name(&key)
-                            .unwrap_or_else(|| Value::new(w.max(1)));
+                        // §7.6: one-dimensional class-property arrays keep
+                        // their leaves in the heap. Multidimensional writes
+                        // populate the flat store, overriding heap defaults.
+                        let heap = || {
+                            class_owner.and_then(|handle| self.class_array_heap_leaf(handle, &key))
+                        };
+                        let flat = || self.get_signal_value_by_name(&key);
+                        let v = if flat_first {
+                            flat().or_else(heap)
+                        } else {
+                            heap().or_else(flat)
+                        }
+                        .unwrap_or_else(|| Value::new(w.max(1)));
                         out.push((format!("{path}{}", &key[name.len()..]), v));
                     }
                 }
