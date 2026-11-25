@@ -10,6 +10,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- A run that `--max-time` stops reports the cap as its end time, and `final`
+  blocks see it, instead of the time of the last event that ran (#1633).
 - Static tasks can call automatic functions and class methods repeatedly,
   with each call initializing its own locals (§6.21, §8.6, #1629).
 - Nonblocking assignments copy unpacked structs through parenthesized
