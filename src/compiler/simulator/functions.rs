@@ -2413,9 +2413,54 @@ impl Simulator {
     ) -> Option<HashMap<String, Value>> {
         let sig = self.ancestor_spec(base, signature, owner)?;
         let saved = self.current_spec.replace((owner.to_string(), sig));
-        let params = self.class_spec_value_params();
+        let mut params = self.class_spec_value_params().unwrap_or_default();
         self.current_spec = saved;
-        params
+        // Evaluate body constants after the specialization is bound. The
+        // derived class may declare a constant with the same name.
+        for (name, init) in &self.module.classes.get(owner)?.param_defaults {
+            if params.contains_key(name) {
+                continue;
+            }
+            let env = super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top: &params,
+            };
+            if let Some(value) = init.as_ref().and_then(|expr| {
+                super::elaborate::const_eval_i64_with_params_env(expr, Some(&env))
+            }) {
+                params.insert(name.clone(), Value::from_u64(value as u64, 32));
+            }
+        }
+        Some(params)
+    }
+
+    /// Resolve a scoped inherited typedef using the ancestor's bindings,
+    /// for both scalar widths and the member layout of packed structs.
+    pub(super) fn scoped_inherited_typedef(
+        &mut self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<(DataType, HashMap<String, Value>)> {
+        let scope = name.scopes.last()?;
+        let base = &scope.name.name;
+        let (owner, target) = self.class_local_typedef_decl(base, &name.name.name)?;
+        if owner == base {
+            return None;
+        }
+        let owner = owner.to_string();
+        let target = self
+            .follow_class_local_typedef(&owner, target)
+            .unwrap_or_else(|| target.clone());
+        let args = scope
+            .type_args
+            .iter()
+            .map(|arg| self.expr_to_spec_fragment(arg))
+            .collect::<Option<Vec<_>>>()?;
+        let sig = self.canonicalize_spec_sig(base, &args.join(","));
+        let bindings = self.class_typedef_spec_params(base, &sig, &owner)?;
+        let mut params = self.module.parameters.clone();
+        self.populate_class_chain_params(&owner, &mut params);
+        params.extend(bindings);
+        Some((target, params))
     }
 
     pub(super) fn packed_struct_layout_in_ctx(
@@ -2437,16 +2482,11 @@ impl Simulator {
         {
             let owner = owner.to_string();
             let target_dt = self.follow_class_local_typedef(&owner, target_dt).unwrap_or_else(|| target_dt.clone());
-            if owner != cls.name {
-                let args = scope.type_args.iter().map(|arg| self.expr_to_spec_fragment(arg)).collect::<Option<Vec<_>>>()?;
-                let sig = self.canonicalize_spec_sig(&cls.name, &args.join(","));
-                let mut params = self.module.parameters.clone();
-                self.populate_class_chain_params(&owner, &mut params);
-                if let Some(spec) = self.class_typedef_spec_params(&cls.name, &sig, &owner) {
-                    params.extend(spec);
-                }
+            if owner != cls.name
+                && let Some((target, params)) = self.scoped_inherited_typedef(name)
+            {
                 return super::elaborate::packed_struct_field_layout(
-                    &target_dt,
+                    &target,
                     &params,
                     &self.module.typedefs,
                     &self.module.typedef_types,
