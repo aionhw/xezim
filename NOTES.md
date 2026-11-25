@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- `$itor` keeps the width and signedness of integral operands, so an unsigned
+  64-bit all-ones value converts to 18446744073709551616.0, and it rounds real
+  arguments to the nearest integer at run time and during elaboration
+  (§6.12.1, §20.5, #1641).
 - Assignment patterns copy unpacked-struct array properties field by field,
   including into multidimensional class properties. Delayed blocking
   assignments sample those fields before the delay (§7.6, §9.4.5, §10.9.1,
