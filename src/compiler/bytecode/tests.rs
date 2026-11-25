@@ -348,24 +348,35 @@ fn constant_branch_lowering_preserves_acceleration_and_case_equality_guard() {
         assert_eq!(ts.insns.len(), 3);
         assert_eq!(ts.tsx, kind == BinOpConstKind::Eq);
         // The existing signed widening, X/Z, fill, and wide-constant
-        // admission rules must also govern the fused form.
+        // admission rules must also govern the fused form. For CaseEq against
+        // a narrow X/Z constant (`x === 8'bx`), a clean 2-state value never
+        // matches, so it lowers to Const(0)+Jmp with `tsx == false` (X inputs
+        // still bail to the 4-state VM).
         for k in [
             Value::all_x(8),
             Value::all_z(8),
             Value::from_u128(1 << 80, 96),
         ] {
             let mut cb = cb.clone();
+            let narrow_xz_case_eq =
+                kind == BinOpConstKind::CaseEq && k.has_xz() && k.width <= 64;
             cb.instructions[1] = Insn::CmpBranchConst(kind, 0, Box::new(k), 1, 3);
-            assert!(
-                lower_two_state(
-                    &cb,
-                    &[8, 8],
-                    &[false, false],
-                    &[false, false],
-                    &HashMap::default()
-                )
-                .is_none()
+            let res = lower_two_state(
+                &cb,
+                &[8, 8],
+                &[false, false],
+                &[false, false],
+                &HashMap::default(),
             );
+            if narrow_xz_case_eq {
+                let ts = res.expect("narrow X/Z CaseEq lowers with 2-state guard");
+                assert!(ts.has_ctrl);
+                assert!(!ts.tsx);
+                assert!(matches!(ts.insns[1], TsInsn::Const { d: 1, v: 0 }));
+                assert!(matches!(ts.insns[2], TsInsn::Jmp { t: 4 }));
+            } else {
+                assert!(res.is_none());
+            }
         }
         let mut cb = cb.clone();
         let mut k = Value::from_u64(3, 16);

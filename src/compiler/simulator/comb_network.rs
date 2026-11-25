@@ -178,6 +178,29 @@ pub(super) struct CtlGate {
     pub(super) ctl: u8,
 }
 
+/// Dynamic controlling-value edge mask for specialized two-state arena
+/// entries (`TS_AND_EQ`, `TS_AND_BIT`, `TS_AND2`, `TS_OR2`).
+/// While the controlling input holds its controlling value (`0` for AND,
+/// definite `1` for OR) and no forces are active, the non-controlling data
+/// inputs' dependency edges have `mask = 0` so broadcast toggles skip waking
+/// the entry completely. The controlling input's own edge is never masked.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct TsCtl {
+    /// First masked data edge span `(pos0..pos0+npos0)` in `comb_dep_edges`.
+    pub(super) pos0: u32,
+    pub(super) npos0: u32,
+    pub(super) smask0: u64,
+    /// Optional second masked data edge span (`npos1 == 0` when unused).
+    pub(super) pos1: u32,
+    pub(super) npos1: u32,
+    pub(super) smask1: u64,
+    /// Whether the edges above currently hold `mask == 0`.
+    pub(super) masked: bool,
+    /// For `TS_AND2` / `TS_OR2`: true when `sig2` is the controlling input
+    /// (and `sig1` is masked); false when `sig1` is controlling.
+    pub(super) ctl_is_sig2: bool,
+}
+
 /// A continuous mux with equal-width, in-bounds descending ranges. Arms
 /// are ordered false/true. The ordinary evaluator still owns every write.
 #[derive(serde::Serialize)]

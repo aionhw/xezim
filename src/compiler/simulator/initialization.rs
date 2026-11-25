@@ -4591,6 +4591,7 @@ impl Simulator {
             iface_path_parts: std::cell::OnceCell::new(),
             quiet_bits: Vec::new(),
             quiet_valid: false,
+            fast_quiet_obs: false,
             prof_quiet_stores: 0,
             prof_observed_stores: 0,
             #[cfg(feature = "jit")]
@@ -5196,6 +5197,10 @@ impl Simulator {
             ctl_sig: Vec::new(),
             ctl_dsts: Vec::new(),
             ctl_rearm_pending: Vec::new(),
+            ts_ctl: Vec::new(),
+            ts_ctl_by_entry: Vec::new(),
+            ts_ctl_dsts: Vec::new(),
+            ts_ctl_rearm_pending: Vec::new(),
             ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
                 && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
                 && std::env::var_os("XEZIM_BSP_SHADOW").is_none(),

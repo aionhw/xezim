@@ -1161,6 +1161,21 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        if self.fast_quiet_obs && self.active_force_exprs.is_empty() && !self.dump_dirty_active {
+            // Fast path latched during clean combinational settle: no value
+            // trace, VCD dump, force expr, inline mirror, commit plan, or
+            // edge-exec/dirty-edge hooks are active.
+            if (unsafe { *self.quiet_bits.get_unchecked(id >> 6) } >> (id & 63)) & 1 != 0 {
+                return;
+            }
+            arm_edge_readers!(self, id, changed);
+            if id < self.event_waiters.watch.len()
+                && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
+            {
+                self.event_waiters.note_write(id);
+            }
+            return;
+        }
         let (edge_sidecar, armed_sidecar) = if self.signal_commit_plan.is_empty() {
             // Quiet signal (no armed / edge readers): nothing below applies
             // unless a global observer is active.
@@ -2120,6 +2135,7 @@ impl Simulator {
         // Record the value as stored (post-resize), so the map mirrors the
         // signal table.
         let stored = self.signal_table.get(id).cloned().unwrap_or(v);
+        self.ctl_note_external_write(id);
         self.forced_signals.insert(id, stored);
     }
 
@@ -2619,6 +2635,7 @@ impl Simulator {
             self.packed.release_forced(id);
         } else {
             self.forced_signals.remove(&id);
+            self.ctl_note_external_write(id);
         }
     }
 

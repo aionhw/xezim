@@ -95,7 +95,7 @@ pub(super) struct AwaitWaiter {
 #[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct TsHdr {
     pub(super) off: u32,
-    /// Stream length (13 bits) | executor kind (3 bits, `TS_HDR_KIND_SHIFT`);
+    /// Stream length (12 bits) | executor kind (4 bits, `TS_HDR_KIND_SHIFT`);
     /// kind 0 = no arena stream. Eight bytes per entry keeps twice as many
     /// headers per cache line as the unpacked form did — the header load is
     /// the first touch of every settle evaluation.
@@ -103,7 +103,7 @@ pub(super) struct TsHdr {
     pub(super) num_regs: u16,
 }
 
-pub(super) const TS_HDR_KIND_SHIFT: u32 = 13;
+pub(super) const TS_HDR_KIND_SHIFT: u32 = 12;
 
 pub(super) const TS_HDR_LEN_MAX: usize = (1 << TS_HDR_KIND_SHIFT) - 1;
 
@@ -781,10 +781,12 @@ impl NbaFastIndex {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn get(&self, id: usize) -> Option<usize> {
         let e = if id < self.dense_entries.len() {
-            self.dense_entries[id]
+            unsafe { *self.dense_entries.get_unchecked(id) }
+        } else if self.sparse_entries.is_empty() {
+            return None;
         } else {
             *self.sparse_entries.get(&id)?
         };

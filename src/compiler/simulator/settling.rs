@@ -1591,6 +1591,11 @@ impl Simulator {
                 self.ctl_rearm(s);
             }
         }
+        if !self.ts_ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ts_ctl_rearm_pending) {
+                self.ts_ctl_rearm(s);
+            }
+        }
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
@@ -1961,6 +1966,23 @@ impl Simulator {
         // written bit by bit while it is read) ran once per carry step, and
         // an immediate assertion in it failed on values that never coexist.
         let has_obs = self.comb_has_observer;
+        let has_mux_guard = !self.mux_guard_by_entry.is_empty();
+        let has_clock_tree = !tree_sig.is_empty();
+        // Latch clean-settle fast path for `after_signal_write_inner`: avoids
+        // checking 8 global observer flags on every signal write (~1.7B/run).
+        self.fast_quiet_obs = self.signal_commit_plan.is_empty()
+            && self.quiet_valid
+            && self.value_trace_ids.is_none()
+            && !self.dump_dirty_active
+            && self.active_force_exprs.is_empty()
+            && self.signal_inline_bits.is_empty()
+            && !(self.event_measure && !self.armed_edge)
+            && !self.in_edge_block
+            && !self.in_edge_cont
+            && !self.dirty_edge
+            && !self.dirty_edge_shadow
+            && self.arm_census.is_none()
+            && !self.profile_report;
         let observer = std::mem::take(&mut self.comb_observer);
         let mut held_obs: Vec<usize> = Vec::new();
         let mut obs_pass_next = false;
@@ -2000,7 +2022,8 @@ impl Simulator {
                     let __hi = unsafe { *dep_offsets.get_unchecked(__tid + 1) } as usize;
                     debug_assert!(__lo <= __hi && __hi <= dep_entries.len());
                     n_dep_edges += (__hi - __lo) as u64;
-                    let __tree_clk = tree_sig.get(__tid).copied().unwrap_or(false);
+                    let __tree_clk =
+                        has_clock_tree && tree_sig.get(__tid).copied().unwrap_or(false);
                     // SAFETY: `dep_edges` parallels `dep_entries`
                     // (`bit_sens_refresh` sizes it before every settle).
                     for __e in unsafe { dep_edges.get_unchecked(__lo..__hi) } {
@@ -2011,19 +2034,11 @@ impl Simulator {
                         }
                         let __dep = __e.entry as usize;
                         // §9.2.2.2.1(b): an `always_comb` is never re-armed
-                        // by its OWN write. One that writes a member of a
-                        // packed struct and reads ANOTHER member depends on
-                        // the whole signal here (CVA6's decoder exception
-                        // block: `instruction_o.ex = ex_i; … .ex.valid = 1;`
-                        // beside a read of `instruction_o.pc`), so its own
-                        // two-step member write re-queued it every pass to
-                        // the settle limit and the core never left its first
-                        // fetch. Only always_comb/always_latch: an explicit
-                        // `always @(a)` and a continuous assign DO re-fire on
-                        // their own writes (the zero-delay loop the limit is
-                        // there to report).
-                        if __dep == $eidx
-                            && matches!(
+                        // by its OWN write, nor is a self-exempt `always @*`.
+                        // Merge both checks under a single `__dep == $eidx`
+                        // branch so the common non-self edge pays one compare.
+                        if __dep == $eidx {
+                            if matches!(
                                 entries[__dep].item,
                                 CombItem::AlwaysBlock {
                                     is_always_comb: true,
@@ -2032,25 +2047,16 @@ impl Simulator {
                                     is_always_comb: true,
                                     ..
                                 }
-                            )
-                        {
-                            continue;
-                        }
-                        if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        // An `always @*` that reads a packed element it also
-                        // writes after packed-region exclusion, the one
-                        // kind the arm above lets through. Precomputed; only
-                        // a self-dependency gets this far, and only an entry
-                        // added since the table was built misses it.
-                        if __dep == $eidx
-                            && self
+                            ) || self
                                 .comb_self_exempt
                                 .get(__dep)
                                 .copied()
                                 .unwrap_or_else(|| entries[__dep].reads_own_writes())
-                        {
+                            {
+                                continue;
+                            }
+                        }
+                        if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
                         }
                         if lane_on && __e.gate_slot != 0 {
@@ -2384,7 +2390,8 @@ impl Simulator {
                 if self.in_pre_process_settle && entries[eidx].defer_at_time0 {
                     self.t0_deferred_ran.insert(eidx);
                 }
-                if let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
+                if has_mux_guard
+                    && let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
                     && self.mux_body_unchanged(slot.get() - 1)
                 {
                     mux_skipped += 1;
@@ -2512,13 +2519,13 @@ impl Simulator {
                     }
                 }
                 if !ts_fast && !ts_native_bailed && self.proc_depth == 0 {
-                    let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind());
-                    if arena_kind != 0 {
+                    let arena_hdr = self.ts_hdr.get(eidx).copied().unwrap_or_default();
+                    if arena_hdr.kind() != 0 {
                         if !ts_keep_recs {
                             self.ts_rec_n = 0;
                         }
                         self.ts_direct_writes = true;
-                        let ok = self.ts_guard_and_exec_arena(eidx);
+                        let ok = self.ts_guard_and_exec_arena(eidx, arena_hdr, &mut dep_edges);
                         self.ts_direct_writes = false;
                         if !ok && self.ts_last_xbail {
                             self.ts_xbail_note(0, eidx);
@@ -2541,7 +2548,15 @@ impl Simulator {
                                 if let (Some(TsSlot::Yes(ts)), Some(m)) =
                                     (self.ts_comb.get(eidx), self.ts_jit.as_mut())
                                 {
-                                    if !ts.has_ctrl && !ts.has_wide {
+                                    if !ts.has_ctrl
+                                        && !ts.has_wide
+                                        && self
+                                            .ts_ctl_by_entry
+                                            .get(eidx)
+                                            .copied()
+                                            .unwrap_or(u32::MAX)
+                                            == u32::MAX
+                                    {
                                         m.compile(eidx, &ts.insns, ts.num_regs);
                                     }
                                 }
@@ -2576,6 +2591,7 @@ impl Simulator {
                     }
                 }
                 if !ts_fast {
+                    self.ts_ctl_set_masked(eidx, &mut dep_edges, false);
                     if !self.ts_sleep.is_empty() {
                         if let Some(c) = self.ts_asleep_comb.get_mut(eidx) {
                             if *c != 0 {
@@ -3240,6 +3256,7 @@ impl Simulator {
             self.max_settle_iters = total_iters;
         }
         self.leave_private_regs(caller_regs);
+        self.fast_quiet_obs = false;
         self.settling = false;
     }
 

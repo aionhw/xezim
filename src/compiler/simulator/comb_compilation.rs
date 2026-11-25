@@ -805,60 +805,6 @@ impl Simulator {
         // 4 GB. Streaming drain releases per-CA allocations as we iterate.
         let cas = std::mem::take(&mut self.module.continuous_assigns);
         let pending_ca = std::mem::take(&mut self.module.pending_cont_assign);
-        // §10.6.2: a whole-ARRAY continuous assign (`assign dst = src;` between
-        // unpacked arrays) has no single signal to drive — the ELEMENTS are the
-        // signals — so it compiled to a phantom scalar and silently drove
-        // nothing, leaving `dst` x for the whole run. Elaboration expands the
-        // module-scope ones, but a SUB-MODULE's assigns arrive here as
-        // `pending_cont_assign` and never pass through that path, so expand
-        // them at the one point every continuous assign is guaranteed to cross.
-        // The array table is snapshotted because the loop below needs `&mut
-        // self`; it is names→ranges only, not ASTs.
-        let arrays_snapshot = self.module.arrays.clone();
-        let arrays_2d_snapshot = self.module.arrays_2d.clone();
-        let params_snapshot = self.module.parameters.clone();
-        let descending_snapshot = self.module.descending_arrays.clone();
-        let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
-        // §10.10: the arrays an unpacked concatenation item cannot be spread
-        // from element by element (`concat_array_assign_parts`).
-        let arrays_nd_snapshot = self.module.arrays_nd.clone();
-        let other_arrays_snapshot: HashSet<String> = self
-            .module
-            .dynamic_arrays
-            .iter()
-            .chain(&self.module.queue_vars)
-            .chain(self.module.associative_arrays.keys())
-            .cloned()
-            .collect();
-        let is_other_array = |n: &str| other_arrays_snapshot.contains(n);
-        let concat_tables = crate::compiler::elaborate::UnpackedArrayTables {
-            arrays: &arrays_snapshot,
-            arrays_2d: &arrays_2d_snapshot,
-            arrays_nd: &arrays_nd_snapshot,
-            descending: &descending_snapshot,
-            decl_dims: &decl_dims_snapshot,
-            params: &params_snapshot,
-            other_array: &is_other_array,
-        };
-        // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
-        // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
-        // with the port chain above unconnected). Identity port connects
-        // collapse by SUBSTITUTION, and different readers may have bound at
-        // DIFFERENT levels of the chain (the deep flop's clock bound one
-        // level up). Fan the drive out to EVERY name in the alias chain so
-        // all of them stay coherent. Width-guarded; chains are short and
-        // hierarchy overrides rare, so the duplication is negligible.
-        let alias_snapshot = self.module.port_aliases.clone();
-        let alias_widths: HashMap<String, u32> = alias_snapshot
-            .iter()
-            .flat_map(|(k, v)| [k.clone(), v.to_string()])
-            .filter_map(|n| {
-                self.module
-                    .signals
-                    .get(&n)
-                    .map(|sig| (n.clone(), sig.width))
-            })
-            .collect();
         // Hoisted out of the loop to reuse capacity across iterations.
         // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
@@ -872,89 +818,122 @@ impl Simulator {
         // measurable at 150k assigns).
         let dump_ca_reads = std::env::var_os("XEZIM_DUMP_CA_READS").is_some();
         let dump_unresolved = std::env::var_os("XEZIM_DUMP_UNRESOLVED").is_some();
-        for mut ca in cas
+        // Reusable per-CA expansion buffers: borrowing `self.module` tables
+        // directly before each inner loop avoids cloning `port_aliases`,
+        // `parameters`, and unpacked-array maps (hundreds of MB on large
+        // fabrics) and eliminates 2x `vec![ca]` heap allocs per assign.
+        let mut expanded_parts: Vec<crate::compiler::elaborate::FullContinuousAssignment> =
+            Vec::new();
+        let mut expanded_cas: Vec<crate::compiler::elaborate::FullContinuousAssignment> =
+            Vec::new();
+        for raw_ca in cas
             .into_iter()
-            .chain(
-                pending_ca
-                    .into_iter()
-                    .map(|p| p.materialize(&params_snapshot)),
-            )
-            .flat_map(|mut ca| {
-                if let crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } = &ca
-                    && !decl_dims_snapshot.contains_key(lhs.as_str())
-                    && !arrays_snapshot.contains_key(lhs.as_str())
-                    && !arrays_2d_snapshot.contains_key(lhs.as_str())
-                {
-                    return vec![ca.into_full()];
-                }
-                ca.make_full_mut();
-                let f = ca.as_full().expect("promoted to Full above");
-                self.module.whole_array_driver_parts(&f.lhs, &f.rhs, f.delay, &decl_dims_snapshot)
-                .or_else(|| {
-                    crate::compiler::elaborate::whole_array_row_assign_parts(
-                        &f.lhs,
-                        &f.rhs,
-                        f.delay,
-                        &arrays_snapshot,
-                        &arrays_2d_snapshot,
-                        &params_snapshot,
-                        Some(&descending_snapshot),
-                        Some(&decl_dims_snapshot),
-                    )
-                })
-                .or_else(|| {
-                    crate::compiler::elaborate::slice_array_assign_parts(
-                        &f.lhs,
-                        &f.rhs,
-                        f.delay,
-                        &arrays_snapshot,
-                        Some(&descending_snapshot),
-                        Some(&decl_dims_snapshot),
-                        &params_snapshot,
-                    )
-                })
-                .or_else(|| {
-                    Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
-                })
-                .or_else(|| {
-                    crate::compiler::elaborate::concat_array_assign_parts(
-                        &f.lhs,
-                        &f.rhs,
-                        f.delay,
-                        &concat_tables,
-                    )
-                })
-                .map(|parts| {
-                    parts
-                        .into_iter()
-                        .map(|mut part| {
-                            part.inherit_driver_metadata(&ca);
-                            part.into_full()
+            .map(Ok)
+            .chain(pending_ca.into_iter().map(Err))
+        {
+            let mut raw_ca = match raw_ca {
+                Ok(c) => c,
+                Err(p) => p.materialize(&self.module.parameters),
+            };
+            expanded_parts.clear();
+            if let crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } = &raw_ca
+                && !self.module.unpacked_decl_dims.contains_key(lhs.as_str())
+                && !self.module.arrays.contains_key(lhs.as_str())
+                && !self.module.arrays_2d.contains_key(lhs.as_str())
+            {
+                expanded_parts.push(raw_ca.into_full());
+            } else {
+                // §10.6.2 / §10.10: expand whole-array / row / slice / pattern /
+                // concat unpacked-array assigns using borrowed module tables.
+                raw_ca.make_full_mut();
+                let expanded = {
+                    let f = raw_ca.as_full().expect("promoted to Full above");
+                    let m = &self.module;
+                    let is_other_array = |n: &str| {
+                        m.dynamic_arrays.contains(n)
+                            || m.queue_vars.contains(n)
+                            || m.associative_arrays.contains_key(n)
+                    };
+                    let concat_tables = crate::compiler::elaborate::UnpackedArrayTables {
+                        arrays: &m.arrays,
+                        arrays_2d: &m.arrays_2d,
+                        arrays_nd: &m.arrays_nd,
+                        descending: &m.descending_arrays,
+                        decl_dims: &m.unpacked_decl_dims,
+                        params: &m.parameters,
+                        other_array: &is_other_array,
+                    };
+                    m.whole_array_driver_parts(&f.lhs, &f.rhs, f.delay, &m.unpacked_decl_dims)
+                        .or_else(|| {
+                            crate::compiler::elaborate::whole_array_row_assign_parts(
+                                &f.lhs,
+                                &f.rhs,
+                                f.delay,
+                                &m.arrays,
+                                &m.arrays_2d,
+                                &m.parameters,
+                                Some(&m.descending_arrays),
+                                Some(&m.unpacked_decl_dims),
+                            )
                         })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec![ca.into_full()])
-            })
-            .flat_map(|ca| {
+                        .or_else(|| {
+                            crate::compiler::elaborate::slice_array_assign_parts(
+                                &f.lhs,
+                                &f.rhs,
+                                f.delay,
+                                &m.arrays,
+                                Some(&m.descending_arrays),
+                                Some(&m.unpacked_decl_dims),
+                                &m.parameters,
+                            )
+                        })
+                        .or_else(|| {
+                            Self::row_pattern_assign_parts(
+                                m,
+                                &raw_ca,
+                                &m.unpacked_decl_dims,
+                                &m.parameters,
+                            )
+                        })
+                        .or_else(|| {
+                            crate::compiler::elaborate::concat_array_assign_parts(
+                                &f.lhs,
+                                &f.rhs,
+                                f.delay,
+                                &concat_tables,
+                            )
+                        })
+                };
+                match expanded {
+                    Some(parts) => {
+                        for mut part in parts {
+                            part.inherit_driver_metadata(&raw_ca);
+                            expanded_parts.push(part.into_full());
+                        }
+                    }
+                    None => expanded_parts.push(raw_ca.into_full()),
+                }
+            }
+            expanded_cas.clear();
+            for ca in expanded_parts.drain(..) {
+                // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
+                // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
+                // with the port chain above unconnected). Fan the drive out to
+                // EVERY name in the alias chain so all of them stay coherent.
                 let chain: Option<Vec<String>> = match &ca.lhs.kind {
-                    // ONLY a user-written HIERARCHY REFERENCE (multi-segment
-                    // path `a.b.c`). Inlined port-connect assigns carry their
-                    // instance-scoped name as ONE dotted segment — fanning
-                    // those out would double-drive the parent net of every
-                    // identity connection in the design.
                     ExprKind::Ident(h)
                         if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()) =>
                     {
                         let flat = Self::resolve_hier_name_static(h, &self.module);
-                        if flat.contains('.') && alias_snapshot.contains_key(&flat) {
-                            let w0 = alias_widths.get(&flat).copied();
+                        if flat.contains('.') && self.module.port_aliases.contains_key(&flat) {
+                            let w0 = self.module.signals.get(&flat).map(|sig| sig.width);
                             let mut names = vec![flat.clone()];
                             let mut cur = flat;
                             for _ in 0..64 {
-                                let Some(p) = alias_snapshot.get(&cur) else {
+                                let Some(p) = self.module.port_aliases.get(&cur) else {
                                     break;
                                 };
-                                if alias_widths.get(p.as_str()).copied() != w0
+                                if self.module.signals.get(p.as_str()).map(|sig| sig.width) != w0
                                     || names.iter().any(|n| n == p)
                                 {
                                     break;
@@ -970,10 +949,9 @@ impl Simulator {
                     _ => None,
                 };
                 match chain {
-                    None => vec![ca],
-                    Some(names) => names
-                        .into_iter()
-                        .map(|n| {
+                    None => expanded_cas.push(ca),
+                    Some(names) => {
+                        for n in names {
                             let mut c = ca.clone();
                             c.lhs = Expression::new(
                                 ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
@@ -992,12 +970,12 @@ impl Simulator {
                                 }),
                                 ca.lhs.span,
                             );
-                            c
-                        })
-                        .collect(),
+                            expanded_cas.push(c);
+                        }
+                    }
                 }
-            })
-        {
+            }
+            for mut ca in expanded_cas.drain(..) {
             // §7.2: a member target written as a member access on a plain
             // name (`n.V`, the form the nettype pass emits for a struct net)
             // is the member's own leaf signal. Name it so before compiling:
@@ -2159,6 +2137,7 @@ impl Simulator {
                 has_unresolved_reads,
                 defer_at_time0: false,
             });
+            }
         }
 
         self.initialize_continuously_driven_nets();

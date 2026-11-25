@@ -801,6 +801,11 @@ impl Simulator {
 
     pub(super) const TS_SLICE_TRANSFER: u8 = 5;
     pub(super) const TS_MUX_STREAM: u8 = 6;
+    pub(super) const TS_AND_EQ: u8 = 7;
+    pub(super) const TS_AND_BIT: u8 = 8;
+    pub(super) const TS_AND2: u8 = 9;
+    pub(super) const TS_OR2: u8 = 10;
+    pub(super) const TS_EQ_STORE: u8 = 11;
 
     /// A lowered conditional whose inputs and one partial write can be
     /// evaluated without filling a VM register file. The stream starts with
@@ -881,19 +886,26 @@ impl Simulator {
     pub(super) fn is_slice_transfer(insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
         matches!(insns,
-            [SigRange { d, .. } | SigRangeW { d, .. },
-             RangeStore { s, .. } | RangeStoreW { s, .. }] if d == s)
+            [LoadSig { d, .. } | SigRange { d, .. } | SigRangeW { d, .. },
+             Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. }] if d == s)
     }
 
+    #[inline(always)]
     fn exec_slice_transfer(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
         let (value, unknown) = match insns[0] {
+            LoadSig { sig, .. } => unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits(),
             SigRange { sig, lo, mask, .. } => {
-                let (v, x) = self.signal_table[sig as usize].raw_bits();
+                let (v, x) = unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits();
                 ((v >> lo) & mask, (x >> lo) & mask)
             }
-            SigRangeW { sig, lo, w, .. } => {
-                Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w)
+            SigRangeW { sig, lo, w, mask, .. } => {
+                let (v, x) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(sig as usize) },
+                    lo,
+                    w,
+                );
+                (v & mask, x & mask)
             }
             _ => unreachable!("slice-transfer source"),
         };
@@ -903,6 +915,9 @@ impl Simulator {
             return false;
         }
         match insns[1] {
+            Store { sig, mask, .. } => {
+                self.ts_store(sig as usize, value & mask, mask);
+            }
             RangeStore {
                 sig, hi, lo, mask, ..
             } => {
@@ -918,19 +933,576 @@ impl Simulator {
         true
     }
 
+    /// `dst = en && (a[..] == b[..])` (CAM wakeup/tag comparators: ~16.6% of
+    /// all contassign evaluations on C910). Short-circuits on `en === 0`
+    /// without loading `a` or `b` (IEEE 1800 §11.4.7: `0 && anything == 0`).
+    pub(super) fn is_and_eq_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        match insns {
+            [
+                LoadSigSigRange { dl: r0, d: r1, .. },
+                SigRangeEq { dr: r2, d: r3, a, b, .. },
+                LogAndStore { a: la, b: lb, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && r1 != r2
+                    && r0 != r3
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && ((*la == *r0 && *lb == *r3) || (*la == *r3 && *lb == *r0))
+            }
+            [
+                LoadSig { d: r0, .. },
+                SigRangeW { d: r1, .. },
+                SigRangeEq { dr: r2, d: r3, a, b, .. },
+                LogAndStore { a: la, b: lb, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && r1 != r2
+                    && r0 != r3
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && ((*la == *r0 && *lb == *r3) || (*la == *r3 && *lb == *r0))
+            }
+            [
+                LoadSigSigRange { dl: r0, d: r1, .. },
+                SigRangeW { d: r2, .. },
+                Eq { d: r3, a, b },
+                LogAndStore { a: la, b: lb, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && r1 != r2
+                    && r0 != r3
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && ((*la == *r0 && *lb == *r3) || (*la == *r3 && *lb == *r0))
+            }
+            [
+                LoadSig { d: r0, .. },
+                SigRangeW { d: r1, .. },
+                SigRangeW { d: r2, .. },
+                Eq { d: r3, a, b },
+                LogAndStore { a: la, b: lb, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && r1 != r2
+                    && r0 != r3
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && ((*la == *r0 && *lb == *r3) || (*la == *r3 && *lb == *r0))
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn ts_ctl_is_sig2(&self, eidx: usize) -> bool {
+        let Some(&slot) = self.ts_ctl_by_entry.get(eidx) else {
+            return false;
+        };
+        if slot == u32::MAX {
+            return false;
+        }
+        unsafe { self.ts_ctl.get_unchecked(slot as usize) }.ctl_is_sig2
+    }
+
+    #[inline(always)]
+    pub(super) fn ts_ctl_set_masked(&mut self, eidx: usize, dep_edges: &mut [DepEdge], want: bool) {
+        let Some(&slot) = self.ts_ctl_by_entry.get(eidx) else {
+            return;
+        };
+        if slot == u32::MAX {
+            return;
+        }
+        let c = unsafe { self.ts_ctl.get_unchecked_mut(slot as usize) };
+        if c.masked == want {
+            return;
+        }
+        c.masked = want;
+        let m0 = if want { 0 } else { c.smask0 };
+        let (lo0, hi0) = (c.pos0 as usize, (c.pos0 + c.npos0) as usize);
+        if let Some(es) = dep_edges.get_mut(lo0..hi0) {
+            for e in es {
+                e.mask = m0;
+            }
+        }
+        if c.npos1 != 0 {
+            let m1 = if want { 0 } else { c.smask1 };
+            let (lo1, hi1) = (c.pos1 as usize, (c.pos1 + c.npos1) as usize);
+            if let Some(es) = dep_edges.get_mut(lo1..hi1) {
+                for e in es {
+                    e.mask = m1;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn exec_and_eq_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (en_sig, dst_sig, dst_mask) = match (insns.first().unwrap(), insns.last().unwrap()) {
+            (
+                LoadSigSigRange { sig, .. } | LoadSig { sig, .. },
+                LogAndStore {
+                    sig: dst, mask: dm, ..
+                },
+            ) => (*sig, *dst, *dm),
+            _ => unreachable!("and_eq stream"),
+        };
+        let (ev, ex) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if ex == 0 && ev == 0 {
+            self.ts_store(dst_sig as usize, 0, dst_mask);
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if ex != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (v1, x1, v2, x2) = match insns {
+            [
+                LoadSigSigRange {
+                    sig2: s1,
+                    lo: lo1,
+                    mask: m1,
+                    ..
+                },
+                SigRangeEq {
+                    sig: s2,
+                    lo: lo2,
+                    mask: m2,
+                    ..
+                },
+                _,
+            ] => {
+                let (a, ax) = unsafe { self.signal_table.get_unchecked(*s1 as usize) }.raw_bits();
+                let (b, bx) = unsafe { self.signal_table.get_unchecked(*s2 as usize) }.raw_bits();
+                (
+                    (a >> lo1) & m1,
+                    (ax >> lo1) & m1,
+                    (b >> lo2) & m2,
+                    (bx >> lo2) & m2,
+                )
+            }
+            [
+                _,
+                SigRangeW {
+                    sig: s1,
+                    lo: lo1,
+                    w: w1,
+                    mask: m1,
+                    ..
+                },
+                SigRangeEq {
+                    sig: s2,
+                    lo: lo2,
+                    mask: m2,
+                    ..
+                },
+                _,
+            ] => {
+                let (a, ax) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(*s1 as usize) },
+                    *lo1,
+                    *w1,
+                );
+                let (b, bx) = unsafe { self.signal_table.get_unchecked(*s2 as usize) }.raw_bits();
+                (a & m1, ax & m1, (b >> lo2) & m2, (bx >> lo2) & m2)
+            }
+            [
+                LoadSigSigRange {
+                    sig2: s1,
+                    lo: lo1,
+                    mask: m1,
+                    ..
+                },
+                SigRangeW {
+                    sig: s2,
+                    lo: lo2,
+                    w: w2,
+                    mask: m2,
+                    ..
+                },
+                _,
+                _,
+            ] => {
+                let (a, ax) = unsafe { self.signal_table.get_unchecked(*s1 as usize) }.raw_bits();
+                let (b, bx) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(*s2 as usize) },
+                    *lo2,
+                    *w2,
+                );
+                ((a >> lo1) & m1, (ax >> lo1) & m1, b & m2, bx & m2)
+            }
+            [
+                _,
+                SigRangeW {
+                    sig: s1,
+                    lo: lo1,
+                    w: w1,
+                    mask: m1,
+                    ..
+                },
+                SigRangeW {
+                    sig: s2,
+                    lo: lo2,
+                    w: w2,
+                    mask: m2,
+                    ..
+                },
+                _,
+                _,
+            ] => {
+                let (a, ax) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(*s1 as usize) },
+                    *lo1,
+                    *w1,
+                );
+                let (b, bx) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(*s2 as usize) },
+                    *lo2,
+                    *w2,
+                );
+                (a & m1, ax & m1, b & m2, bx & m2)
+            }
+            _ => unreachable!("and_eq stream body"),
+        };
+        if (x1 | x2) != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let res = u64::from(v1 == v2) & dst_mask;
+        self.ts_store(dst_sig as usize, res, dst_mask);
+        true
+    }
+
+    /// `dst = en && bus[bit]` (~8.1% of contassign evals on C910).
+    /// Short-circuits on `en === 0` without loading `bus`.
+    pub(super) fn is_and_bit_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        match insns {
+            [
+                LoadSigSigRange { dl: r0, d: r1, .. },
+                Bit { d: r2, s, .. },
+                LogAndStore { a, b, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && s == r1
+                    && ((*a == *r0 && *b == *r2) || (*a == *r2 && *b == *r0))
+            }
+            [
+                LoadSig { d: r0, .. },
+                SigRangeW { d: r1, .. },
+                Bit { d: r2, s, .. },
+                LogAndStore { a, b, .. },
+            ] => {
+                r0 != r1
+                    && r0 != r2
+                    && s == r1
+                    && ((*a == *r0 && *b == *r2) || (*a == *r2 && *b == *r0))
+            }
+            [
+                LoadSig { d: r0, .. },
+                SigBit { d: r1, .. } | SigBitW { d: r1, .. },
+                LogAndStore { a, b, .. },
+            ] => r0 != r1 && ((*a == *r0 && *b == *r1) || (*a == *r1 && *b == *r0)),
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn exec_and_bit_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (en_sig, dst_sig, dst_mask) = match (insns.first().unwrap(), insns.last().unwrap()) {
+            (
+                LoadSigSigRange { sig, .. } | LoadSig { sig, .. },
+                LogAndStore {
+                    sig: dst, mask: dm, ..
+                },
+            ) => (*sig, *dst, *dm),
+            _ => unreachable!("and_bit stream"),
+        };
+        let (ev, ex) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if ex == 0 && ev == 0 {
+            self.ts_store(dst_sig as usize, 0, dst_mask);
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if ex != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (bv, bx) = match insns {
+            [
+                LoadSigSigRange { sig2, lo, mask, .. },
+                Bit { bit, .. },
+                _,
+            ] => {
+                let (v, x) = unsafe { self.signal_table.get_unchecked(*sig2 as usize) }.raw_bits();
+                let rv = (v >> lo) & mask;
+                let rx = (x >> lo) & mask;
+                ((rv >> bit) & 1, (rx >> bit) & 1)
+            }
+            [
+                _,
+                SigRangeW {
+                    sig, lo, w, mask, ..
+                },
+                Bit { bit, .. },
+                _,
+            ] => {
+                let (v, x) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(*sig as usize) },
+                    *lo,
+                    *w,
+                );
+                let rv = v & mask;
+                let rx = x & mask;
+                ((rv >> bit) & 1, (rx >> bit) & 1)
+            }
+            [_, SigBit { sig, bit, .. }, _] => {
+                let (v, x) = unsafe { self.signal_table.get_unchecked(*sig as usize) }.raw_bits();
+                ((v >> bit) & 1, (x >> bit) & 1)
+            }
+            [_, SigBitW { sig, bit, .. }, _] => Self::raw_bits_slice(
+                unsafe { self.signal_table.get_unchecked(*sig as usize) },
+                *bit,
+                1,
+            ),
+            _ => unreachable!("and_bit stream body"),
+        };
+        if bx != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        self.ts_store(dst_sig as usize, bv & dst_mask, dst_mask);
+        true
+    }
+
+    /// `dst = a && b` (~3.1% of contassign evals on C910).
+    /// Short-circuits on `a === 0` without loading `b`.
+    pub(super) fn is_and2_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(
+            insns,
+            [
+                LoadSig2 { d1, d2, .. },
+                LogAndStore { a, b, .. }
+            ] if d1 != d2 && ((*a == *d1 && *b == *d2) || (*a == *d2 && *b == *d1))
+        )
+    }
+
+    #[inline(always)]
+    fn exec_and2_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let [
+            LoadSig2 { sig1, sig2, .. },
+            LogAndStore { sig: dst, mask, .. },
+        ] = insns
+        else {
+            unreachable!("and2 stream");
+        };
+        let (en_sig, data_sig) = if self.ts_ctl_is_sig2(eidx) {
+            (*sig2, *sig1)
+        } else {
+            (*sig1, *sig2)
+        };
+        let (v1, x1) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if x1 == 0 && v1 == 0 {
+            self.ts_store(*dst as usize, 0, *mask);
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if x1 != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (v2, x2) = unsafe { self.signal_table.get_unchecked(data_sig as usize) }.raw_bits();
+        if x2 == 0 && v2 == 0 {
+            self.ts_store(*dst as usize, 0, *mask);
+            return true;
+        }
+        if x2 != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        self.ts_store(*dst as usize, 1 & *mask, *mask);
+        true
+    }
+
+    /// `dst = a || b` (~1.1% of contassign evals on C910).
+    /// Short-circuits on definite-1 controlling input without loading the other.
+    pub(super) fn is_or2_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(
+            insns,
+            [
+                LoadSig2 { d1, d2, .. },
+                LogOrStore { a, b, .. }
+            ] if d1 != d2 && ((*a == *d1 && *b == *d2) || (*a == *d2 && *b == *d1))
+        )
+    }
+
+    #[inline(always)]
+    fn exec_or2_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let [
+            LoadSig2 { sig1, sig2, .. },
+            LogOrStore { sig: dst, mask, .. },
+        ] = insns
+        else {
+            unreachable!("or2 stream");
+        };
+        let (en_sig, data_sig) = if self.ts_ctl_is_sig2(eidx) {
+            (*sig2, *sig1)
+        } else {
+            (*sig1, *sig2)
+        };
+        let (v1, x1) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if (v1 & !x1) != 0 {
+            self.ts_store(*dst as usize, 1 & *mask, *mask);
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if x1 != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (v2, x2) = unsafe { self.signal_table.get_unchecked(data_sig as usize) }.raw_bits();
+        if (v2 & !x2) != 0 {
+            self.ts_store(*dst as usize, 1 & *mask, *mask);
+            return true;
+        }
+        if x2 != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        self.ts_store(*dst as usize, 0, *mask);
+        true
+    }
+
+    /// `dst = (a[..] == b[..])` (~3.1% of contassign evals on C910).
+    pub(super) fn is_eq_store_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(
+            insns,
+            [
+                SigRange { d: r0, .. } | SigRangeW { d: r0, .. },
+                SigRangeEq { dr: r1, d: r2, a, b, .. },
+                Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. }
+            ] if r0 != r1
+                && s == r2
+                && ((*a == *r0 && *b == *r1) || (*a == *r1 && *b == *r0))
+        )
+    }
+
+    #[inline(always)]
+    fn exec_eq_store_stream(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (v1, x1) = match insns[0] {
+            SigRange { sig, lo, mask, .. } => {
+                let (v, x) = unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits();
+                ((v >> lo) & mask, (x >> lo) & mask)
+            }
+            SigRangeW {
+                sig, lo, w, mask, ..
+            } => {
+                let (v, x) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(sig as usize) },
+                    lo,
+                    w,
+                );
+                (v & mask, x & mask)
+            }
+            _ => unreachable!("eq_store lhs"),
+        };
+        let SigRangeEq {
+            sig: s2,
+            lo: lo2,
+            mask: m2,
+            ..
+        } = insns[1]
+        else {
+            unreachable!("eq_store rhs");
+        };
+        let (b, bx) = unsafe { self.signal_table.get_unchecked(s2 as usize) }.raw_bits();
+        let (v2, x2) = ((b >> lo2) & m2, (bx >> lo2) & m2);
+        if (x1 | x2) != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let res = u64::from(v1 == v2);
+        match insns[2] {
+            Store { sig, mask, .. } => {
+                self.ts_store(sig as usize, res & mask, mask);
+            }
+            RangeStore {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_range_store(sig as usize, res & mask, lo, hi);
+            }
+            RangeStoreW {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_wide_range_store(sig as usize, lo, hi, res & mask, 0);
+            }
+            _ => unreachable!("eq_store dst"),
+        }
+        true
+    }
+
     /// `ts_guard_and_exec` for a comb entry whose lowered stream lives in the
     /// arena (`ts_arena` / `ts_hdr`): one dense header load and a contiguous
     /// instruction slice instead of an `Arc` deref plus a per-block heap
     /// `Vec` — the executor's cycles were dominated by those two misses.
-    pub(super) fn ts_guard_and_exec_arena(&mut self, eidx: usize) -> bool {
-        let h = self.ts_hdr[eidx];
+    pub(super) fn ts_guard_and_exec_arena(
+        &mut self,
+        eidx: usize,
+        h: TsHdr,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
         self.ts_exec_aborted = false;
         self.ts_last_xbail = false;
         if self.warn_x {
+            self.ts_ctl_set_masked(eidx, dep_edges, false);
             self.prof_ts_bail_warnx += 1;
             return false;
         }
         if !self.forced_signals.is_empty() {
+            self.ts_ctl_set_masked(eidx, dep_edges, false);
             if let Some(TsSlot::Yes(ts)) = self.ts_comb.get(eidx) {
                 let p: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
                 if self.ts_writes_forced(unsafe { &*p }) {
@@ -948,6 +1520,11 @@ impl Simulator {
         self.ts_cur_eidx = eidx as u32;
         let ok = match h.kind() {
             Self::TS_SLICE_TRANSFER => self.exec_slice_transfer(insns),
+            Self::TS_AND_EQ => self.exec_and_eq_stream(insns, eidx, dep_edges),
+            Self::TS_AND_BIT => self.exec_and_bit_stream(insns, eidx, dep_edges),
+            Self::TS_AND2 => self.exec_and2_stream(insns, eidx, dep_edges),
+            Self::TS_OR2 => self.exec_or2_stream(insns, eidx, dep_edges),
+            Self::TS_EQ_STORE => self.exec_eq_store_stream(insns),
             Self::TS_MUX_STREAM if self.ts_mux_stream_on => self.exec_mux_stream(insns),
             kind => self.exec_two_state_parts(insns, h.num_regs as u32, kind),
         };
@@ -1051,18 +1628,45 @@ impl Simulator {
     }
 
     pub(super) fn ts_store_nba_wide(&mut self, id: usize, v: &[u64], w: u32) {
-        let val = Value::from_words(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i].value = val;
-        } else if self.signal_table[id] != val {
-            self.nba_fast_index.insert(id, self.nba_fast.len());
-            self.nba_fast.push(NbaFast {
-                block_index: 0,
-                signal_id: id,
-                value: val,
-            });
+            self.nba_fast[i].value = Value::from_words(v, w);
         } else {
-            self.prof_nba_elided += 1;
+            let cur = unsafe { self.signal_table.get_unchecked(id) };
+            // Fast stack-only equality check avoids heap-allocating `WidePlanes`
+            // on elided wide NBAs (millions per CoreMark run).
+            if w > 64 && w <= 512 && cur.width == w && !cur.is_signed && !cur.is_real && !cur.is_fill
+            {
+                let n = (w as usize).div_ceil(64);
+                let mut cur_w = [0u64; 8];
+                if cur.words_if_clean(&mut cur_w[..n]) {
+                    let r = w % 64;
+                    let top_mask = if r == 0 { u64::MAX } else { (1u64 << r) - 1 };
+                    let mut same = true;
+                    for i in 0..n {
+                        let want = v.get(i).copied().unwrap_or(0)
+                            & if i + 1 == n { top_mask } else { u64::MAX };
+                        if cur_w[i] != want {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if same {
+                        self.prof_nba_elided += 1;
+                        return;
+                    }
+                }
+            }
+            let val = Value::from_words(v, w);
+            if *cur != val {
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: val,
+                });
+            } else {
+                self.prof_nba_elided += 1;
+            }
         }
     }
 
@@ -1577,6 +2181,16 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
                 }
+                TsInsn::RedXor { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize].count_ones() & 1) as u64;
+                }
+                TsInsn::Mod { d, a, b, mask } => {
+                    let rhs = regs[*b as usize];
+                    if rhs == 0 {
+                        bail!();
+                    }
+                    regs[*d as usize] = (regs[*a as usize] % rhs) & mask;
+                }
                 TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                 TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
                     // FSM streams run on the control executor only.
@@ -1632,6 +2246,8 @@ impl Simulator {
                 | TsInsn::SaveSigW { .. }
                 | TsInsn::WNbaFromElem(..)
                 | TsInsn::RangeFillXW { .. }
+                | TsInsn::RangeFillNbaXW { .. }
+                | TsInsn::ConstStoreNbaX(..)
                 | TsInsn::LoopPoll) => match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
                     0 => {}
                     1 => return false,
@@ -2540,6 +3156,16 @@ impl Simulator {
                     TsInsn::RedAnd { d, s, mask } => {
                         r!(*d) = (r!(*s) == *mask) as u64;
                     }
+                    TsInsn::RedXor { d, s } => {
+                        r!(*d) = (r!(*s).count_ones() & 1) as u64;
+                    }
+                    TsInsn::Mod { d, a, b, mask } => {
+                        let rhs = r!(*b);
+                        if rhs == 0 {
+                            return false;
+                        }
+                        r!(*d) = (r!(*a) % rhs) & mask;
+                    }
                     TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                     TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
                         // FSM streams run on the control executor only.
@@ -2585,6 +3211,8 @@ impl Simulator {
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
                     | TsInsn::RangeFillXW { .. }
+                    | TsInsn::RangeFillNbaXW { .. }
+                    | TsInsn::ConstStoreNbaX(..)
                     | TsInsn::LoopPoll => match self.ts_exec_dyn(insn, rp) {
                         0 => {}
                         1 => return false,
@@ -3019,6 +3647,48 @@ impl Simulator {
         self.after_signal_write_premirrored(id);
     }
 
+    pub(super) fn ts_wide_range_fill_nba_xz(&mut self, id: usize, lo: u32, hi: u32, vbit: u8) {
+        if self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return self.ts_wide_range_fill_nba(id, lo, hi, 0);
+        }
+        let fill_v = if vbit != 0 { u64::MAX } else { 0 };
+        let end = hi as usize + 1;
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let mut pos = lo as usize;
+            while pos < end {
+                let n = (end - pos).min(64);
+                let m = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+                self.nba_fast[i]
+                    .value
+                    .splice_bits64(pos, fill_v & m, m, n);
+                pos += n;
+            }
+        } else {
+            let mut nv = self.signal_table[id].clone();
+            let mut changed = false;
+            let mut pos = lo as usize;
+            while pos < end {
+                let n = (end - pos).min(64);
+                let m = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+                if nv.splice_bits64(pos, fill_v & m, m, n) {
+                    changed = true;
+                }
+                pos += n;
+            }
+            if !changed {
+                self.prof_nba_elided += 1;
+            } else {
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+            }
+        }
+    }
+
     pub(super) fn ts_restore_saved(&mut self, base: usize) {
         while self.ts_save_list.len() > base {
             let Some((sig, v, x)) = self.ts_save_list.pop() else {
@@ -3417,6 +4087,22 @@ impl Simulator {
                     self.ts_wide_range_fill_xz(*sig as usize, *lo, *hi, *v);
                     0
                 }
+                TsInsn::RangeFillNbaXW { sig, hi, lo, v } => {
+                    self.ts_wide_range_fill_nba_xz(*sig as usize, *lo, *hi, *v);
+                    0
+                }
+                TsInsn::ConstStoreNbaX(p) => {
+                    let w = p.hi.saturating_sub(p.lo) + 1;
+                    let (v, x) = self.ts_scrub_two_state(p.sig as usize, p.v, p.x);
+                    if x == 0 {
+                        self.ts_store_nba(p.sig as usize, v, w);
+                    } else {
+                        let mut val = Value::from_inline(v, x, w.max(1));
+                        val.is_signed = self.signal_signed[p.sig as usize];
+                        self.ts_store_nba_val(p.sig as usize, val);
+                    }
+                    0
+                }
                 _ => 0,
             }
         }
@@ -3486,19 +4172,36 @@ impl Simulator {
         }
     }
 
+    #[inline]
     pub(crate) fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
-        let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i].value = val;
-        } else if self.signal_table[id] != val {
-            self.nba_fast_index.insert(id, self.nba_fast.len());
-            self.nba_fast.push(NbaFast {
-                block_index: 0,
-                signal_id: id,
-                value: val,
-            });
+            self.nba_fast[i].value = Value::from_u64(v, w);
         } else {
-            self.prof_nba_elided += 1;
+            let cur = unsafe { self.signal_table.get_unchecked(id) };
+            if w <= 64 && cur.width == w && !cur.is_signed && !cur.is_real && !cur.is_fill {
+                let mask = if w == 64 {
+                    u64::MAX
+                } else if w == 0 {
+                    0
+                } else {
+                    (1u64 << w) - 1
+                };
+                if cur.inline_bits() == Some((v & mask, 0)) {
+                    self.prof_nba_elided += 1;
+                    return;
+                }
+            }
+            let val = Value::from_u64(v, w);
+            if *cur != val {
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: val,
+                });
+            } else {
+                self.prof_nba_elided += 1;
+            }
         }
     }
 
@@ -4027,6 +4730,16 @@ impl Simulator {
                     TsInsn::RedAnd { d, s, mask } => {
                         (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *mask) as u64;
                     }
+                    TsInsn::RedXor { d, s } => {
+                        (*rp.add(*d as usize)) = ((*rp.add(*s as usize)).count_ones() & 1) as u64;
+                    }
+                    TsInsn::Mod { d, a, b, mask } => {
+                        let rhs = *rp.add(*b as usize);
+                        if rhs == 0 {
+                            return false;
+                        }
+                        (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) % rhs) & mask;
+                    }
                     TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                     TsInsn::WaitEdge { ix, resume } => {
                         self.fsm_suspend = Some((*resume, FsmWait::Edge(*ix)));
@@ -4078,6 +4791,8 @@ impl Simulator {
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
                     | TsInsn::RangeFillXW { .. }
+                    | TsInsn::RangeFillNbaXW { .. }
+                    | TsInsn::ConstStoreNbaX(..)
                     | TsInsn::LoopPoll) => match self.ts_exec_dyn(insn, rp) {
                         0 => {}
                         1 => return false,
@@ -6665,5 +7380,96 @@ endmodule
         ] {
             assert_eq!(sim.get_signal(name).and_then(Value::to_u64), Some(expected));
         }
+    }
+
+    #[test]
+    fn ts_ctl_dynamic_masking_preserves_four_state_deposit_and_force() {
+        let source = r#"
+module entry_m(
+  input logic en,
+  input logic [7:0] bus,
+  input logic [7:0] tag,
+  input logic hot_bit,
+  output wire d_eq,
+  output wire d_bit,
+  output wire d_and,
+  output wire d_or
+);
+  assign d_eq  = en && (bus[3:0] == tag[3:0]);
+  assign d_bit = en && bus[0];
+  assign d_and = en && hot_bit;
+  assign d_or  = en || hot_bit;
+endmodule
+
+module top;
+  logic [15:0] en;
+  logic [7:0]  bus;
+  logic [7:0]  tag;
+  logic        hot_bit;
+  wire [15:0]  d_eq, d_bit, d_and, d_or;
+  logic [7:0]  chk;
+  genvar i;
+  generate
+    for (i = 0; i < 16; i = i + 1) begin : gf
+      wire en_i = en[i];
+      entry_m u (
+        .en(en_i), .bus(bus), .tag(tag), .hot_bit(hot_bit),
+        .d_eq(d_eq[i]), .d_bit(d_bit[i]), .d_and(d_and[i]), .d_or(d_or[i])
+      );
+    end
+  endgenerate
+
+  initial begin
+    chk = 0;
+    en = 16'h0;
+    bus = 8'h00;
+    tag = 8'h5a;
+    hot_bit = 1'b0;
+    #1;
+    // Controlled state: en == 0, bus/hot_bit toggle while masked.
+    bus = 8'h5a;
+    hot_bit = 1'b1;
+    #1;
+    if (d_eq[0] !== 1'b0 || d_bit[0] !== 1'b0 || d_and[0] !== 1'b0 || d_or[0] !== 1'b1) chk = chk + 1;
+    // Unmask en[0]: must immediately observe live bus == 8'h5a and hot_bit == 1.
+    en[0] = 1'b1;
+    #1;
+    if (d_eq[0] !== 1'b1 || d_bit[0] !== 1'b0 || d_and[0] !== 1'b1 || d_or[0] !== 1'b1) chk = chk + 2;
+    // Toggle bus while unmasked.
+    bus = 8'h5b;
+    #1;
+    if (d_eq[0] !== 1'b0 || d_bit[0] !== 1'b1) chk = chk + 4;
+    // Transition en[0] from 0 -> X while masked: must unmask so bus toggle sees X && 0 = 0.
+    en[0] = 1'b0;
+    bus = 8'h5a;
+    #1;
+    en[0] = 1'bx;
+    #1;
+    if (d_eq[0] !== 1'bx) chk = chk + 8;
+    bus = 8'h00;
+    #1;
+    if (d_eq[0] !== 1'b0) chk = chk + 16;
+    // Force and release while controlled.
+    en[0] = 1'b0;
+    bus = 8'h5a;
+    #1;
+    force gf[0].u.d_eq = 1'b1;
+    #1;
+    if (d_eq[0] !== 1'b1) chk = chk + 32;
+    release gf[0].u.d_eq;
+    #1;
+    if (d_eq[0] !== 1'b0) chk = chk + 64;
+    $finish;
+  end
+endmodule
+"#;
+        let sim = crate::simulate(source, 100).expect("simulate ts_ctl");
+        assert!(sim.finished);
+        assert_eq!(sim.error_count, 0);
+        assert_eq!(sim.get_signal("chk").and_then(Value::to_u64), Some(0));
+        assert!(
+            !sim.ts_ctl.is_empty(),
+            "expected TsCtl slots to register on high-fanout bus"
+        );
     }
 }
