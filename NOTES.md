@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Constant integral casts of real operands round to the nearest integer as
+  run-time casts do, so `int'(0.49999999999999994)` folds to 0. Enum casts in
+  constant functions use the enum's base type, and named integral casts
+  convert their operand before the surrounding arithmetic (§6.12.1, §6.19.4,
+  §6.24.1, #1636).
 - Assignment patterns copy unpacked-struct array properties field by field,
   including into multidimensional class properties. Delayed blocking
   assignments sample those fields before the delay (§7.6, §9.4.5, §10.9.1,
