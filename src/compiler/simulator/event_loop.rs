@@ -2864,6 +2864,12 @@ impl Simulator {
                     );
                     self.report_parked_waiters(8);
                 }
+                // The cap stops a run that still has later work: the run
+                // has reached the cap, whatever time its last event ran at,
+                // as `run <t>` does. A run with nothing left keeps its time.
+                if !self.finished && next_time != u64::MAX && self.time < self.max_time {
+                    self.time = self.max_time;
+                }
                 break;
             }
             // #t0-comb-defer: leaving time 0 ends the start batch however
