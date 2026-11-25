@@ -491,12 +491,20 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
 /// separate statement kinds).
 fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
     use std::collections::HashSet;
-    let mut nets: HashSet<String> = HashSet::new();
-    let mut implicit_output_nets = HashSet::new();
+    if !items.iter().any(|it| {
+        matches!(
+            it,
+            ModuleItem::AlwaysConstruct(_) | ModuleItem::InitialConstruct(_)
+        )
+    }) {
+        return;
+    }
+    let mut nets: HashSet<&str> = HashSet::new();
+    let mut implicit_output_nets: HashSet<&str> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
-                nets.insert(d.name.name.clone());
+                nets.insert(d.name.name.as_str());
             }
         }
     }
@@ -518,7 +526,7 @@ fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], e
                     && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
             };
             if net {
-                nets.insert(p.name.name.clone());
+                nets.insert(p.name.name.as_str());
             }
             let implicit_net = net
                 && if omitted { prev_implicit_net } else { p.net_type.is_none() };
@@ -533,7 +541,7 @@ fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], e
         for it in items {
             if let ModuleItem::DataDeclaration(d) = it {
                 for dc in &d.declarators {
-                    nets.remove(&dc.name.name);
+                    nets.remove(dc.name.name.as_str());
                 }
             }
         }
@@ -551,7 +559,7 @@ fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], e
         };
         for_each_proc_assign_lhs(stmt, &mut |lv| {
             if let Some(b) = base_ident(lv) {
-                if nets.contains(&b) && flagged.insert(b.clone()) {
+                if nets.contains(b.as_str()) && flagged.insert(b.clone()) {
                     let mut message = format!(
                         "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
                          §6.5 — nets need a continuous assignment)",
@@ -2922,6 +2930,27 @@ fn check_implicit_ports(
     port_map: &HashMap<String, HashSet<String>>,
     errs: &mut Vec<String>,
 ) {
+    let has_implicit_or_wildcard = items.iter().any(|it| {
+        let ModuleItem::ModuleInstantiation(inst) = it else {
+            return false;
+        };
+        inst.instances.iter().any(|instance| {
+            instance.connections.iter().any(|conn| {
+                matches!(
+                    conn,
+                    xezim_core::ast::decl::PortConnection::Wildcard
+                        | xezim_core::ast::decl::PortConnection::Named {
+                            expr: None,
+                            implicit: true,
+                            ..
+                        }
+                )
+            })
+        })
+    });
+    if !has_implicit_or_wildcard {
+        return;
+    }
     let Some(scope) = collect_scope_names(ports, items) else {
         return;
     };
@@ -5629,7 +5658,11 @@ fn check_cont_assign_rhs_names(
             }
         }
     }
-    if !is_top {
+    if !is_top
+        || !items
+            .iter()
+            .any(|it| matches!(it, ModuleItem::ContinuousAssign(_)))
+    {
         return;
     }
     let mut names = HashSet::new();
