@@ -2,20 +2,20 @@
 
 use super::*;
 
-struct ClassArrayLayout {
-    lo: i64,
-    hi: i64,
-    width: u32,
+pub(super) struct ClassArrayLayout {
+    pub(super) lo: i64,
+    pub(super) hi: i64,
+    pub(super) width: u32,
     signed: bool,
     two_state: bool,
     string: bool,
     real: bool,
-    descending: bool,
+    pub(super) descending: bool,
     data_type: DataType,
 }
 
 impl ClassArrayLayout {
-    fn default_value(&self) -> Value {
+    pub(super) fn default_value(&self) -> Value {
         let mut value = if self.string {
             Value::from_string("")
         } else if self.real {
@@ -327,7 +327,12 @@ impl Simulator {
                 // static-fixed arm in the Index evaluator; this covers the
                 // package-qualified and bare-in-method spellings, from the
                 // same per-element cells.
-                let key = format!("{}::{}", cn, leaf);
+                if let Some((ref sb, ref ss)) = spec
+                    && self.class_is_parameterized(&cn)
+                {
+                    self.ensure_spec_statics(sb, ss);
+                }
+                let key = self.static_fixed_key_in_spec(&cn, &leaf, spec.as_ref())?;
                 let ew = self.module.arrays.get(&key).map(|t| t.2)?;
                 let iv = self.eval_expr(index);
                 return match iv.to_i64().filter(|_| !iv.has_xz()) {
@@ -354,7 +359,7 @@ impl Simulator {
 
     /// §6.20.2 / §8.25: resolve bounds and element types in the declaring
     /// specialization, rather than retaining its elaboration-time defaults.
-    fn class_array_layout(&mut self, class: &str, leaf: &str) -> Option<ClassArrayLayout> {
+    pub(super) fn class_array_layout(&mut self, class: &str, leaf: &str) -> Option<ClassArrayLayout> {
         use crate::ast::types::UnpackedDimension as UD;
         let cd = self.module.classes.get(class)?.clone();
         let (mut lo, mut hi, fallback_width) =
@@ -655,7 +660,7 @@ impl Simulator {
         self.current_spec = saved_spec;
     }
 
-    fn class_array_pattern_values(
+    pub(super) fn class_array_pattern_values(
         &mut self,
         items: &[AssignmentPatternItem],
         layout: &ClassArrayLayout,

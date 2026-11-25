@@ -377,7 +377,9 @@ impl Simulator {
             {
                 let spec = self
                     .resolve_call_spec_params(Self::extract_call_spec(expr), &self.current_spec)?;
-                if let Some(k) = self.static_fixed_key_in(&spec.0, &member.name) {
+                self.ensure_spec_statics(&spec.0, &spec.1);
+                if let Some(k) = self.static_fixed_key_in_spec(&spec.0, &member.name, Some(&spec))
+                {
                     return Some(k);
                 }
                 let saved = self.current_spec.replace(spec.clone());
