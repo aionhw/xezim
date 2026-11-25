@@ -78,6 +78,47 @@ endmodule
     );
 }
 
+/// §7.8 and §23.11: selecting a bound sibling's associative array element
+/// in a port connection reads the current element, including after writes.
+#[test]
+fn bound_port_follows_a_siblings_associative_array_element() {
+    check(
+        r#"
+module monitor;
+  logic values[int];
+  initial begin
+    #1 values[0] = 1'b1;
+    #2 values[0] = 1'b0;
+  end
+endmodule
+module sink(input logic selected);
+  initial begin
+    #2 $display("T|bound first %b", selected);
+    #2 $display("T|bound second %b", selected);
+  end
+endmodule
+module host; endmodule
+bind top.h monitor u_mon();
+bind top.h sink u_sink(.selected(u_mon.values[0]));
+module top;
+  host h();
+  wire selected = h.u_mon.values[0];
+  initial begin
+    #2 $strobe("T|assign first %b", selected);
+    #2 $strobe("T|assign second %b", selected);
+    #1 $finish;
+  end
+endmodule
+"#,
+        &[
+            "T|bound first 1",
+            "T|assign first 1",
+            "T|bound second 0",
+            "T|assign second 0",
+        ],
+    );
+}
+
 #[test]
 fn bind_defparam() {
     check(
