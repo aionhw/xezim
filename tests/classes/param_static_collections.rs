@@ -72,3 +72,30 @@ endmodule
     assert!(lines.contains(&"mut=2,888,1,777,104,90,6,4"), "{lines:?}");
     assert!(lines.contains(&"rnd=1,1,1,1"), "{lines:?}");
 }
+
+/// §8.25 and §10.10: fixed static arrays take unpacked concatenations in
+/// declared order, with each specialization's actual parameter values.
+#[test]
+fn static_fixed_array_concatenation_uses_specialized_bounds_and_values() {
+    let sim = simulate(
+        r#"
+module top;
+  class P #(int N = 4);
+    static int values[N:N-1] = {N, N+1};
+  endclass
+  class Plain;
+    static int values[3:2] = {7, 8};
+  endclass
+  initial begin
+    $display("specialized %0d %0d", P#(8)::values[8], P#(8)::values[7]);
+    $display("default %0d %0d", P#(4)::values[4], P#(4)::values[3]);
+    $display("plain %0d %0d", Plain::values[3], Plain::values[2]);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert_eq!(lines, ["specialized 8 9", "default 4 5", "plain 7 8"]);
+}

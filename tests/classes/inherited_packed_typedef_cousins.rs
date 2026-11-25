@@ -149,3 +149,40 @@ endmodule
         "{lines:?}"
     );
 }
+
+/// §6.18 and §8.25: the typedef uses the parameters of the specialization
+/// that declared it, including an expression in the extends clause.
+#[test]
+fn inherited_packed_typedef_uses_the_declaring_specialization() {
+    let sim = simulate(
+        r#"
+module top;
+  class Base #(int W = 4);
+    typedef struct packed { bit [W-1:0] payload; bit flag; } word;
+  endclass
+  class Child #(int N = 3) extends Base#(N+2);
+    word member;
+    function int check(output word out);
+      word local_value = '1;
+      out = local_value;
+      return $bits(member) * 1000 + $bits(local_value) * 10 + $bits(out);
+    endfunction
+  endclass
+  typedef Child#(8) C;
+  initial begin
+    C c = new;
+    Base#(10)::word o;
+    Child#(8)::word s;
+    int sizes;
+    sizes = c.check(o);
+    s = '1;
+    $display("sizes=%0d out=%0h scope=%0d %0h", sizes, o, $bits(s), s.payload);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert_eq!(lines, ["sizes=11121 out=7ff scope=11 3ff"]);
+}
