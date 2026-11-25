@@ -639,3 +639,6 @@ mod time0_always_event_prearm_1545;
 
 #[path = "scheduling/delayed_nested_collections.rs"]
 mod delayed_nested_collections;
+
+#[path = "scheduling/unpacked_slice_nba_1644.rs"]
+mod unpacked_slice_nba_1644;

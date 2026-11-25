@@ -174,3 +174,43 @@ fn c20_utility_system_functions() {
         ],
     );
 }
+
+#[test]
+fn itor_preserves_width_and_rounds_real_arguments_1641() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  localparam real folded_wide = $itor(80'h1_0000_0000_0000_0000);
+  localparam real folded_real = $itor(5.75);
+  localparam real folded_signed = $itor(-80'sd18446744073709551616);
+  bit [63:0] u = 64'hffff_ffff_ffff_ffff;
+  bit [79:0] w = 80'h2_0000_0000_0000_0000;
+  logic signed [79:0] s = -80'sd18446744073709551616;
+  real fraction = -2.5;
+  real near_zero = -0.4;
+  initial begin
+    #1;
+    $display("itor=%b%b%b%b%b%b%b%b",
+        folded_wide == 18446744073709551616.0,
+        folded_real == 6.0,
+        folded_signed == -18446744073709551616.0,
+        $itor(u) == 18446744073709551616.0,
+        $itor(w) == 36893488147419103232.0,
+        $itor(s) == -18446744073709551616.0,
+        $itor(fraction) == -3.0,
+        $realtobits($itor(near_zero)) === 64'd0);
+    $finish;
+  end
+endmodule
+"#,
+        1_000_000,
+    )
+    .expect("simulation");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message.trim() == "itor=11111111"),
+        "{:?}",
+        sim.output
+    );
+}

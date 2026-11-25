@@ -125,7 +125,7 @@ module top;
 endmodule
 "#;
 
-fn run(compile: &str) -> String {
+fn run_design(design: &str, compile: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
         "xezim_foreach_handle_member_{}_{}",
@@ -135,7 +135,7 @@ fn run(compile: &str) -> String {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join("design.sv");
-    std::fs::write(&path, DESIGN).expect("write design");
+    std::fs::write(&path, design).expect("write design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
             "--simulate",
@@ -160,7 +160,7 @@ fn run(compile: &str) -> String {
 #[test]
 fn foreach_over_another_class_collection_compiles() {
     for compile in ["0", "1"] {
-        let log = run(compile);
+        let log = run_design(DESIGN, compile);
         let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("T|")).collect();
         assert_eq!(
             lines,
@@ -180,11 +180,51 @@ fn foreach_over_another_class_collection_compiles() {
             "XEZIM_COMPILE_METHODS={compile}"
         );
     }
-    let log = run("1");
+    let log = run_design(DESIGN, "1");
     for m in ["item.walk", "item.sum"] {
         assert!(
             log.contains(&format!("runs-compiled scope={m}")),
             "{m} did not run compiled:\n{log}"
         );
+    }
+}
+
+#[test]
+fn foreach_over_another_class_queue_compares_full_element_1640() {
+    const SRC: &str = r#"
+class holder;
+  int q[$];
+endclass
+
+class counter;
+  localparam int match_value = 16'h4000;
+  function int count(holder h);
+    int equal = 0, unequal = 0;
+    foreach (h.q[i]) begin
+      if (h.q[i] == match_value) equal++;
+      if (h.q[i] != match_value) unequal++;
+    end
+    return equal * 10 + unequal;
+  endfunction
+endclass
+
+module top;
+  initial begin
+    counter c = new;
+    holder h = new;
+    h.q.push_back(16'h4000);
+    h.q.push_back(16'h0000);
+    h.q.push_back(16'hc000);
+    h.q.push_back(16'h4000);
+    $display("T|counts=%0d", c.count(h));
+  end
+endmodule
+"#;
+    for compile in ["0", "1"] {
+        let log = run_design(SRC, compile);
+        assert!(log.lines().any(|line| line == "T|counts=22"), "{log}");
+        if compile == "1" {
+            assert!(log.contains("runs-compiled scope=counter.count"), "{log}");
+        }
     }
 }

@@ -931,3 +931,6 @@ mod unrolled_two_state_packed_member_store;
 
 #[path = "types/thomas_data_types_1638.rs"]
 mod thomas_data_types_1638;
+
+#[path = "types/packed_struct_input_actual_1645.rs"]
+mod packed_struct_input_actual_1645;
