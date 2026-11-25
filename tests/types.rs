@@ -928,3 +928,6 @@ mod packed_member_xz_index_1561;
 mod packed_struct_member_array_part_select_1564;
 #[path = "types/unrolled_two_state_packed_member_store.rs"]
 mod unrolled_two_state_packed_member_store;
+
+#[path = "types/thomas_data_types_1638.rs"]
+mod thomas_data_types_1638;

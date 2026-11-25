@@ -54,8 +54,10 @@ fn run(dir: &Path, lib: &Path, sv: &str) -> String {
 }
 
 const SV: &str = r#"
+`default_nettype none
 `timescale 1us/1ns
 module sub; endmodule
+`default_nettype tri0
 `timescale 1ns/1ps
 module top;
   logic [11:0] sig;
@@ -86,6 +88,10 @@ void probe(void) {
     vpi_printf("CMP|same=%d diff=%d\n", vpi_compare_objects(a, b), vpi_compare_objects(a, c));
     vpi_printf("G64|size=%lld\n", (long long)vpi_get64(vpiSize, a));
     vpiHandle sub = vpi_handle_by_name("top.u_sub", NULL);
+    vpiHandle top = vpi_handle_by_name("top", NULL);
+    vpi_printf("NET|top=%d sub=%d\n",
+        vpi_get(vpiDefNetType, top) == vpiTri0,
+        vpi_get(vpiDefNetType, sub) == vpiNone);
     vpi_printf("TIME|sim unit=%d prec=%d\n", vpi_get(vpiTimeUnit, NULL), vpi_get(vpiTimePrecision, NULL));
     vpi_printf("TIME|sub unit=%d prec=%d\n", vpi_get(vpiTimeUnit, sub), vpi_get(vpiTimePrecision, sub));
     int32_t u = 0, p = 0;
@@ -124,6 +130,7 @@ fn mcd_output_compare_get64_and_time_queries() {
         "MCD|vpi_flush=0",
         "CMP|same=1 diff=0",
         "G64|size=12",
+        "NET|top=1 sub=1",
         "TIME|sim unit=-12 prec=-12",
         "TIME|sub unit=-6 prec=-9",
         "SV|sub unit=-6 prec=-9",

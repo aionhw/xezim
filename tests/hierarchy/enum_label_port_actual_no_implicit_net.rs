@@ -109,7 +109,7 @@ package pk;
   typedef enum logic [2:0] { SYS_CSR, SYS_ERET } sys_op_e;
 endpackage
 typedef enum logic [1:0] { U_A, U_B } u_e;
-module probe (input i);
+module probe (input wire i);
 endmodule
 `define CHECK(LBL, OTHER) \
   logic [2:0] op = 3'd0; \

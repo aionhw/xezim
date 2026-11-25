@@ -65,3 +65,27 @@ endmodule
     .expect("legal nettype use rejected");
     assert!(out.iter().any(|l| l == "R 1.0 1.0 2"), "{out:?}");
 }
+
+/// §10.3: an unpacked index selects an entire net, so both drivers resolve.
+#[test]
+fn whole_unpacked_nettype_element_accepts_continuous_drivers() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  function automatic real sum(input real drivers[]);
+    real result = 0.0;
+    foreach (drivers[i]) result += drivers[i];
+    return result;
+  endfunction
+  nettype real resolved with sum;
+  resolved a[2];
+  assign a[0] = 1.5;
+  assign a[0] = 2.5;
+  initial #1 $display("resolved %0.1f", a[0]);
+endmodule
+"#,
+        100,
+    )
+    .expect("whole net array element");
+    assert_eq!(sim.output[0].message, "resolved 4.0");
+}

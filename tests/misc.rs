@@ -694,5 +694,6 @@ mod deferred_assertion_counts;
 
 #[path = "misc/stringify_macro_chain.rs"]
 mod stringify_macro_chain;
-#[path = "misc/continuous_assign_time_scope.rs"]
-mod continuous_assign_time_scope;
+
+#[path = "misc/default_nettype_1635.rs"]
+mod default_nettype_1635;
