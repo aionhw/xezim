@@ -247,13 +247,13 @@ endmodule
 fn edge_block_tracks_variable_delay_clock_after_period_change() {
     const SRC: &str = r#"
 `timescale 1ps/1ps
-module capture(output logic q, input logic clk, input logic we);
+module capture(output logic q = 0, input logic clk, input logic we);
   always_ff @(posedge clk) if (we) q <= 1'b1;
 endmodule
 module top;
   logic clk = 0;
   logic we = 0;
-  logic q = 0;
+  logic q;
   real half;
   capture dut(q, clk, we);
 

@@ -57,7 +57,7 @@ endmodule
 
 module top;
   logic clk = 0;
-  logic o = 0, o2 = 0;
+  logic o, o2;
   string where = "";
   sub s (.clk(clk), .o(o));
   sub t (.clk(clk), .o(o2));
