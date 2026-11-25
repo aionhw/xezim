@@ -5203,7 +5203,7 @@ impl Simulator {
         let aggregate =
             |dt: &DataType| matches!(dt, DataType::TypeReference { .. } | DataType::Struct(_));
         let may = match self.fn_ret_frames.last()? {
-            ReturnPatternType::NotPacked => false,
+            ReturnPatternType::NotPacked | ReturnPatternType::Event => false,
             ReturnPatternType::Func(dt) => aggregate(dt),
             ReturnPatternType::Method(m) => match &m.kind {
                 crate::ast::decl::ClassMethodKind::Function(f) => aggregate(&f.return_type),

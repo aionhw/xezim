@@ -804,13 +804,8 @@ impl Simulator {
             // `->e` / `@(e)` resolve through module.events. Arrays
             // and queues of events register their BASE name so
             // element refs (`ev_arr[i]`) are recognized as events.
-            if matches!(
-                data_type,
-                crate::ast::types::DataType::Simple {
-                    kind: crate::ast::types::SimpleType::Event,
-                    ..
-                }
-            ) {
+            let is_event_decl = self.is_event_data_type(data_type);
+            if is_event_decl && (!is_scalar_decl || self.local_stack.is_empty() || static_block) {
                 self.module.events.insert(d.name.name.clone());
             }
             // Declared ELEMENT type of a local. `var_decl_types` holds
@@ -1791,8 +1786,42 @@ impl Simulator {
                 } else {
                     None
                 };
+                let in_frame = !self.local_stack.is_empty() && !static_block;
+                let is_event_scalar = is_scalar_decl && is_event_decl;
                 let v = if let Some(saved) = saved_static {
                     saved
+                } else if is_event_scalar && in_frame {
+                    let canon = match &d.init {
+                        Some(init_expr) => self
+                            .event_handle_capture_key(init_expr)
+                            .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string()),
+                        None => self.fresh_unbacked_event_key(&d.name.name),
+                    };
+                    self.note_event_handle_live();
+                    Self::encode_event_handle_value(&canon)
+                } else if is_event_scalar {
+                    match &d.init {
+                        Some(init_expr) => {
+                            let target = self
+                                .event_handle_capture_key(init_expr)
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                            note_event_trigger();
+                            if target == d.name.name {
+                                self.event_aliases.remove(&d.name.name);
+                            } else {
+                                self.event_aliases.insert(d.name.name.clone(), target);
+                            }
+                        }
+                        None => {
+                            if matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)) {
+                                let fresh = self.fresh_unbacked_event_key(&d.name.name);
+                                self.event_aliases.insert(d.name.name.clone(), fresh);
+                            } else {
+                                self.event_aliases.remove(&d.name.name);
+                            }
+                        }
+                    }
+                    Value::new(1)
                 } else if let Some(init_expr) = d
                     .init
                     .as_ref()

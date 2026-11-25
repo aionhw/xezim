@@ -73,6 +73,12 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("VarDecl_offset_range");
             return false;
         }
+        if let StatementKind::VarDecl { data_type, .. } = &stmt.kind
+            && self.is_event_dt(data_type)
+        {
+            self.bail("VarDecl_event");
+            return false;
+        }
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
@@ -642,6 +648,10 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nba_unpacked_collection");
                     return self.emit_fallback(stmt);
                 }
+                if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
@@ -725,6 +735,10 @@ impl<'a> BytecodeCompiler<'a> {
                     self.next_reg = start_reg;
                     // Fall through to the AST fallback below.
                     self.bail("coll_elem_store");
+                    return self.emit_fallback(stmt);
+                }
+                if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
                     return self.emit_fallback(stmt);
                 }
                 let width = self.infer_lhs_width(lvalue);
@@ -1501,7 +1515,11 @@ impl<'a> BytecodeCompiler<'a> {
                 for fi in init {
                     match fi {
                         ForInit::Assign { lvalue, rvalue } => {
-                            let width = self.infer_lhs_width(lvalue);
+                            if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
+                    return self.emit_fallback(stmt);
+                }
+                let width = self.infer_lhs_width(lvalue);
                             let val_reg = match self.compile_expr(rvalue, width) {
                                 Some(r) => r,
                                 None => {

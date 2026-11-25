@@ -465,6 +465,7 @@ impl Simulator {
                 return v;
             }
         }
+        let whole = expr;
         match &expr.kind {
             ExprKind::Number(num) => {
                 let v = self.eval_number(num);
@@ -725,6 +726,43 @@ impl Simulator {
                         }
                     }
                 }
+                // LRM §15.5.3: `e.triggered` on a named/class event.
+                // Match BEFORE class-property / hierarchical signal lookup
+                // when the prefix is a known event so object event properties
+                // don't short-circuit to raw X, while ordinary properties named
+                // `triggered` still fall through.
+                if hier.path.len() >= 2
+                    && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
+                {
+                    let head = hier_prefix(hier);
+                    let head_expr = Expression::new(ExprKind::Ident(head), expr.span);
+                    if let Some(fired) = self.event_triggered_now(&head_expr) {
+                        return if fired {
+                            Value::ones(1)
+                        } else {
+                            Value::zero(1)
+                        };
+                    }
+                }
+                // §15.5.5.3: non-scalar / class-member event handle in boolean
+                // context (`e.ev`, `u.sub_e`, `arr[i]`) must precede generic
+                // property / hierarchical signal reads.
+                if self.any_events_possible()
+                    && (hier.path.len() > 1 || !hier.path[0].selects.is_empty())
+                {
+                    let leaf = hier.path.last().unwrap().name.name.as_str();
+                    if self.class_event_names().contains(leaf)
+                        || self.module.events.contains(leaf)
+                        || self
+                            .module
+                            .events
+                            .contains(self.resolve_hier_name(hier).as_ref())
+                    {
+                        if let Some(v) = self.event_bool_value(expr) {
+                            return v;
+                        }
+                    }
+                }
                 // §8.9: a static property through a handle, null or not,
                 // names the shared cell of the handle's declared class.
                 if hier.path.len() == 2
@@ -911,21 +949,6 @@ impl Simulator {
                         return v;
                     }
                 }
-                // LRM §15.5.3: `e.triggered` on a named event.
-                // `e.triggered` parses as Ident(path=[e, triggered]); match
-                // here BEFORE generic signal lookup so we don't get back X.
-                if hier.path.len() >= 2
-                    && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
-                {
-                    let head = hier_prefix(hier);
-                    let head_expr = Expression::new(ExprKind::Ident(head), expr.span);
-                    let fired = self.event_triggered_now(&head_expr).unwrap_or(false);
-                    return if fired {
-                        Value::ones(1)
-                    } else {
-                        Value::zero(1)
-                    };
-                }
                 // §6.19.6: enum methods written WITHOUT parentheses parse as a
                 // hierarchical Ident, e.g. `color1.num` -> path=[color1, num].
                 // Route to the enum-method evaluator when the prefix is an
@@ -1000,6 +1023,25 @@ impl Simulator {
                         .cloned()
                     {
                         if let Some(v) = self.ref_alias_read(&storage) {
+                            return v;
+                        }
+                    }
+                    // §15.5.5.3: an event handle in a Boolean/value context
+                    // evaluates to 1'b1 if non-null and 1'b0 if null.
+                    if self.any_events_possible()
+                        && (self.local_event_handle(name).is_some()
+                            || self.module.events.contains(name.as_str())
+                            || self.event_aliases.contains_key(name.as_str())
+                            || (!self.ref_binding_stack.is_empty()
+                                && self
+                                    .ref_binding_stack
+                                    .iter()
+                                    .rev()
+                                    .any(|m| m.contains_key(name.as_str())))
+                            || (self.this_stack.last().copied().flatten().is_some()
+                                && self.class_event_names().contains(name.as_str())))
+                    {
+                        if let Some(v) = self.event_bool_value(expr) {
                             return v;
                         }
                     }
@@ -2291,18 +2333,24 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                // §15.5.4: comparing event variables compares their IDENTITY
-                // (which synchronization object they name), not a value. An
-                // event's 1-bit backing signal holds an arbitrary toggle state,
-                // so the integral path returned x — `e1 == e2` after `e1 = e2`
-                // read x instead of 1. Null compares equal only to null.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let lk = self.event_operand_key(left);
-                    let rk = self.event_operand_key(right);
-                    if let (Some(lk), Some(rk)) = (lk, rk) {
-                        let eq = lk == rk;
-                        let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
-                        return Value::from_u64(res as u64, 1);
+                // §15.5.4 / §15.5.5.3: comparing event variables compares their
+                // IDENTITY (`==`, `!=`, `===`, `!==`), not a toggle value,
+                // and null compares equal only to null. Guard on shape + live
+                // event presence so non-event compares pay zero overhead.
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) && Self::expr_could_be_event(left)
+                    && Self::expr_could_be_event(right)
+                    && self.any_events_possible()
+                {
+                    if let Some(lk) = self.event_operand_key(left) {
+                        if let Some(rk) = self.event_operand_key(right) {
+                            let eq = lk == rk;
+                            let is_eq = matches!(op, BinaryOp::Eq | BinaryOp::CaseEq);
+                            let res = if is_eq { eq } else { !eq };
+                            return Value::from_u64(res as u64, 1);
+                        }
                     }
                 }
                 // §11.4.8 gated-call elision, RIGHT-hand mask. Handled BEFORE
@@ -2920,6 +2968,21 @@ impl Simulator {
                     return self.eval_expr_ctx(&selected, ctx_width);
                 }
 
+                if self.any_events_possible() && !matches!(&expr.kind, ExprKind::Call { .. }) {
+                    let leaf = match &expr.kind {
+                        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                        ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                        _ => None,
+                    };
+                    if let Some(l) = leaf
+                        && (self.module.events.contains(l)
+                            || self.class_event_names().contains(l))
+                    {
+                        if let Some(v) = self.event_bool_value(whole) {
+                            return v;
+                        }
+                    }
+                }
                 // §14.3: `cb.sig[i]` on an unpacked-array clockvar reads the
                 // element's sample (see `tick_clocking_blocks`).
                 if let Some(v) = self.clocking_array_elem_read(expr, index) {
@@ -4523,6 +4586,15 @@ impl Simulator {
                     });
                     if self.expr_is_string_valued(recv) || recv_name.is_some() {
                         return self.eval_call(expr, &[]);
+                    }
+                }
+                if member.name != "triggered"
+                    && self.any_events_possible()
+                    && (self.class_event_names().contains(member.name.as_str())
+                        || !self.module.events.is_empty())
+                {
+                    if let Some(v) = self.event_bool_value(expr) {
+                        return v;
                     }
                 }
 

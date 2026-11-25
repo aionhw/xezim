@@ -3335,7 +3335,11 @@ impl Simulator {
     pub(super) fn apply_default_outs(&mut self, wb: Vec<(Expression, Value)>, cname: &str) {
         self.class_context_stack.push(Some(cname.to_string()));
         for (dflt, v) in wb {
-            self.assign_value(&dflt, &v);
+            if let Some(canon) = Self::decode_event_handle_value(&v) {
+                self.assign_event_handle_canon(&dflt, &canon);
+            } else {
+                self.assign_value(&dflt, &v);
+            }
         }
         self.class_context_stack.pop();
     }

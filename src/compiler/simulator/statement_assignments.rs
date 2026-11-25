@@ -1087,6 +1087,13 @@ impl Simulator {
             if cd.static_properties.contains(*seg) {
                 return None;
             }
+            if cd
+                .property_types
+                .get(*seg)
+                .is_some_and(|dt| self.class_dt_is_event(&cd.name, dt))
+            {
+                return None;
+            }
             let inst = self.heap.get(h)?.as_ref()?;
             if self.prop_owners(&inst.class_name).get(*seg)?.0 != *owner {
                 return None;
@@ -1968,7 +1975,14 @@ impl Simulator {
             }
         }
         // §15.5.5: a class-member event takes the other event's object.
-        self.bind_instance_event_assign(lvalue, rvalue);
+        if self.bind_instance_event_assign(lvalue, rvalue) {
+            return;
+        }
+        // §15.5.5: handle assignment on frame-local / formal / ref / module
+        // event variables before `simple_blocking_assign`.
+        if self.any_events_possible() && self.try_event_handle_assign(lvalue, rvalue) {
+            return;
+        }
         // §13.4.1, §7.2: `f = t;` in the function `f`, with `t` a whole
         // unpacked struct, spreads `t` over the return variable's leaves.
         // The plain copy below stored it as one value nobody reads.

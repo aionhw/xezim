@@ -447,6 +447,32 @@ impl Simulator {
                     }
                 }
             }
+            if port.dimensions.is_empty() && self.is_event_data_type(&port.data_type) {
+                let canon = if port.direction == PortDirection::Output {
+                    self.fresh_unbacked_event_key(&port.name.name)
+                } else if arg_supplied(i) {
+                    self.event_handle_capture_key(&args[i])
+                        .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string())
+                } else if let Some(def) = &port.default {
+                    self.in_subroutine_default_scope(None, None, |sim| {
+                        sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                        sim.push_pending_formal_dyn(&formal_dyn);
+                        let canon = sim
+                            .event_handle_capture_key(def)
+                            .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                        sim.pop_pending_formal_dyn();
+                        sim.pop_local_frame();
+                        canon
+                    })
+                } else {
+                    self.fresh_unbacked_event_key(&port.name.name)
+                };
+                self.note_event_handle_live();
+                let val = Self::encode_event_handle_value(&canon);
+                self.register_formal_type_metadata(&port.name.name, &port.data_type, true);
+                locals.insert(port.name.name.clone(), val);
+                continue;
+            }
             let mut val = if port.direction == PortDirection::Output {
                 let default = if self.port_class_ref(port).is_some()
                     || self.is_virtual_iface_type(&port.data_type)
@@ -642,7 +668,11 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if self.dt_is_real(&fd.return_type) {
+        let mut ret_init = if self.is_event_data_type(&fd.return_type) {
+            self.note_event_handle_live();
+            let k = self.fresh_unbacked_event_key(&ret_name);
+            Self::encode_event_handle_value(&k)
+        } else if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -1016,6 +1046,7 @@ impl Simulator {
         if !result.is_real
             && !unpacked_struct_ret
             && !Self::is_string_data_type(&fd.return_type)
+            && !self.is_event_data_type(&fd.return_type)
             && !matches!(
                 fd.return_type,
                 crate::ast::types::DataType::Void { .. } | crate::ast::types::DataType::Real { .. }
@@ -1090,6 +1121,10 @@ impl Simulator {
         // caller's actual — instance prop or another plain name — whatever
         // the actual held on entry.
         for (pn, v, caller) in writebacks {
+            if let Some(canon) = Self::decode_event_handle_value(&v) {
+                self.assign_event_handle_canon(&caller, &canon);
+                continue;
+            }
             self.vif_writeback(
                 &caller,
                 &v,
@@ -1314,7 +1349,11 @@ impl Simulator {
         let locals = self.pop_local_frame_take().unwrap_or_default();
         for (port_name, caller_expr) in &c.output_bindings {
             if let Some(val) = locals.get(port_name) {
-                self.assign_value(caller_expr, val);
+                if let Some(canon) = Self::decode_event_handle_value(val) {
+                    self.assign_event_handle_canon(caller_expr, &canon);
+                } else {
+                    self.assign_value(caller_expr, val);
+                }
             }
         }
         for (actual, bound) in vif_outputs {
@@ -2724,7 +2763,11 @@ impl Simulator {
             .collect();
         for (actual, value, binding) in default_outputs {
             if let Some(value) = value {
-                self.assign_value(&actual, &value);
+                if let Some(canon) = Self::decode_event_handle_value(&value) {
+                    self.assign_event_handle_canon(&actual, &canon);
+                } else {
+                    self.assign_value(&actual, &value);
+                }
             }
             if let Some(binding) = binding {
                 if binding.is_empty() {
@@ -3069,6 +3112,46 @@ impl Simulator {
             }
             match port.direction {
                 PortDirection::Output | PortDirection::Inout => {
+                    if port.dimensions.is_empty() && self.is_event_data_type(&port.data_type) {
+                        let canon = if port.direction == PortDirection::Output {
+                            self.fresh_unbacked_event_key(&port.name.name)
+                        } else if arg_supplied(i) {
+                            self.event_handle_capture_key(&args[i])
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string())
+                        } else if let Some(default) = &port.default {
+                            self.in_subroutine_default_scope(
+                                default_receiver.as_ref(),
+                                default_spec.clone(),
+                                |sim| {
+                                    sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    sim.push_pending_formal_dyn(&formal_dyn);
+                                    let canon = sim
+                                        .event_handle_capture_key(default)
+                                        .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                                    sim.pop_pending_formal_dyn();
+                                    sim.pop_local_frame();
+                                    canon
+                                },
+                            )
+                        } else {
+                            self.fresh_unbacked_event_key(&port.name.name)
+                        };
+                        self.note_event_handle_live();
+                        locals.insert(
+                            port.name.name.clone(),
+                            Self::encode_event_handle_value(&canon),
+                        );
+                        if let Some(a) =
+                            actual.filter(|a| arg_supplied(i) || Self::is_lvalue_expr(a))
+                        {
+                            if arg_supplied(i) {
+                                output_bindings.push((port.name.name.clone(), a.clone()));
+                            } else {
+                                default_output_bindings.push((port.name.name.clone(), a.clone()));
+                            }
+                        }
+                        continue;
+                    }
                     // §13.5.3 (1800-2023): an omitted argument with a default
                     // binds the default as its actual, so `output o = a`
                     // copies `o` back to `a` on return.
@@ -3175,13 +3258,7 @@ impl Simulator {
                     // the stale value captured at call time, cancelling the
                     // edge before the main loop delivered it: the trigger
                     // "happened" and the caller's `@e` waiter still hung.
-                    if matches!(
-                        &port.data_type,
-                        crate::ast::types::DataType::Simple {
-                            kind: crate::ast::types::SimpleType::Event,
-                            ..
-                        }
-                    ) {
+                    if port.dimensions.is_empty() && self.is_event_data_type(&port.data_type) {
                         continue;
                     }
                     static REF_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3218,6 +3295,35 @@ impl Simulator {
                     }
                 }
                 _ => {
+                    if port.dimensions.is_empty() && self.is_event_data_type(&port.data_type) {
+                        let canon = if arg_supplied(i) {
+                            self.event_handle_capture_key(&args[i])
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string())
+                        } else if let Some(def) = &port.default {
+                            self.in_subroutine_default_scope(
+                                default_receiver.as_ref(),
+                                default_spec.clone(),
+                                |sim| {
+                                    sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    sim.push_pending_formal_dyn(&formal_dyn);
+                                    let canon = sim
+                                        .event_handle_capture_key(def)
+                                        .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                                    sim.pop_pending_formal_dyn();
+                                    sim.pop_local_frame();
+                                    canon
+                                },
+                            )
+                        } else {
+                            self.fresh_unbacked_event_key(&port.name.name)
+                        };
+                        self.note_event_handle_live();
+                        locals.insert(
+                            port.name.name.clone(),
+                            Self::encode_event_handle_value(&canon),
+                        );
+                        continue;
+                    }
                     let is_vif =
                         vif_formal_indices.contains(&i) && !self.vif_collection_formal(port);
                     let mut val = if arg_supplied(i) {

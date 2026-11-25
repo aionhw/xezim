@@ -545,6 +545,12 @@ impl Simulator {
                     continue;
                 }
             }
+            if self.class_prop_declared_event(handle, &slot) {
+                let lv = Self::hier_ident_expr(Self::iface_path_segs(&slot, init.span), init.span);
+                if self.bind_instance_event_assign(&lv, init) {
+                    continue;
+                }
+            }
             let real = cdef.properties.get(&pname).is_some_and(|sig| sig.is_real);
             // §10.8: a pattern takes the property's declared type.
             let decl_ty = if has_pattern(&init) {

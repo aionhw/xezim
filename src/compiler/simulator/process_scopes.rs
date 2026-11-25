@@ -3310,7 +3310,9 @@ impl Simulator {
                         let cached = self.forever_sens_cache.get(&key).cloned();
                         let (resolved, is_clk_ev) = match cached {
                             Some(c) => c,
-                            None if self.event_needs_indexed_class_waiter(event) => {
+                            None if self.event_needs_indexed_class_waiter(event)
+                                || self.event_control_event_key(event).is_some() =>
+                            {
                                 (Vec::new(), false)
                             }
                             None => {
@@ -4859,7 +4861,11 @@ impl Simulator {
         if !self.pending_nba_triggers.is_empty() {
             let evs = std::mem::take(&mut self.pending_nba_triggers);
             for ev in evs {
-                self.fire_named_event(&ev);
+                if let Some(canon) = ev.strip_prefix('\x05') {
+                    self.fire_canon_event(canon);
+                } else {
+                    self.fire_named_event(&ev);
+                }
             }
         }
         if !self.pending_nba_instance_triggers.is_empty() {

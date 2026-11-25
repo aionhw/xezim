@@ -1626,23 +1626,22 @@ impl Simulator {
                         if let Some(e) = elem_expr
                             && let Some(key) = self.expr_instance_event_elem(e)
                         {
-                            let cont = pc.pushed_body(body, pc.start + i + 1);
-                            self.instance_event_waiters.push(InstanceEventWaiter {
-                                key: InstanceEventKeys::One(key),
-                                pid,
-                                continuation: cont,
-                            });
+                            self.park_instance_event_key_wait(pid, key, pc, body, pc.start + i + 1);
                             return;
                         }
-                        if let Some(fname) = self.event_control_field_name(event) {
+                        if let Some(fname) = self.event_control_field_name(event)
+                            && self.local_event_handle(&fname).is_none()
+                            && (self.ref_binding_stack.is_empty()
+                                || self.ref_bound_event_key(&fname).is_none())
+                        {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
-                                // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
-                                let cont = pc.pushed_body(body, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_key_wait(
                                     pid,
-                                    continuation: cont,
-                                });
+                                    key,
+                                    pc,
+                                    body,
+                                    pc.start + i + 1,
+                                );
                                 return;
                             }
                         }
@@ -1663,13 +1662,13 @@ impl Simulator {
                                     self.park_condition_waiter(pid, cont, &cond);
                                     return;
                                 }
-                                // Chain the caller's tail rather than copying it.
-                                let cont = pc.pushed_body(body, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_key_wait(
                                     pid,
-                                    continuation: cont,
-                                });
+                                    key,
+                                    pc,
+                                    body,
+                                    pc.start + i + 1,
+                                );
                                 return;
                             }
                         }
@@ -1720,12 +1719,7 @@ impl Simulator {
                             }
                         };
                         if let Some(key) = static_ev {
-                            let cont = pc.pushed_body(body, pc.start + i + 1);
-                            self.instance_event_waiters.push(InstanceEventWaiter {
-                                key: InstanceEventKeys::One(key),
-                                pid,
-                                continuation: cont,
-                            });
+                            self.park_instance_event_key_wait(pid, key, pc, body, pc.start + i + 1);
                             return;
                         }
                         // `@prop` / `@(h.prop)` on a NON-event class property:
@@ -1765,38 +1759,8 @@ impl Simulator {
                         // saw `-> e2` — only the TRIGGER side canonicalized
                         // (§15.5.4). Resolving here fixes both, and keeps the
                         // delta-yield fallback for genuine non-event locals.
-                        if let Some(key) = self.event_control_event_key(event) {
-                            let canon = self.resolve_event_key(&key);
-                            if self.signal_name_to_id.contains_key(canon.as_str()) {
-                                // Chain the caller's tail rather than copying it.
-                                let cont = pc.pushed_body(body, pc.start + i + 1);
-                                let sens = vec![Sensitivity {
-                                    signal_name: canon,
-                                    edge: EdgeKind::AnyEdge,
-                                    iff: None,
-                                    value_of: None,
-                                }];
-                                {
-                                    let w = self.make_event_waiter_kind(pid, sens, cont, false);
-                                    self.park_event_waiter(w);
-                                }
-                                return;
-                            }
-                            // §15.5: an event with no signal — a subroutine's
-                            // local `event e;` — waits for `fire_named_event`
-                            // by name. The signal fallback below resumed it
-                            // after the slot's NBA region, i.e. at once. So
-                            // does a labeled block's local stored under its
-                            // hierarchical name (`a.e`, §6.21).
-                            if (!canon.contains('.') || self.module.events.contains(canon.as_str()))
-                                && canon != Self::EVENT_NULL_KEY
-                            {
-                                let cont = pc.pushed_body(body, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(self.unbacked_event_key(&canon)),
-                                    pid,
-                                    continuation: cont,
-                                });
+                        if let Some(canon) = self.event_control_event_key(event) {
+                            if self.park_canon_event_wait(pid, canon, pc, body, pc.start + i + 1) {
                                 return;
                             }
                         }
@@ -2951,5 +2915,100 @@ impl Simulator {
                 self.run_process_stmts(pid, &frame);
             }
         }
+    }
+
+    fn park_canon_event_wait(
+        &mut self,
+        pid: usize,
+        canon: String,
+        pc: &ProcCont,
+        body: &Statement,
+        next: usize,
+    ) -> bool {
+        if let Some(id) = Self::parse_instance_event_obj_id(&canon) {
+            if id != Self::EVENT_OBJ_NULL_ID {
+                let cont = pc.pushed_body(body, next);
+                self.instance_event_waiters.push(InstanceEventWaiter {
+                    key: InstanceEventKeys::One((0, canon)),
+                    pid,
+                    continuation: cont,
+                });
+                return true;
+            }
+            return false;
+        }
+        if let Some(slot) = Self::parse_instance_event_slot_key(&canon) {
+            if self.event_obj_ids.get(&slot) != Some(&Self::EVENT_OBJ_NULL_ID) {
+                let cont = pc.pushed_body(body, next);
+                self.instance_event_waiters.push(InstanceEventWaiter {
+                    key: InstanceEventKeys::One(slot),
+                    pid,
+                    continuation: cont,
+                });
+                return true;
+            }
+            return false;
+        }
+        if canon.starts_with("\u{3}ev#") {
+            let cont = pc.pushed_body(body, next);
+            self.instance_event_waiters.push(InstanceEventWaiter {
+                key: InstanceEventKeys::One((0, canon)),
+                pid,
+                continuation: cont,
+            });
+            return true;
+        }
+        if self.signal_name_to_id.contains_key(canon.as_str()) {
+            let cont = pc.pushed_body(body, next);
+            let sens = vec![Sensitivity {
+                signal_name: canon,
+                edge: EdgeKind::AnyEdge,
+                iff: None,
+                value_of: None,
+            }];
+            let w = self.make_event_waiter_kind(pid, sens, cont, false);
+            self.park_event_waiter(w);
+            return true;
+        }
+        if (!canon.contains('.') || self.module.events.contains(canon.as_str()))
+            && canon != Self::EVENT_NULL_KEY
+        {
+            let cont = pc.pushed_body(body, next);
+            self.instance_event_waiters.push(InstanceEventWaiter {
+                key: InstanceEventKeys::One(self.unbacked_event_key(&canon)),
+                pid,
+                continuation: cont,
+            });
+            return true;
+        }
+        false
+    }
+
+    fn park_instance_event_key_wait(
+        &mut self,
+        pid: usize,
+        key: (usize, String),
+        pc: &ProcCont,
+        body: &Statement,
+        next: usize,
+    ) {
+        if let Some(aliased) = self
+            .event_aliases
+            .get(&Self::instance_event_stamp_key(&key))
+            .cloned()
+        {
+            if aliased == Self::EVENT_NULL_KEY
+                || Self::parse_instance_event_obj_id(&aliased) == Some(Self::EVENT_OBJ_NULL_ID)
+                || self.park_canon_event_wait(pid, aliased, pc, body, next)
+            {
+                return;
+            }
+        }
+        let cont = pc.pushed_body(body, next);
+        self.instance_event_waiters.push(InstanceEventWaiter {
+            key: InstanceEventKeys::One(key),
+            pid,
+            continuation: cont,
+        });
     }
 }

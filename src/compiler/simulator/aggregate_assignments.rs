@@ -4622,8 +4622,11 @@ impl Simulator {
         // §15.5.5: pushing an event variable stores its synchronization-object
         // KEY (a string), so a handle later pulled out of the container
         // (`e = q[0]`, `q[0].triggered`) still names the same object.
-        if let Some(k) = self.event_ref_key(arg) {
-            let canon = self.resolve_event_key(&k);
+        if !matches!(arg.kind, ExprKind::Null)
+            && self.any_events_possible()
+            && Self::expr_could_be_event(arg)
+            && let Some(canon) = self.event_handle_capture_key(arg)
+        {
             self.set_signal_value_by_name(elem, Value::from_string(&canon));
             return;
         }

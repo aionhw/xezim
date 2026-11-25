@@ -305,26 +305,21 @@ impl Simulator {
                     .property_types
                     .get(p)
                     .map(|dt| {
-                        // Step 6: enum-typed properties are integral heap
-                        // Values (width of the enum's base) — loadable.
-                        self.scalar_formal_integral(dt).is_some()
-                            || self.typeref_names_class(dt)
-                            || self.typeref_names_enum(dt)
-                            // class-perf (uvm_lru_cache::get): a member typed
-                            // by a TypeReference that plan time cannot resolve
-                            // (a TYPE PARAMETER — `DATA_T data;` in
-                            // uvm_lru_cache_node — or a parameterized-class
-                            // alias) is still a plain heap slot: the
-                            // interpreter's dotted read fetches
-                            // `properties[name]` verbatim (class_prop_width
-                            // never resizes non-integral members), and
-                            // LoadClassMember does the same. Specializations
-                            // bind such params to class handles (the UVM LRU
-                            // cache binds DATA_T=chandle), so the slot value
-                            // passes through untouched. Only the heap-slot
-                            // SHAPES that are NOT properties-keyed (collections
-                            // above, statics above) stay refused.
-                            || matches!(dt, crate::ast::types::DataType::TypeReference { .. })
+                        // Named events must never lower to LoadClassMember/StoreClassMember.
+                        !self.class_dt_is_event(&cur, dt)
+                            && (
+                                // Step 6: enum-typed properties are integral heap
+                                // Values (width of the enum's base) — loadable.
+                                self.scalar_formal_integral(dt).is_some()
+                                    || self.typeref_names_class(dt)
+                                    || self.typeref_names_enum(dt)
+                                    // class-perf (uvm_lru_cache::get): a member typed
+                                    // by a TypeReference that plan time cannot resolve
+                                    // (a TYPE PARAMETER — `DATA_T data;` in
+                                    // uvm_lru_cache_node — or a parameterized-class
+                                    // alias) is still a plain heap slot.
+                                    || matches!(dt, crate::ast::types::DataType::TypeReference { .. })
+                            )
                     })
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
@@ -1681,6 +1676,21 @@ impl Simulator {
         })
     }
 
+    /// Does `body` declare, at any depth, an `event` local (including typedefs)?
+    fn declares_event_local(&self, cname: &str, body: &[Statement]) -> bool {
+        use crate::ast::stmt::StatementKind;
+        body.iter().any(|s| match &s.kind {
+            StatementKind::VarDecl { data_type, .. } => self.class_dt_is_event(cname, data_type),
+            _ => self.declares_event_local_in(cname, &Self::sub_stmts(s)),
+        })
+    }
+
+    fn declares_event_local_in(&self, cname: &str, stmts: &[&Statement]) -> bool {
+        stmts
+            .iter()
+            .any(|s| self.declares_event_local(cname, std::slice::from_ref(*s)))
+    }
+
     fn declares_vif_local_in(&self, stmts: &[&Statement]) -> bool {
         stmts
             .iter()
@@ -1918,6 +1928,14 @@ impl Simulator {
             // assignment, and an assignment bound nothing.
             if self.declares_vif_local(body) {
                 trace_decline("vif-local");
+                self.compiled_method_skip.insert((cid, mid, spec_id));
+                return None;
+            }
+            if ports.iter().any(|p| self.class_dt_is_event(cname, &p.data_type))
+                || self.declares_event_local(cname, body)
+                || matches!(&kind, CompiledBodyKind::Function(f) if self.class_dt_is_event(cname, &f.return_type))
+            {
+                trace_decline("event-subroutine");
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }

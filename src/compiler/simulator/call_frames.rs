@@ -366,6 +366,7 @@ pub(super) struct TaskCleanup {
 pub(crate) enum ReturnPatternType {
     /// A return type no pattern can target.
     NotPacked,
+    Event,
     Func(std::rc::Rc<DataType>),
     Method(Arc<crate::ast::decl::ClassMethod>),
 }

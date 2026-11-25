@@ -332,6 +332,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                if self.is_event_ident(hier) {
+                    self.bail("event_ident");
+                    return None;
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     // An integral parameter's signal-table twin: fold to the
                     // parameter's constant instead of a runtime load. On

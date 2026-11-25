@@ -385,6 +385,13 @@ impl Simulator {
             ident_slow.extend(statics.iter().cloned());
             ident_slow.extend(vif_props.iter().cloned());
             ident_slow.extend(self.struct_capable_names().iter().cloned());
+            for (cn, cd) in self.module.classes.iter() {
+                for (p, dt) in &cd.property_types {
+                    if self.class_dt_is_event(cn, dt) {
+                        ident_slow.insert(p.clone());
+                    }
+                }
+            }
             ident_slow.insert("UVM_ACTIVE".to_string());
             ident_slow.insert("UVM_PASSIVE".to_string());
             let mut param_first = [false; 256];
@@ -1752,17 +1759,21 @@ impl Simulator {
                         .get(i)
                         .filter(|_| arg_supplied(i))
                         .or_else(|| Self::default_actual(port));
+                    let is_event_port =
+                        port.dimensions.is_empty() && self.class_dt_is_event(cname, &port.data_type);
                     // Freeze the actual in the caller, before installing this method's
                     // receiver and locals. Ref writes go directly to that storage.
-                    let ref_storage = if port.direction == PortDirection::Ref && arg_supplied(i) {
-                        self.ref_scope_alias_target(port, &args[i]).or_else(|| {
-                            let ExprKind::Ident(h) = &args[i].kind else { return None };
-                            if h.path.len() != 1 || !h.path[0].selects.is_empty() { return None; }
-                            self.ref_alias_stack.last()?.get(&h.path[0].name.name).cloned()
-                        })
-                    } else {
-                        None
-                    };
+                    let ref_storage =
+                        if !is_event_port && port.direction == PortDirection::Ref && arg_supplied(i)
+                        {
+                            self.ref_scope_alias_target(port, &args[i]).or_else(|| {
+                                let ExprKind::Ident(h) = &args[i].kind else { return None };
+                                if h.path.len() != 1 || !h.path[0].selects.is_empty() { return None; }
+                                self.ref_alias_stack.last()?.get(&h.path[0].name.name).cloned()
+                            })
+                        } else {
+                            None
+                        };
                     // An associative-array `output`/`inout`/`ref` formal
                     // is copied back via the assoc-param signal-namespace
                     // merge, NOT the scalar `output_bindings` path (which
@@ -1949,6 +1960,39 @@ impl Simulator {
                             }
                             continue;
                         }
+                    }
+                    if is_event_port {
+                        let canon = if port.direction == PortDirection::Output {
+                            self.fresh_unbacked_event_key(&port.name.name)
+                        } else if arg_supplied(i) {
+                            self.event_handle_capture_key(&args[i])
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string())
+                        } else if let Some(def) = &port.default {
+                            let saved_spec = self.seed_callee_spec_from_instance(handle, cname);
+                            self.this_stack.push(Some(handle));
+                            self.class_context_stack.push(Some(cname.clone()));
+                            self.local_iface_aliases.push(None);
+                            self.push_local_frame_typed(locals.clone(), frame_types.clone());
+                            self.push_pending_formal_dyn(&formal_dyn);
+                            let canon = self
+                                .event_handle_capture_key(def)
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                            self.pop_pending_formal_dyn();
+                            self.pop_local_frame();
+                            self.local_iface_aliases.pop();
+                            self.class_context_stack.pop();
+                            self.this_stack.pop();
+                            self.restore_spec_pooled(saved_spec);
+                            canon
+                        } else {
+                            self.fresh_unbacked_event_key(&port.name.name)
+                        };
+                        self.note_event_handle_live();
+                        locals.insert(
+                            port.name.name.clone(),
+                            Self::encode_event_handle_value(&canon),
+                        );
+                        continue;
                     }
                     // §11.6.1/§11.8.2: a call ACTUAL is CONTEXT-DETERMINED by
                     // the callee's declared formal, exactly like the operand of
@@ -2313,7 +2357,15 @@ impl Simulator {
                     // string Value, not a 32-bit int — otherwise an implicit
                     // `funcname = {a, "b", ...}` string-concat assignment
                     // coerces to the int's 32-bit width and reads back empty.
-                    let mut init = if let (ClassMethodKind::Function(f), Some(rp)) =
+                    let mut init = if matches!(
+                        &method.kind,
+                        ClassMethodKind::Function(f)
+                            if self.class_dt_is_event(cname, &f.return_type)
+                    ) {
+                        self.note_event_handle_live();
+                        let k = self.fresh_unbacked_event_key(rn);
+                        Self::encode_event_handle_value(&k)
+                    } else if let (ClassMethodKind::Function(f), Some(rp)) =
                         (&method.kind, plan.ret.as_ref())
                     {
                         if rp.decl_string {
@@ -2661,6 +2713,9 @@ impl Simulator {
                 };
                 self.fn_ret_ctx_stack.push(method_ret_ctx);
                 let frame = match &method.kind {
+                    ClassMethodKind::Function(f) if self.class_dt_is_event(cname, &f.return_type) => {
+                        ReturnPatternType::Event
+                    }
                     ClassMethodKind::Function(f) if Self::ret_may_take_pattern(&f.return_type) => {
                         ReturnPatternType::Method(method.clone())
                     }
@@ -3136,6 +3191,10 @@ impl Simulator {
                     self.purge_array_formals(&array_inputs);
                 }
                 for (pn, v, caller) in writebacks {
+                    if let Some(canon) = Self::decode_event_handle_value(&v) {
+                        self.assign_event_handle_canon(&caller, &canon);
+                        continue;
+                    }
                     self.vif_writeback(
                         &caller,
                         &v,

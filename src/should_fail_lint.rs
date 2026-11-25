@@ -255,7 +255,7 @@ fn check_unit<'a>(
     check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
     check_member_access_roots(u.items, errs);
-    check_event_arguments(u.items, errs);
+    check_event_arguments(u.items, elab, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_param_override_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
@@ -5540,17 +5540,58 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
 
 /// §13.5: an `event` is not a value, so it cannot be passed to a subroutine
 /// input that is not itself an event (`func(evt)` with `input arg;`).
-fn check_event_arguments(items: &[ModuleItem], errs: &mut Vec<String>) {
-    let mut events: HashSet<&str> = HashSet::new();
+fn check_event_arguments(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    let mut local_tds: HashMap<&str, &DataType> = HashMap::new();
     for it in items {
-        if let ModuleItem::DataDeclaration(d) = it
-            && matches!(
-                d.data_type,
+        if let ModuleItem::TypedefDeclaration(td) = it {
+            local_tds.insert(td.name.name.as_str(), &td.data_type);
+        }
+    }
+    fn is_event_dt<'a>(
+        mut dt: &'a DataType,
+        local_tds: &HashMap<&str, &'a DataType>,
+        elab: &'a ElaboratedModule,
+    ) -> bool {
+        for _ in 0..16 {
+            match dt {
                 DataType::Simple {
                     kind: xezim_core::ast::types::SimpleType::Event,
                     ..
+                } => return true,
+                DataType::TypeReference { name, .. } => {
+                    let next = if !name.scopes.is_empty() {
+                        let qual = format!(
+                            "{}::{}",
+                            name.scopes
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("::"),
+                            name.name.name
+                        );
+                        elab.typedef_types
+                            .get(&qual)
+                            .or_else(|| elab.typedef_types.get(&name.name.name))
+                    } else {
+                        local_tds
+                            .get(name.name.name.as_str())
+                            .copied()
+                            .or_else(|| elab.typedef_types.get(&name.name.name))
+                    };
+                    match next {
+                        Some(resolved) => dt = resolved,
+                        None => return false,
+                    }
                 }
-            )
+                _ => return false,
+            }
+        }
+        false
+    }
+    let mut events: HashSet<&str> = HashSet::new();
+    for it in items {
+        if let ModuleItem::DataDeclaration(d) = it
+            && is_event_dt(&d.data_type, &local_tds, elab)
         {
             events.extend(d.declarators.iter().map(|v| v.name.name.as_str()));
         }
@@ -5590,13 +5631,7 @@ fn check_event_arguments(items: &[ModuleItem], errs: &mut Vec<String>) {
                     && ah.path.len() == 1
                     && ah.path[0].selects.is_empty()
                     && events.contains(ah.path[0].name.name.as_str())
-                    && !matches!(
-                        p.data_type,
-                        DataType::Simple {
-                            kind: xezim_core::ast::types::SimpleType::Event,
-                            ..
-                        }
-                    )
+                    && !is_event_dt(&p.data_type, &local_tds, elab)
                 {
                     hits.push(format!(
                         "event '{}' passed to non-event argument '{}' of '{}' \
