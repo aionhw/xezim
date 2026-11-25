@@ -660,6 +660,31 @@ impl Simulator {
         if !(dst.sliced || src.sliced) || dst.names.len() != src.names.len() {
             return false;
         }
+        if let Some(su) = self
+            .queue_elem_struct(&src.root_name)
+            .or_else(|| self.queue_elem_struct(&dst.root_name))
+        {
+            // §7.6: a struct array element is a set of member cells. Hold
+            // every source field before writing an overlapping destination.
+            let leaves = self.unpacked_struct_leaf_keys("", &su);
+            let mut writes = Vec::new();
+            for (dst, src) in dst.names.iter().zip(&src.names) {
+                let (Some(dst), Some(src)) = (dst, src) else {
+                    continue;
+                };
+                for (suffix, width, _) in &leaves {
+                    if *width > 0
+                        && let Some(value) = self.struct_leaf_value(&format!("{src}{suffix}"))
+                    {
+                        writes.push((format!("{dst}{suffix}"), value));
+                    }
+                }
+            }
+            for (leaf, value) in writes {
+                self.write_struct_leaf(&leaf, value, false);
+            }
+            return true;
+        }
         let values = self.read_unpacked_elems(&src);
         for (name, v) in dst.names.iter().zip(values) {
             let Some(name) = name else {
