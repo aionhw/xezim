@@ -544,6 +544,15 @@ impl Simulator {
                 return r;
             }
         }
+        if !self.no_class_objects()
+            && matches!(
+                lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            )
+            && let Some(changed) = self.class_collection_member_select_write(lhs, val)
+        {
+            return changed;
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 // §7.2.1/§23.7: preserve the full registered struct path
@@ -955,28 +964,25 @@ impl Simulator {
                             .map(|s| s.name.name.as_str())
                             .collect::<Vec<_>>()
                             .join(".");
-                        if let Some(fields) =
-                            self.module.packed_struct_fields.get(obj_name).cloned()
+                        if let Some((off, w)) =
+                            self.module.packed_struct_fields.get(obj_name).and_then(|fs| {
+                                fs.iter()
+                                    .find(|(m, _, _)| m == &sub)
+                                    .map(|&(_, o, w)| (o, w))
+                            })
                         {
-                            if let Some((_, off, w)) =
-                                fields.iter().find(|(m, _, _)| m == &sub).cloned()
-                            {
-                                // The container may be a procedural LOCAL (a
-                                // packed struct declared inside a task), which
-                                // `get/set_signal_value_by_name` cannot see.
-                                if let Some(cur_sig) = self.get_local_or_signal(obj_name) {
-                                    let total_w = cur_sig.width;
-                                    let mut cur = cur_sig.resize(total_w);
-                                    let piece = val.resize_for_assign(w);
-                                    for i in 0..w {
-                                        let bit = piece.get_bit(i as usize);
-                                        cur.set_bit((off + i) as usize, bit);
-                                    }
-                                    let prev = self.get_local_or_signal(obj_name);
-                                    let changed = prev.as_ref() != Some(&cur);
-                                    self.set_local_or_signal(obj_name, cur);
-                                    return changed;
-                                }
+                            // The container may be a procedural LOCAL (a
+                            // packed struct declared inside a task), which
+                            // `get/set_signal_value_by_name` cannot see.
+                            if let Some(cur_sig) = self.get_local_or_signal(obj_name) {
+                                let total_w = cur_sig.width;
+                                let mut cur = cur_sig.resize(total_w);
+                                let piece = val.resize_for_assign(w);
+                                cur.copy_bits_from(off as usize, &piece, 0, w as usize);
+                                let prev = self.get_local_or_signal(obj_name);
+                                let changed = prev.as_ref() != Some(&cur);
+                                self.set_local_or_signal(obj_name, cur);
+                                return changed;
                             }
                         }
                     }
@@ -1658,10 +1664,10 @@ impl Simulator {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let name = self.resolve_hier_name(hier);
                             if self.module.arrays.contains_key(&*name) {
-                                // §7.4.6: SIGNED index — a negative-lo array
-                                // (`m[-2:1]`) loses its negative elements when
-                                // the index goes through to_u64.
-                                let idx = self.eval_expr(index).to_i64().unwrap_or(0);
+                                // §7.4.6, §11.5.1: SIGNED index (invalid/x/z discards write).
+                                let Some(idx) = self.eval_expr(index).to_index() else {
+                                    return false;
+                                };
                                 self.get_array_elem_id(&name, idx)
                             } else {
                                 None
@@ -1783,10 +1789,13 @@ impl Simulator {
                         let fname = hier.path[1].name.name.clone();
                         // (b) Packed struct: slice into the parent signal at
                         //     `packed_struct_fields[root] → (fname, off, w)`.
-                        if let Some(fields) = self.module.packed_struct_fields.get(&root).cloned() {
-                            if let Some((_, field_off, field_w)) =
-                                fields.iter().find(|(m, _, _)| m == &fname).cloned()
-                            {
+                        if let Some((field_off, field_w)) =
+                            self.module.packed_struct_fields.get(&root).and_then(|fs| {
+                                fs.iter()
+                                    .find(|(m, _, _)| m == &fname)
+                                    .map(|&(_, o, w)| (o, w))
+                            })
+                        {
                                 // §7.4.1: an ASCENDING member dim mirrors the
                                 // bit labels (`bit [0:15] b; b[14:15]` = the
                                 // LOW two bits).
@@ -1847,7 +1856,6 @@ impl Simulator {
                                     }
                                 }
                             }
-                        }
                         // Resolve `root` to a handle from any storage class.
                         let root_handle: Option<usize> = {
                             let from_local = self
@@ -2016,14 +2024,18 @@ impl Simulator {
                         && self.frame_bound_bare_name(bh).is_none()
                     {
                         let base_name = self.resolve_hier_name(bh);
-                        if let Some(fields) =
-                            self.module.packed_struct_fields.get(&*base_name).cloned()
+                        if let Some((field_off, field_w)) = self
+                            .module
+                            .packed_struct_fields
+                            .get(&*base_name)
+                            .and_then(|fs| {
+                                fs.iter()
+                                    .find(|(m, _, _)| m == &member.name)
+                                    .map(|&(_, o, w)| (o, w))
+                            })
                         {
-                            if let Some((_, field_off, field_w)) =
-                                fields.iter().find(|(m, _, _)| m == &member.name).cloned()
-                            {
-                                // signal_table path
-                                if let Some(&id) = self.signal_name_to_id.get(base_name.as_ref()) {
+                            // signal_table path
+                            if let Some(&id) = self.signal_name_to_id.get(base_name.as_ref()) {
                                     let total_w = self.signal_widths[id] as usize;
                                     let lo = (field_off as usize) + lsb;
                                     let hi = (field_off as usize)
@@ -2073,7 +2085,6 @@ impl Simulator {
                                 }
                             }
                         }
-                    }
                     // (c) any other member receiver — notably a struct
                     // variable or a struct-element collection whose VALUE
                     // must not be read back as a heap handle (the (a) gate
@@ -2111,10 +2122,10 @@ impl Simulator {
                         let arr_name = self.resolve_hier_name(ah);
                         if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&*arr_name)
                         {
-                            let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                            let Some(base_off) =
-                                self.packed_elem_lsb(&arr_name, idx as i64, elem_w)
-                            else {
+                            let Some(idx) = self.eval_expr(index).to_index() else {
+                                return false;
+                            };
+                            let Some(base_off) = self.packed_elem_lsb(&arr_name, idx, elem_w) else {
                                 return false;
                             };
                             // Inner-dim labels mirror on an ascending
@@ -2334,9 +2345,7 @@ impl Simulator {
                         elem = elem.resize(total);
                     }
                     let fv = val.resize_for_assign(w);
-                    for i in 0..w {
-                        elem.set_bit((off + i) as usize, fv.get_bit(i as usize));
-                    }
+                    elem.copy_bits_from(off as usize, &fv, 0, w as usize);
                     return self.assign_value(elem_expr, &elem);
                 }
                 // §13.4.2: a member of a subroutine-local / formal unpacked
@@ -2515,9 +2524,7 @@ impl Simulator {
                         let total_w = cur_sig.width;
                         let mut cur = cur_sig.resize(total_w);
                         let piece = val.resize_for_assign(w);
-                        for i in 0..w {
-                            cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
-                        }
+                        cur.copy_bits_from(off as usize, &piece, 0, w as usize);
                         let changed = cur != cur_sig;
                         self.set_local_or_signal(&base, cur);
                         return changed;
@@ -2811,31 +2818,28 @@ impl Simulator {
                 // packed_struct_fields for signal-based structs
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
-                        if let Some((_, off, w)) =
-                            fields.iter().find(|(m, _, _)| m == &member.name).cloned()
-                        {
-                            if let Some(cur_sig) = self.get_signal_value_by_name(&name) {
-                                let total_w = cur_sig.width;
-                                let mut cur = cur_sig.resize(total_w);
-                                // §7.3: a real union member stores real bits.
-                                let piece = if w == 64
-                                    && !val.is_real
-                                    && self.union_real_member(&name, &member.name)
-                                {
-                                    Value::from_f64(val.to_f64()).resize(w)
-                                } else {
-                                    val.resize_for_assign(w)
-                                };
-                                for i in 0..w {
-                                    let bit = piece.get_bit(i as usize);
-                                    cur.set_bit((off + i) as usize, bit);
-                                }
-                                let prev = self.get_signal_value_by_name(&name);
-                                let changed = prev.as_ref() != Some(&cur);
-                                self.set_signal_value_by_name(&name, cur);
-                                return changed;
-                            }
+                    if let Some((off, w)) = self.module.packed_struct_fields.get(&*name).and_then(|fs| {
+                        fs.iter()
+                            .find(|(m, _, _)| m == &member.name)
+                            .map(|&(_, o, w)| (o, w))
+                    }) {
+                        if let Some(cur_sig) = self.get_signal_value_by_name(&name) {
+                            let total_w = cur_sig.width;
+                            let mut cur = cur_sig.resize(total_w);
+                            // §7.3: a real union member stores real bits.
+                            let piece = if w == 64
+                                && !val.is_real
+                                && self.union_real_member(&name, &member.name)
+                            {
+                                Value::from_f64(val.to_f64()).resize(w)
+                            } else {
+                                val.resize_for_assign(w)
+                            };
+                            cur.copy_bits_from(off as usize, &piece, 0, w as usize);
+                            let prev = self.get_signal_value_by_name(&name);
+                            let changed = prev.as_ref() != Some(&cur);
+                            self.set_signal_value_by_name(&name, cur);
+                            return changed;
                         }
                     }
                 }
@@ -2863,11 +2867,15 @@ impl Simulator {
                         }
                     }
                     field_path.reverse();
-                    let mut indices: Vec<u64> = Vec::new();
+                    let mut indices: Vec<i64> = Vec::new();
+                    let mut invalid_idx = false;
                     let root_name: Option<String> = loop {
                         match &cur_expr.kind {
                             ExprKind::Index { expr: b, index } => {
-                                indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
+                                match self.eval_expr(index).to_index() {
+                                    Some(i) => indices.push(i),
+                                    None => invalid_idx = true,
+                                }
                                 cur_expr = b.as_ref();
                             }
                             // A procedural LOCAL registers its layout under
@@ -2913,75 +2921,63 @@ impl Simulator {
                         }
                     };
                     if let Some(arr_name) = root_name {
-                        if !indices.is_empty() {
+                        if !indices.is_empty() || invalid_idx {
                             indices.reverse();
-                            if let Some(fields) =
-                                self.module.packed_struct_fields.get(&arr_name).cloned()
+                            let field_key = field_path.join(".");
+                            if let Some((off, w, struct_w)) = self
+                                .module
+                                .packed_struct_fields
+                                .get(&arr_name)
+                                .and_then(|fs| {
+                                    let (_, off, w) = fs.iter().find(|(m, _, _)| m == &field_key)?;
+                                    let struct_w =
+                                        fs.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
+                                    Some((*off, *w, struct_w))
+                                })
                             {
-                                let field_key = field_path.join(".");
-                                if let Some((_, off, w)) =
-                                    fields.iter().find(|(m, _, _)| m == &field_key).cloned()
-                                {
-                                    let mut elem_name = arr_name.clone();
-                                    for i in &indices {
-                                        elem_name.push_str(&format!("[{}]", i));
-                                    }
-                                    if let Some(cur_sig) = self.get_signal_value_by_name(&elem_name)
-                                    {
+                                if invalid_idx {
+                                    return false;
+                                }
+                                let mut elem_name = arr_name.clone();
+                                for i in &indices {
+                                    elem_name.push('[');
+                                    Self::push_i64(&mut elem_name, *i);
+                                    elem_name.push(']');
+                                }
+                                if let Some(cur_sig) = self.get_signal_value_by_name(&elem_name) {
+                                    let total_w = cur_sig.width;
+                                    let mut cur = cur_sig.resize(total_w);
+                                    let piece = val.resize_for_assign(w);
+                                    cur.copy_bits_from(off as usize, &piece, 0, w as usize);
+                                    let prev = self.get_signal_value_by_name(&elem_name);
+                                    let changed = prev.as_ref() != Some(&cur);
+                                    self.set_signal_value_by_name(&elem_name, cur);
+                                    return changed;
+                                }
+                                // §7.4.2: PACKED array of packed struct —
+                                // `foo[i]` is NOT a separate signal but a bit
+                                // slice of the single backing vector. Splice
+                                // the field at `i*elem_w + off`.
+                                if let Some(slot) = Self::flatten_packed_slot_iter(
+                                    indices.iter().copied(),
+                                    self.module
+                                        .packed_full_dims
+                                        .get(&arr_name)
+                                        .map(|d| d.as_slice()),
+                                ) {
+                                    // Frame-aware: a task/function local
+                                    // lives in the call frame, not the
+                                    // signal table (`get_local_or_signal`
+                                    // covers both).
+                                    if let Some(cur_sig) = self.get_local_or_signal(&arr_name) {
                                         let total_w = cur_sig.width;
                                         let mut cur = cur_sig.resize(total_w);
+                                        let abs_off = slot * struct_w + off;
                                         let piece = val.resize_for_assign(w);
-                                        for i in 0..w {
-                                            let bit = piece.get_bit(i as usize);
-                                            cur.set_bit((off + i) as usize, bit);
-                                        }
-                                        let prev = self.get_signal_value_by_name(&elem_name);
-                                        let changed = prev.as_ref() != Some(&cur);
-                                        self.set_signal_value_by_name(&elem_name, cur);
+                                        cur.copy_bits_from(abs_off as usize, &piece, 0, w as usize);
+                                        let changed = cur != cur_sig;
+                                        self.set_local_or_signal(&arr_name, cur);
                                         return changed;
-                                    }
-                                    // §7.4.2: PACKED array of packed struct —
-                                    // `foo[i]` is NOT a separate signal but a bit
-                                    // slice of the single backing vector. Splice
-                                    // the field at `i*elem_w + off`.
-                                    {
-                                        // Struct width from the field layout, and
-                                        // the slot flattened over ALL declared
-                                        // dims — the old form handled a single
-                                        // index with `packed_signal_elem_widths`,
-                                        // which is the OUTERMOST element width, so
-                                        // `t [0:0][1:0]` (two dims) both failed the
-                                        // arity check and would have used 2x the
-                                        // struct width had it passed.
-                                        let struct_w =
-                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                                        let dims =
-                                            self.module.packed_full_dims.get(&arr_name).cloned();
-                                        if let Some(slot) =
-                                            Self::flatten_packed_slot(&indices, dims.as_deref())
-                                        {
-                                            // Frame-aware: a task/function local
-                                            // lives in the call frame, not the
-                                            // signal table (`get_local_or_signal`
-                                            // covers both).
-                                            if let Some(cur_sig) =
-                                                self.get_local_or_signal(&arr_name)
-                                            {
-                                                let total_w = cur_sig.width;
-                                                let mut cur = cur_sig.resize(total_w);
-                                                let abs_off = slot * struct_w + off;
-                                                let piece = val.resize_for_assign(w);
-                                                for i in 0..w {
-                                                    cur.set_bit(
-                                                        (abs_off + i) as usize,
-                                                        piece.get_bit(i as usize),
-                                                    );
-                                                }
-                                                let changed = cur != cur_sig;
-                                                self.set_local_or_signal(&arr_name, cur);
-                                                return changed;
-                                            }
-                                        }
                                     }
                                 }
                             }

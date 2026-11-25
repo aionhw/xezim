@@ -315,7 +315,9 @@ impl Simulator {
     }
 
     /// §19.7 `cg.option.<name>`: the value set at run time, else by the
-    /// covergroup body, else the option's default.
+    /// covergroup body, else the option's default. A body option is read in
+    /// the instance's own scope (`cg_bin_scope`), so one set from a
+    /// constructor argument reads back as the value the coverage uses.
     pub(super) fn cg_option_read(&mut self, idx: usize, field: &str) -> Option<Value> {
         let inst = self.cg_heap.get(idx)?.as_ref()?;
         if let Some(v) = inst.options.get(field) {
@@ -328,7 +330,27 @@ impl Simulator {
             })
         });
         if let Some(e) = body {
-            return Some(self.eval_expr(&e));
+            let scope = Self::cg_bin_scope(inst);
+            if scope.is_empty() {
+                return Some(self.eval_expr(&e));
+            }
+            let frame = scope.iter().cloned().collect();
+            let owner = inst.owner;
+            let scope_hint = inst
+                .cg_name
+                .rsplit_once('.')
+                .filter(|_| !inst.cg_name.contains("::"))
+                .map(|(scope, _)| scope.to_string());
+            let saved_hint = scope_hint.map(|scope| self.name_resolve_hint.replace(Some(scope)));
+            self.push_local_frame(frame);
+            self.this_stack.push(owner);
+            let value = self.eval_expr(&e);
+            self.this_stack.pop();
+            self.pop_local_frame();
+            if let Some(saved_hint) = saved_hint {
+                self.name_resolve_hint.replace(saved_hint);
+            }
+            return Some(value);
         }
         let n = match field {
             "weight" | "at_least" => 1,

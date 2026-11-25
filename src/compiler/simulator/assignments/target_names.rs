@@ -360,7 +360,7 @@ impl Simulator {
                         return Some(format!("{}[{}]", base, key));
                     }
                 }
-                let i = iv.to_i64()?;
+                let i = iv.to_index()?;
                 // `format!` drags in the whole core::fmt machinery, which the
                 // profile showed dominating this path. A nested index builds
                 // one of these per dimension, per access.

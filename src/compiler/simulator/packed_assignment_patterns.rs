@@ -330,7 +330,7 @@ impl Simulator {
         if let Some(access) = self.declared_packed_access(lvalue)
             && access.unpacked == 0
         {
-            return Some(self.packed_access_type(access.element_type, &access.dimensions));
+            return Some(self.packed_access_type(&access.element_type, &access.dimensions));
         }
         if let Some(dt) = self.member_path_type(lvalue) {
             return Some(dt);
@@ -464,7 +464,7 @@ impl Simulator {
             dimensions: Vec::new(),
             span: crate::ast::Span::dummy(),
         };
-        Some(self.packed_access_type(logic, &dims))
+        Some(self.packed_access_type(&logic, &dims))
     }
 
     /// The packed struct type of a signal (or a member of one) with no
@@ -490,7 +490,7 @@ impl Simulator {
 
     /// The packed type of a `declared_packed_access` result: `dims` over
     /// the element type (a struct, or bits of an integral type).
-    fn packed_access_type(&self, element: DataType, dims: &[(i64, i64)]) -> DataType {
+    fn packed_access_type(&self, element: &DataType, dims: &[(i64, i64)]) -> DataType {
         let int = |v: i64| Box::new(Self::int_lit_expr(v, crate::ast::Span::dummy()));
         let packed: Vec<PackedDimension> = dims
             .iter()
@@ -501,7 +501,8 @@ impl Simulator {
             })
             .collect();
         match element {
-            DataType::Struct(mut su) => {
+            DataType::Struct(su) => {
+                let mut su = su.clone();
                 su.dimensions = packed;
                 DataType::Struct(su)
             }
@@ -512,7 +513,7 @@ impl Simulator {
                 if !packed.is_empty() =>
             {
                 let two_state = super::elaborate::is_type_two_state_resolved(
-                    &element,
+                    element,
                     &self.module.typedef_types,
                 );
                 DataType::IntegerVector {
@@ -526,7 +527,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                 }
             }
-            other => other,
+            other => other.clone(),
         }
     }
 

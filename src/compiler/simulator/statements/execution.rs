@@ -1776,6 +1776,33 @@ impl Simulator {
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }
+                    if self.pending_ret_collection.is_none()
+                        && self
+                            .fn_ret_collection_stack
+                            .last()
+                            .copied()
+                            .unwrap_or(false)
+                        && matches!(Self::unparen(e).kind, ExprKind::RangeSelect { .. })
+                    {
+                        if let Some((src, idx, width)) =
+                            self.collection_slice_indices(Self::unparen(e))
+                        {
+                            if let Some(su) = self.queue_elem_struct(&src) {
+                                self.snapshot_ret_structs(&src, &idx, &su);
+                            } else {
+                                const RET_SNAP: &str = "__xz_ret_coll__";
+                                let vals = self.collection_values_at(&src, &idx, width);
+                                for (i, v) in vals.into_iter().enumerate() {
+                                    self.set_signal_value_by_name(
+                                        &Self::name_with_index(RET_SNAP, i as i64),
+                                        v,
+                                    );
+                                }
+                                self.set_queue_size(RET_SNAP, idx.len() as u64);
+                                self.pending_ret_collection = Some(RET_SNAP.to_string());
+                            }
+                        }
+                    }
                     // §7.10.2.4, §7.10.2.5: `return q.pop_front()` on a queue
                     // of fixed-size rows hands back the removed row.
                     if self.pending_ret_collection.is_none()

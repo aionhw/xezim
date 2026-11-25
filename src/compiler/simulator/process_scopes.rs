@@ -3808,14 +3808,26 @@ impl Simulator {
                 span,
             )
         };
+        let xz_lit = |span| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(1),
+                    signed: false,
+                    base: NumberBase::Binary,
+                    value: "x".to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((0u64, 1u64, 1u32))),
+                }),
+                span,
+            )
+        };
         // A STRING key (`aa["name"] <= v`, or a string variable) must not be
         // folded into a decimal literal — the associative key would change.
         // Same for wide (>64-bit) keys, which are string-keyed in disguise
         // (`pool#(string,…)`). Those indices keep their expression; §10.4.2
         // staleness only bites loop/temp variables, which are integral.
-        let freezable = |sim: &mut Self, idx: &Expression| -> Option<i64> {
+        let freezable = |sim: &mut Self, idx: &Expression| -> Option<Expression> {
             match &idx.kind {
-                ExprKind::StringLiteral(_) => return None,
+                ExprKind::StringLiteral(_) | ExprKind::Dollar => return None,
                 ExprKind::Ident(h) => {
                     let n = sim.resolve_hier_name(h);
                     if sim.string_signals.contains(&*n) {
@@ -3828,14 +3840,14 @@ impl Simulator {
             if v.is_real || v.width > 64 {
                 return None;
             }
-            // An x/z bound must NOT freeze into a literal: `to_i64` masks the
-            // unknown bits away, so `i = 'hx; x[i +: 2] <= 2'b11` froze to
-            // `x[0 +: 2]` and wrote the low bits. Leaving the expression alone
-            // lets the apply-time path see the x and discard the write (§11.5.1).
+            // §10.4.2 + §11.5.1: an x/z bound evaluated in the NBA schedule
+            // phase must freeze as x rather than keeping the mutable variable,
+            // so overwriting the index variable afterward cannot retarget the
+            // write during NBA apply.
             if v.has_xz() {
-                return None;
+                return Some(xz_lit(idx.span));
             }
-            v.to_i64()
+            v.to_i64().map(|n| lit(n, idx.span))
         };
         match &e.kind {
             ExprKind::Index { expr, index } => {
@@ -3850,23 +3862,18 @@ impl Simulator {
                 if let Some(b) = qbound {
                     self.dollar_bound.push(b);
                 }
-                let frozen_idx = freezable(self, index);
+                let frozen_idx = if Self::expr_contains_dollar(index) && qbound.is_none() {
+                    None
+                } else {
+                    freezable(self, index)
+                };
                 if qbound.is_some() {
                     self.dollar_bound.pop();
                 }
-                let Some(iv) = frozen_idx else {
-                    return Expression::new(
-                        ExprKind::Index {
-                            expr: Box::new(base),
-                            index: index.clone(),
-                        },
-                        e.span,
-                    );
-                };
                 Expression::new(
                     ExprKind::Index {
                         expr: Box::new(base),
-                        index: Box::new(lit(iv, index.span)),
+                        index: Box::new(frozen_idx.unwrap_or_else(|| index.as_ref().clone())),
                     },
                     e.span,
                 )
@@ -3878,23 +3885,22 @@ impl Simulator {
                 right,
             } => {
                 let base = self.freeze_lvalue_indices(expr);
-                let (Some(lv), Some(rv)) = (freezable(self, left), freezable(self, right)) else {
-                    return Expression::new(
-                        ExprKind::RangeSelect {
-                            expr: Box::new(base),
-                            kind: *kind,
-                            left: left.clone(),
-                            right: right.clone(),
-                        },
-                        e.span,
-                    );
+                let frozen_left = if Self::expr_contains_dollar(left) {
+                    None
+                } else {
+                    freezable(self, left)
+                };
+                let frozen_right = if Self::expr_contains_dollar(right) {
+                    None
+                } else {
+                    freezable(self, right)
                 };
                 Expression::new(
                     ExprKind::RangeSelect {
                         expr: Box::new(base),
                         kind: *kind,
-                        left: Box::new(lit(lv, left.span)),
-                        right: Box::new(lit(rv, right.span)),
+                        left: Box::new(frozen_left.unwrap_or_else(|| left.as_ref().clone())),
+                        right: Box::new(frozen_right.unwrap_or_else(|| right.as_ref().clone())),
                     },
                     e.span,
                 )
@@ -4620,12 +4626,7 @@ impl Simulator {
     /// (a nested member is a flattened key of its own, so the split points
     /// are tried from the longest base down).
     fn packed_nba_flat_slice(&self, flat: &str) -> Option<(String, u32, u32)> {
-        for (i, _) in flat
-            .match_indices('.')
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
+        for (i, _) in flat.rmatch_indices('.') {
             let (b, prefix) = (&flat[..i], &flat[i + 1..]);
             let Some(layout) = self.module.packed_struct_fields.get(b) else {
                 continue;

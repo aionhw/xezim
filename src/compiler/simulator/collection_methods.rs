@@ -2935,10 +2935,10 @@ impl Simulator {
     /// For a queue or dynamic array an empty or reversed range (`q[3:1]`,
     /// `q[4:$]` on four elements) yields no elements, and bounds beyond
     /// either end are clamped (§7.10.1).
-    pub(super) fn collection_slice_values(
+    pub(super) fn collection_slice_indices(
         &mut self,
         arg: &Expression,
-    ) -> Option<(Vec<Value>, u32)> {
+    ) -> Option<(String, Vec<i64>, u32)> {
         let ExprKind::RangeSelect {
             expr: base,
             kind,
@@ -2950,14 +2950,37 @@ impl Simulator {
         };
         let name = match &base.kind {
             ExprKind::Index { .. } | ExprKind::Call { .. } => self.queue_actual_storage(base),
-            ExprKind::Ident(h) if h.path.len() > 1 => self.expr_assoc_name(base).or_else(|| self.array_operand_name(base)),
-            _ => self.array_operand_name(base),
+            ExprKind::Ident(h) if h.path.len() > 1 => {
+                self.expr_assoc_name(base).or_else(|| self.array_operand_name(base))
+            }
+            ExprKind::MemberAccess { .. } => {
+                self.expr_assoc_name(base).or_else(|| self.array_operand_name(base))
+            }
+            _ => self.array_operand_name(base).or_else(|| {
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                (!self.ident_shadowed_by_non_collection(h)).then(|| {
+                    let mut nm = self.resolve_hier_name(h).into_owned();
+                    if let Some(r) = self.dyn_name_lookup(&nm) {
+                        nm = r.to_string();
+                    } else if let Some(s) = self.instance_assoc_member(&nm) {
+                        nm = s;
+                    }
+                    nm
+                })
+            }),
         }?;
-        if self.queue_elem_struct(&name).is_some() {
+        let (lo_a, hi_a, w, is_class_queue) = if let Some(&t) = self.module.arrays.get(&*name) {
+            (t.0, t.1, t.2, false)
+        } else if self.class_queue_prop(&name) {
+            (0, -1, 32, true)
+        } else {
             return None;
-        }
-        let (lo_a, hi_a, w) = *self.module.arrays.get(&*name)?;
-        let live_size = self.live_coll_size(&name);
+        };
+        let live_size = self
+            .live_coll_size(&name)
+            .or_else(|| is_class_queue.then(|| self.get_queue_size(&name)));
         let is_dyn = live_size.is_some();
         let upper = live_size.map_or(hi_a, |n| n as i64 - 1);
         self.dollar_bound.push(upper);
@@ -2965,13 +2988,13 @@ impl Simulator {
         let r = self.eval_expr(right).to_index();
         self.dollar_bound.pop();
         let Some((l, r)) = l.zip(r) else {
-            return Some((Vec::new(), w));
+            return Some((name, Vec::new(), w));
         };
         let (from, to) = match kind {
             RangeKind::Constant => (l, r),
             RangeKind::IndexedUp if r > 0 => (l, l.saturating_add(r - 1)),
             RangeKind::IndexedDown if r > 0 => (l.saturating_sub(r - 1), l),
-            _ => return Some((Vec::new(), w)),
+            _ => return Some((name, Vec::new(), w)),
         };
         let lo_b = if is_dyn { 0 } else { lo_a };
         let descending = !is_dyn && self.module.descending_arrays.contains(&name);
@@ -2981,21 +3004,34 @@ impl Simulator {
             (from, to)
         };
         let (lo, hi) = (lo.max(lo_b), hi.min(upper));
-        let mut vals = if lo > hi {
+        let mut idx: Vec<i64> = if lo > hi {
             Vec::new()
         } else {
-            (lo..=hi)
-                .map(|idx| {
-                    self.get_signal_value_by_name(&Self::name_with_index(&name, idx))
-                        .or_else(|| self.coll_missing_elem_value(&name))
-                        .unwrap_or_else(|| Value::zero(w))
-                })
-                .collect()
+            (lo..=hi).collect()
         };
         if descending {
-            vals.reverse();
+            idx.reverse();
         }
-        Some((vals, w))
+        Some((name, idx, w))
+    }
+
+    pub(super) fn collection_slice_values(
+        &mut self,
+        arg: &Expression,
+    ) -> Option<(Vec<Value>, u32)> {
+        let (name, idx, w) = self.collection_slice_indices(arg)?;
+        if self.queue_elem_struct(&name).is_some() {
+            return None;
+        }
+        Some((self.collection_values_at(&name, &idx, w), w))
+    }
+
+    pub(super) fn collection_values_at(&self, name: &str, indices: &[i64], width: u32) -> Vec<Value> {
+        indices.iter().map(|&i| {
+            self.get_signal_value_by_name(&Self::name_with_index(name, i))
+                .or_else(|| self.coll_missing_elem_value(name))
+                .unwrap_or_else(|| Value::zero(width))
+        }).collect()
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary

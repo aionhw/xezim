@@ -129,7 +129,8 @@ impl Simulator {
                 {
                     return v;
                 }
-                if matches!(base.kind, ExprKind::Index { .. })
+                if (self.needs_declared_packed_access(expr)
+                    || self.needs_static_packed_access(expr))
                     && let Some(v) = self.read_declared_packed_access(expr)
                 {
                     return v;
@@ -177,6 +178,11 @@ impl Simulator {
                 if (self.needs_declared_packed_access(expr)
                     || self.needs_static_packed_access(expr))
                     && let Some(v) = self.read_declared_packed_access(expr)
+                {
+                    return v;
+                }
+                if !self.no_class_objects()
+                    && let Some(v) = self.class_collection_member_select_read(expr)
                 {
                     return v;
                 }
@@ -1449,28 +1455,28 @@ impl Simulator {
                             .map(|s| s.name.name.as_str())
                             .collect::<Vec<_>>()
                             .join(".");
-                        if let Some(fields) =
-                            self.module.packed_struct_fields.get(obj_name).cloned()
+                        if let Some((off, w)) =
+                            self.module.packed_struct_fields.get(obj_name).and_then(|fs| {
+                                fs.iter()
+                                    .find(|(m, _, _)| m == &sub)
+                                    .map(|&(_, o, w)| (o, w))
+                            })
                         {
-                            if let Some((_, off, w)) =
-                                fields.iter().find(|(m, _, _)| m == &sub).cloned()
-                            {
-                                if let Some(sig) = self.get_signal_value_by_name(obj_name) {
-                                    let mut v =
-                                        sig.range_select((off + w - 1) as usize, off as usize);
-                                    // §7.2.1: the member's DECLARED signedness
-                                    // (the slice itself is an unsigned bit
-                                    // pattern; `int s` printed as unsigned).
-                                    if self.struct_member_signed(obj_name, &sub) {
-                                        v.is_signed = true;
-                                    }
-                                    if v.has_xz() && self.packed_member_two_state(obj_name, &sub) {
-                                        let signed = v.is_signed;
-                                        v = v.to_two_state();
-                                        v.is_signed = signed;
-                                    }
-                                    return v;
+                            if let Some(sig) = self.get_signal_value_by_name(obj_name) {
+                                let mut v =
+                                    sig.range_select((off + w - 1) as usize, off as usize);
+                                // §7.2.1: the member's DECLARED signedness
+                                // (the slice itself is an unsigned bit
+                                // pattern; `int s` printed as unsigned).
+                                if self.struct_member_signed(obj_name, &sub) {
+                                    v.is_signed = true;
                                 }
+                                if v.has_xz() && self.packed_member_two_state(obj_name, &sub) {
+                                    let signed = v.is_signed;
+                                    v = v.to_two_state();
+                                    v.is_signed = signed;
+                                }
+                                return v;
                             }
                         }
                     }
@@ -3949,19 +3955,22 @@ impl Simulator {
                             if h.path.len() == 2 {
                                 let struct_var = h.path[0].name.name.as_str();
                                 let field_name = h.path[1].name.name.as_str();
-                                if let Some(fields) =
-                                    self.module.packed_struct_fields.get(struct_var).cloned()
+                                if let Some((field_off, _field_w)) = self
+                                    .module
+                                    .packed_struct_fields
+                                    .get(struct_var)
+                                    .and_then(|fs| {
+                                        fs.iter()
+                                            .find(|(m, _, _)| m == field_name)
+                                            .map(|&(_, o, w)| (o, w))
+                                    })
                                 {
-                                    if let Some((_, field_off, _field_w)) =
-                                        fields.iter().find(|(m, _, _)| m == field_name).cloned()
+                                    if let Some(struct_v) =
+                                        self.get_signal_value_by_name(struct_var)
                                     {
-                                        if let Some(struct_v) =
-                                            self.get_signal_value_by_name(struct_var)
-                                        {
-                                            let lo = (field_off as usize) + idx * (elem_w as usize);
-                                            let hi = lo + (elem_w as usize) - 1;
-                                            return struct_v.range_select(hi, lo);
-                                        }
+                                        let lo = (field_off as usize) + idx * (elem_w as usize);
+                                        let hi = lo + (elem_w as usize) - 1;
+                                        return struct_v.range_select(hi, lo);
                                     }
                                 }
                             }

@@ -187,7 +187,9 @@ thread_local! {}
 // constant-loop stores through packed members.
 // §20.8.1: fold wide operands of `$clog2` without truncating.
 // §7.4.6, §11.5.1, §20.6.2: bound packed stores and size declarations from locals.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3183;
+// §6.11.2: compile 2-state and mixed constant packed member stores with DropXz.
+// Scoped package calls can now lower to compiled function calls (#1623).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3185;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -3136,10 +3138,25 @@ pub struct Simulator {
     #[serde(skip)]
     struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
     #[serde(skip)]
+    #[allow(clippy::type_complexity)]
     packed_struct_member_memo: std::cell::RefCell<
         HashMap<
-            (String, u32, u32, String),
-            Option<(u32, u32, bool, crate::ast::types::DataType, Vec<(i64, i64)>)>,
+            Box<str>,
+            HashMap<
+                Box<str>,
+                Vec<(
+                    u32,
+                    u32,
+                    u32,
+                    Option<(
+                        u32,
+                        u32,
+                        bool,
+                        std::rc::Rc<crate::ast::types::DataType>,
+                        std::rc::Rc<[(i64, i64)]>,
+                    )>,
+                )>,
+            >,
         >,
     >,
     /// Per-(handle, prop) cache of `class_prop_packed_dims` and

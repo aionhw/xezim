@@ -219,8 +219,15 @@ pub(super) struct DeclaredPackedAccess {
     pub(super) offset: u32,
     pub(super) width: u32,
     pub(super) dimensions: Vec<(i64, i64)>,
-    pub(super) element_type: DataType,
+    pub(super) element_type: std::rc::Rc<DataType>,
     pub(super) unpacked: usize,
+    /// §7.4.6 / §11.5.1: an x/z or out-of-bounds index/range was encountered
+    /// along this select chain, so writes discard and reads return x (or 0
+    /// for 2-state) of `width`.
+    pub(super) invalid: bool,
+    /// True when the root began with an unpacked dimension, so a missing
+    /// element storage cell indicates an out-of-bounds element access.
+    pub(super) from_unpacked: bool,
 }
 
 /// A known static root either supports packed access or retains its own path.
