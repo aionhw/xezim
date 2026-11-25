@@ -448,18 +448,11 @@ impl Simulator {
                         if self.module.classes.contains_key(cls)
                             && self.member_is_static_coll(cls, coll)
                         {
-                            recv_name = if self.static_coll_name_collides(coll) {
+                            recv_name = if self.static_coll_name_collides(coll)
+                                || self.class_is_parameterized(cls)
+                            {
                                 self.static_prop_key(cls, coll)
                                     .unwrap_or_else(|| coll.to_string())
-                            } else if self.class_is_parameterized(cls) {
-                                // PARAMETERIZED class: statics live
-                                // per-specialization, resolved from the
-                                // qualified form via `current_spec` (§8.25);
-                                // collapsing to the bare name would drop the
-                                // specialization and miss the store (e.g.
-                                // `config_db#(int)::m_rsc` flattens to
-                                // `config_db.m_rsc`, `#(int)` stripped).
-                                recv_name
                             } else {
                                 coll.to_string()
                             };

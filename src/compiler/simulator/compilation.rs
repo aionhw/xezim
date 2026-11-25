@@ -492,23 +492,6 @@ impl Simulator {
         // from each declaring class's `static_assoc_key_types` so a
         // `static T map[string]` gets string storage (hashing the bare name
         // as NUMERIC would corrupt foreach()/first()/next()).
-        let _static_cols: Vec<(String, bool, u32, bool)> = self
-            .module
-            .classes
-            .values()
-            .flat_map(|cd| {
-                cd.static_collections
-                    .iter()
-                    .map(move |(name, is_assoc, width)| {
-                        let is_str = cd
-                            .static_assoc_key_types
-                            .get(name)
-                            .map(|kt| kt == "string")
-                            .unwrap_or(false);
-                        (name.clone(), *is_assoc, *width, is_str)
-                    })
-            })
-            .collect();
         // A static-collection bare name declared by TWO SIBLING classes must
         // be stored per DECLARING class (§8.9) — compute that set up front.
         // A static-collection name needs per-DECLARING-class storage whenever
@@ -622,10 +605,6 @@ impl Simulator {
         // classes declaring the same member name get separate stores.
         for (cls, name, lo, hi, width) in static_fixed {
             let key = format!("{}::{}", cls, name);
-            self.module
-                .arrays
-                .entry(key.clone())
-                .or_insert((lo, hi, width));
             // §6.8: a 4-STATE element type defaults to x, not 0 — only
             // two-state elements (int/byte/bit...) start at zero. The
             // declared type is on the owning class's property table.
@@ -642,6 +621,10 @@ impl Simulator {
             } else {
                 Value::all_x(width)
             };
+            self.module
+                .arrays
+                .entry(key.clone())
+                .or_insert((lo, hi, width));
             for i in lo..=hi {
                 let elem = format!("{}[{}]", key, i);
                 self.widths.insert(elem.clone(), width);

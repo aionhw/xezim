@@ -1423,18 +1423,42 @@ impl Simulator {
         } else {
             base.to_string()
         };
-        let inits: Vec<(String, String, Expression)> = {
-            let mut acc = Vec::new();
+        let mut inits: Vec<(String, String, Expression)> = Vec::new();
+        let mut static_colls: Vec<(String, String, bool, u32, Option<Expression>)> = Vec::new();
+        let mut static_fixed: Vec<(String, String, u32, Option<Expression>)> = Vec::new();
+        {
             let mut cur = Some(start);
             while let Some(cname) = cur {
                 if let Some(cd) = self.get_class_def(&cname) {
+                    let is_param = self.class_is_parameterized(&cd.name);
+                    if is_param {
+                        for (prop, is_assoc, w) in &cd.static_collections {
+                            static_colls.push((
+                                cd.name.clone(),
+                                prop.clone(),
+                                *is_assoc,
+                                *w,
+                                cd.property_inits.get(prop).cloned(),
+                            ));
+                        }
+                        for (prop, _, _, w) in &cd.static_fixed_arrays {
+                            static_fixed.push((
+                                cd.name.clone(),
+                                prop.clone(),
+                                *w,
+                                cd.property_inits.get(prop).cloned(),
+                            ));
+                        }
+                    }
                     for (prop, expr) in &cd.property_inits {
-                        if self.class_is_parameterized(&cd.name)
+                        if is_param
                             && cd.static_properties.contains(prop)
+                            && !cd.static_collections.iter().any(|(n, ..)| n == prop)
+                            && !cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop)
                             && (Self::expr_contains_call(expr)
                                 || Self::static_new_args(expr).is_some())
                         {
-                            acc.push((cd.name.clone(), prop.clone(), expr.clone()));
+                            inits.push((cd.name.clone(), prop.clone(), expr.clone()));
                         }
                     }
                     cur = cd.extends.clone();
@@ -1442,12 +1466,177 @@ impl Simulator {
                     break;
                 }
             }
-            acc
-        };
+        }
         // Run each initializer with current_spec set to this specialization.
         let saved_spec = self.current_spec.clone();
         self.current_spec = Some((base.to_string(), sig.to_string()));
         let canon_sig = self.canonicalize_spec_sig(base, sig);
+        for (cname, prop, is_assoc, default_w, init) in static_colls {
+            let declaring_sig = if cname == base {
+                canon_sig.clone()
+            } else {
+                self.ancestor_spec(base, &canon_sig, &cname)
+                    .unwrap_or_else(|| canon_sig.clone())
+            };
+            self.current_spec = Some((cname.clone(), declaring_sig.clone()));
+            let Some(spec_key) = self.static_prop_key_spec(
+                &cname,
+                &prop,
+                Some(&(cname.clone(), declaring_sig)),
+            ) else {
+                continue;
+            };
+            if self.module.associative_arrays.contains_key(&spec_key)
+                || self.module.dynamic_arrays.contains(&spec_key)
+            {
+                continue;
+            }
+            self.class_context_stack.push(Some(cname.clone()));
+            self.this_stack.push(None);
+            let Some((is_str, is_queue, assoc_iw, elem_type)) = self.module.classes.get(&cname).map(|cd| {
+                (
+                    cd.static_assoc_key_types
+                        .get(&prop)
+                        .is_some_and(|kt| kt == "string"),
+                    cd.queue_property_names.contains(&prop),
+                    cd.static_assoc_index_props.get(&prop).copied(),
+                    self.class_prop_elem_type(cd, &prop).cloned(),
+                )
+            }) else {
+                self.this_stack.pop();
+                self.class_context_stack.pop();
+                continue;
+            };
+            let elem_type = elem_type.map(|dt| {
+                self.bind_type_params_in(&dt, &|n| self.resolve_type_param_binding(n))
+                    .unwrap_or(dt)
+            });
+            let width = elem_type
+                .as_ref()
+                .map(|dt| {
+                    let resolved = self.resolve_dt(dt);
+                    let spec_params = self.class_spec_value_params();
+                    let env = self.spec_param_env(&spec_params);
+                    super::elaborate::resolve_type_width_env(
+                        &resolved,
+                        Some(&env),
+                        Some(&self.module.typedefs),
+                    )
+                })
+                .filter(|&w| w > 0)
+                .unwrap_or_else(|| default_w.max(1));
+            if is_queue {
+                self.module.queue_vars.insert(spec_key.clone());
+            }
+            if is_assoc {
+                self.module
+                    .associative_arrays
+                    .entry(spec_key.clone())
+                    .or_insert(is_str);
+                self.module
+                    .assoc_elem_widths
+                    .entry(spec_key.clone())
+                    .or_insert(width);
+                if let Some(iw) = assoc_iw {
+                    self.module
+                        .assoc_index_widths
+                        .entry(spec_key.clone())
+                        .or_insert(iw);
+                }
+                self.widths.insert(spec_key.clone(), width);
+            } else {
+                self.module.dynamic_arrays.insert(spec_key.clone());
+                self.module
+                    .arrays
+                    .entry(spec_key.clone())
+                    .or_insert((0, 63, width));
+                self.widths.insert(spec_key.clone(), width);
+                self.set_queue_size(&spec_key, 0);
+            }
+            if let Some(init) = init {
+                let (pattern, assoc_items) = match &self.unpacked_pattern(&init).kind {
+                    ExprKind::AssignmentPattern(items) if is_assoc => {
+                        (true, Some(items.clone()))
+                    }
+                    ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_) => (true, None),
+                    _ => (false, None),
+                };
+                if let Some(items) = assoc_items {
+                    self.assign_class_assoc_pattern(&spec_key, width, &items);
+                } else if pattern && !is_assoc {
+                    self.populate_queue_from_init(&spec_key, &init, elem_type);
+                } else {
+                    let lhs = super::property_initialization::prop_ident_expr(&prop);
+                    let stmt = Statement::new(
+                        StatementKind::BlockingAssign {
+                            lvalue: lhs.clone(),
+                            rvalue: init.clone(),
+                        },
+                        init.span,
+                    );
+                    self.exec_stmt_blocking_assign(&stmt, &lhs, &init);
+                }
+            }
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+        }
+        for (cname, prop, default_w, init) in static_fixed {
+            let declaring_sig = if cname == base {
+                canon_sig.clone()
+            } else {
+                self.ancestor_spec(base, &canon_sig, &cname)
+                    .unwrap_or_else(|| canon_sig.clone())
+            };
+            self.current_spec = Some((cname.clone(), declaring_sig.clone()));
+            let Some(spec_key) = self.static_prop_key_spec(
+                &cname,
+                &prop,
+                Some(&(cname.clone(), declaring_sig)),
+            ) else {
+                continue;
+            };
+            if self.module.arrays.contains_key(&spec_key) {
+                continue;
+            }
+            self.class_context_stack.push(Some(cname.clone()));
+            self.this_stack.push(None);
+            if let Some(layout) = self.class_array_layout(&cname, &prop) {
+                let default = layout.default_value();
+                self.module
+                    .arrays
+                    .insert(spec_key.clone(), (layout.lo, layout.hi, layout.width));
+                if layout.descending {
+                    self.module.descending_arrays.insert(spec_key.clone());
+                }
+                self.widths.insert(spec_key.clone(), layout.width);
+                for i in layout.lo..=layout.hi {
+                    let mut elem = spec_key.clone();
+                    elem.push('[');
+                    Self::push_i64(&mut elem, i);
+                    elem.push(']');
+                    self.widths.insert(elem.clone(), layout.width);
+                    if !self.signals.contains_key(&elem) {
+                        self.signals.insert(elem, default.clone());
+                    }
+                }
+                if let Some(init) = init
+                    && let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind
+                {
+                    for (index, value) in self.class_array_pattern_values(items, &layout) {
+                        let mut elem = spec_key.clone();
+                        elem.push('[');
+                        Self::push_i64(&mut elem, index);
+                        elem.push(']');
+                        self.signals.insert(elem, value);
+                    }
+                }
+            } else {
+                let w = default_w.max(1);
+                self.module.arrays.insert(spec_key.clone(), (0, -1, w));
+            }
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+        }
         for (cname, prop, init) in inits {
             // An inherited static belongs to the DECLARING specialization,
             // so direct and derived references share its single initializer.
