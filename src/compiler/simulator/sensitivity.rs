@@ -2600,17 +2600,14 @@ impl Simulator {
                 // such would read bit 0 of the whole-array signal storage
                 // instead of element 0.
                 let name = Self::resolve_hier_name_static(hier, &self.module);
-                if self.module.arrays.contains_key(&name) {
+                let scoped = scope_hint.map(|sc| format!("{sc}.{name}"));
+                let unpacked = |name: &str| {
+                    self.module.arrays.contains_key(name)
+                        || self.module.dynamic_arrays.contains(name)
+                        || self.module.associative_arrays.contains_key(name)
+                };
+                if unpacked(&name) || scoped.as_deref().is_some_and(unpacked) {
                     return None;
-                }
-                if let Some(scope) = scope_hint {
-                    if self
-                        .module
-                        .arrays
-                        .contains_key(&format!("{}.{}", scope, name))
-                    {
-                        return None;
-                    }
                 }
                 // Reject packed multi-D element access (`logic [N-1:0][W-1:0] p;
                 // p[i]` with W>1). `p[i]` selects a W-bit element, NOT a single
@@ -2647,7 +2644,6 @@ impl Simulator {
                 // `v[0] = in_valid` into the LSB, which the interpreter then
                 // read back as `v[N]` — a one-stage pipeline's out_valid
                 // tracked in_valid and its ready bit stayed x.
-                let scoped = scope_hint.map(|sc| format!("{}.{}", sc, name));
                 let dim = self
                     .module
                     .packed_full_dims
