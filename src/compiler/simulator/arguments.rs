@@ -1351,12 +1351,7 @@ impl Simulator {
     /// its fields into the leaf, as a packed-struct variable does.
     pub(super) fn register_packed_leaf_layout(&mut self, key: &str, dt: &DataType) {
         self.meta_note(key);
-        if let Some(fields) = super::elaborate::packed_struct_field_layout(
-            dt,
-            &self.module.parameters,
-            &self.module.typedefs,
-            &self.module.typedef_types,
-        ) {
+        if let Some(fields) = self.packed_struct_layout_in_ctx(dt) {
             if !fields.is_empty() {
                 self.module
                     .packed_struct_fields
@@ -3119,7 +3114,7 @@ impl Simulator {
     }
 
     /// `w = v` / `r = v[1]` / `v[1] = r` over multi-dimensional unpacked
-    /// arrays. Returns true when it performed the copy.
+    /// arrays or fixed class-property arrays. Returns true on a copy.
     pub(super) fn copy_multi_dim_array(
         &mut self,
         lvalue: &Expression,
@@ -3130,6 +3125,7 @@ impl Simulator {
         if self.module.arrays_2d.is_empty()
             && self.module.arrays_nd.is_empty()
             && self.module.coll_shapes.is_empty()
+            && self.no_class_objects()
         {
             return false;
         }
@@ -3139,27 +3135,38 @@ impl Simulator {
         let Some((rbase, rsfx, r_nd)) = self.nd_array_operand(rvalue) else {
             return false;
         };
-        if !(l_nd || r_nd) {
+        let class_array = !self.no_class_objects()
+            && (Self::class_storage_owner(&lbase).is_some()
+                || Self::class_storage_owner(&rbase).is_some());
+        if !(l_nd || r_nd || class_array) {
             return false;
         }
-        if lbase == rbase && lsfx == rsfx {
-            return true;
-        }
         // §7.2: an element of an unpacked-struct array is its member leaves.
+        // For a class row the type belongs to the root property (§8.4).
         let elem_su = self
             .nd_elem_struct(&rbase)
             .or_else(|| self.nd_elem_struct(&lbase))
             .or_else(|| {
-                self.p_elem_type(&rbase)
-                    .and_then(|dt| self.unpacked_struct_of(&dt))
+                if class_array {
+                    let lroot = lbase.split('[').next().unwrap_or(&lbase);
+                    let rroot = rbase.split('[').next().unwrap_or(&rbase);
+                    self.queue_elem_struct(rroot)
+                        .or_else(|| self.queue_elem_struct(lroot))
+                } else {
+                    self.p_elem_type(&rbase)
+                        .and_then(|dt| self.unpacked_struct_of(&dt))
+                }
             });
+        if lbase == rbase && lsfx == rsfx {
+            return true;
+        }
         // §7.8.6: an element of a row an associative array does not hold
         // reads the element type's default.
         let missing = self.assoc_row_missing_value(&rbase);
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
             if let Some(su) = &elem_su {
                 let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
-                self.copy_unpacked_struct(&d, &s, &su.clone());
+                self.copy_unpacked_struct(&d, &s, su);
                 continue;
             }
             let v = self

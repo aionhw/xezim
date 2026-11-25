@@ -109,6 +109,44 @@ impl Simulator {
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
         classes.sort();
         for cn in classes {
+            let mut chain: Vec<String> = Vec::new();
+            let mut cur = Some(cn.as_str());
+            let mut has_params = false;
+            while let Some(c) = cur {
+                if chain.len() >= 64 {
+                    break;
+                }
+                let Some(cdef) = module.classes.get(c) else {
+                    break;
+                };
+                if !cdef.param_defaults.is_empty() {
+                    has_params = true;
+                }
+                chain.push(c.to_string());
+                cur = cdef.extends.as_deref();
+            }
+            let mut class_params: HashMap<String, Value> = HashMap::default();
+            if has_params {
+                for cname in chain.iter().rev() {
+                    let Some(cdef) = module.classes.get(cname) else {
+                        continue;
+                    };
+                    for (pn, pdefault) in &cdef.param_defaults {
+                        if let Some(init) = pdefault {
+                            let env = super::elaborate::ParamEnv::Overlay {
+                                base: &module.parameters,
+                                top: &class_params,
+                            };
+                            if let Some(v) = super::elaborate::const_eval_i64_with_params_env(
+                                init,
+                                Some(&env),
+                            ) {
+                                class_params.insert(pn.clone(), Value::from_u64(v as u64, 32));
+                            }
+                        }
+                    }
+                }
+            }
             let Some(cd) = module.classes.get(&cn) else {
                 continue;
             };
@@ -118,6 +156,10 @@ impl Simulator {
                 .map(|(n, dt)| (n.clone(), dt.clone()))
                 .collect();
             targets.sort_by(|a, b| a.0.cmp(&b.0));
+            let env = (!class_params.is_empty()).then(|| super::elaborate::ParamEnv::Overlay {
+                base: &module.parameters,
+                top: &class_params,
+            });
             for (name, dt) in targets {
                 match &dt {
                     DataType::Enum(et) => {
@@ -127,12 +169,17 @@ impl Simulator {
                         let base_width = et
                             .base_type
                             .as_ref()
-                            .map(|bt| {
-                                resolve_type_width(
+                            .map(|bt| match &env {
+                                Some(env) => super::elaborate::resolve_type_width_env(
+                                    bt,
+                                    Some(env),
+                                    Some(&module.typedefs),
+                                ),
+                                None => resolve_type_width(
                                     bt,
                                     Some(&module.parameters),
                                     Some(&module.typedefs),
-                                )
+                                ),
                             })
                             .unwrap_or(32)
                             .max(1);
@@ -142,9 +189,20 @@ impl Simulator {
                         let mut members: Vec<(String, u64)> = Vec::new();
                         for m in &et.members {
                             let val = match &m.init {
-                                Some(init) => {
-                                    Self::const_expr_u64(init, &module.parameters).unwrap_or(next)
-                                }
+                                Some(init) => match &env {
+                                    Some(env) => {
+                                        super::elaborate::const_eval_i64_with_params_env(
+                                            init,
+                                            Some(env),
+                                        )
+                                        .map(|v| v as u64)
+                                        .or_else(|| Self::const_expr_u64(init, &module.parameters))
+                                        .unwrap_or(next)
+                                    }
+                                    None => {
+                                        Self::const_expr_u64(init, &module.parameters).unwrap_or(next)
+                                    }
+                                },
                                 None => next,
                             };
                             next = val.wrapping_add(1);
@@ -154,11 +212,18 @@ impl Simulator {
                         module.enum_members.insert(name, members);
                     }
                     _ => {
-                        let w = resolve_type_width(
-                            &dt,
-                            Some(&module.parameters),
-                            Some(&module.typedefs),
-                        )
+                        let w = match &env {
+                            Some(env) => super::elaborate::resolve_type_width_env(
+                                &dt,
+                                Some(env),
+                                Some(&module.typedefs),
+                            ),
+                            None => resolve_type_width(
+                                &dt,
+                                Some(&module.parameters),
+                                Some(&module.typedefs),
+                            ),
+                        }
                         .max(1);
                         module.typedefs.insert_if_absent(name.clone(), w);
                         module.typedef_types.entry(name).or_insert(dt);

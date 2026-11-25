@@ -2753,8 +2753,15 @@ impl Simulator {
                         let (di, si) = (format!("{}{}", d, sfx), format!("{}{}", sname, sfx));
                         if let Some(inner) = &elem_su {
                             self.copy_unpacked_struct(&di, &si, inner);
-                        } else if let Some(v) = self.get_signal_value_by_name(&si) {
-                            self.write_leaf_by_name(&di, v);
+                        } else if let Some(v) = self.struct_leaf_value(&si) {
+                            let is_str = matches!(
+                                self.resolve_dt_ref(&m.data_type),
+                                DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            );
+                            self.write_struct_leaf(&di, v, is_str);
                         }
                     }
                 }
@@ -2779,6 +2786,9 @@ impl Simulator {
     pub(super) fn write_struct_leaf(&mut self, flat: &str, v: Value, is_str: bool) {
         if let Some((h, key)) = flat.split_once('#')
             && let Ok(h) = h.parse::<usize>()
+            && !flat.split_once('[').is_some_and(|(root, _)| {
+                self.module.arrays_2d.contains_key(root) || self.module.arrays_nd.contains_key(root)
+            })
             && let Some(Some(inst)) = self.heap.get_mut(h)
             && let Some(old) = inst.properties.get_mut(key)
         {
@@ -4800,7 +4810,7 @@ impl Simulator {
     }
 
     /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
-    fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
+    pub(super) fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
         let Some((w, signed, two_state)) = info else {
             return val;
         };
@@ -6190,7 +6200,7 @@ impl Simulator {
 
     /// Evaluate the items of the row value `e` (a pattern or a concatenation)
     /// whose store is discarded, for their side effects only.
-    fn eval_row_value_for_effects(&mut self, e: &Expression) {
+    pub(super) fn eval_row_value_for_effects(&mut self, e: &Expression) {
         match &self.unpacked_pattern(e).kind {
             ExprKind::AssignmentPattern(items) => {
                 for item in items {

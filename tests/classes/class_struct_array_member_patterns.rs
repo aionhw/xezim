@@ -67,3 +67,172 @@ endmodule
         ]
     );
 }
+
+/// §7.6 and §10.9.1: a class-property array can be the value of a
+/// multidimensional array's positional pattern item.
+#[test]
+fn array_pattern_copies_rows_from_class_struct_arrays() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int a; byte b; } S;
+  class C;
+    S rows[2];
+    S dst[2][2];
+    function void copy();
+      dst = '{rows, this.rows};
+      $display("class %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][1].a, dst[1][0].b);
+      dst[1][0].a = 9;
+    endfunction
+  endclass
+  C c;
+  S dst[2][2];
+  initial begin
+    c = new;
+    c.rows[0] = '{1, 2};
+    c.rows[1] = '{3, 4};
+    dst = '{c.rows, c.rows};
+    $display("module %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][1].a, dst[1][0].b);
+    c.copy();
+    $display("updated %0d %0d", c.dst[1][0].a, c.rows[0].a);
+    dst = '{c.dst[1], c.dst[0]};
+    $display("rows %0d %0d %0d %0d", dst[0][0].a, dst[0][1].b, dst[1][0].a, dst[1][1].b);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim
+        .output
+        .iter()
+        .map(|line| line.message.as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        ["module 1 4 3 2", "class 1 4 3 2", "updated 9 1", "rows 9 4 1 4"]
+    );
+}
+
+/// §7.6 and §8.4: fixed unpacked struct arrays copy in declared order across
+/// class properties, module arrays and multidimensional rows.
+#[test]
+fn direct_class_struct_array_copies_preserve_fields() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+typedef struct { int a; byte b; } S;
+class C;
+  S src[3:2];
+  S d[5:4];
+  S rows[2][2];
+  function void run();
+    d = src;
+    rows[1] = this.src;
+    rows[0] = rows[1];
+    $display("in %0d %0d %0d %0d",d[5].a,d[4].b,rows[0][0].a,rows[1][1].b);
+  endfunction
+endclass
+C c; S md[2]; S src[2];
+initial begin
+  c=new;
+  c.src[3]='{11,12}; c.src[2]='{13,14};
+  src[0]='{21,22}; src[1]='{23,24};
+  md=c.src;
+  $display("out %0d %0d",md[0].a,md[1].b);
+  c.d=src;
+  $display("back %0d %0d",c.d[5].a,c.d[4].b);
+  c.run();
+end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["out 11 14", "back 21 24", "in 11 14 11 14"]);
+}
+
+/// §7.6: a direct array copy includes fixed-array fields of unpacked structs.
+#[test]
+fn direct_fixed_struct_array_copy_includes_nested_array_fields() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int val[2]; } S;
+  class C;
+    S src[1];
+    S dst[3:3];
+  endclass
+  C c;
+  S out_arr[7:7];
+  initial begin
+    c=new;
+    c.src[0].val[0]=42;
+    c.src[0].val[1]=17;
+    out_arr=c.src;
+    c.dst=out_arr;
+    $display("fixed nested %0d %0d %0d %0d",out_arr[7].val[0],out_arr[7].val[1],c.dst[3].val[0],c.dst[3].val[1]);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["fixed nested 42 17 42 17"]);
+}
+
+/// §7.4.6 and §7.6: an overlapping struct-array slice samples each
+/// field before any destination element is overwritten.
+#[test]
+fn overlapping_class_struct_array_slices_copy_every_field() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int n; byte b; } S;
+  class C; S a[3:0]; endclass
+  C c;
+  S out_arr[2];
+  initial begin
+    c=new;
+    c.a[3]='{1,11}; c.a[2]='{2,22}; c.a[1]='{3,33}; c.a[0]='{4,44};
+    out_arr=c.a[3:2];
+    c.a[2:1]=c.a[3:2];
+    $display("slice %0d %0d %0d %0d %0d %0d",out_arr[0].n,out_arr[1].b,c.a[2].n,c.a[2].b,c.a[1].n,c.a[1].b);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["slice 1 22 1 11 2 22"]);
+}
+
+/// §7.6 and §7.10: copying a queue to a descending fixed array and back
+/// preserves element order and all unpacked struct fields.
+#[test]
+fn class_queue_and_descending_fixed_struct_array_copy_in_order() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  typedef struct { int n; } S;
+  class C; S a[5:4]; S q[$]; endclass
+  C c;
+  S q[$];
+  initial begin
+    c=new;
+    c.q = '{'{7},'{9}};
+    c.a=c.q;
+    q=c.a;
+    $display("rank %0d %0d %0d %0d %0d",c.a[5].n,c.a[4].n,q.size(),q[0].n,q[1].n);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|entry| entry.message.as_str()).collect();
+    assert_eq!(lines, ["rank 7 9 2 7 9"]);
+}

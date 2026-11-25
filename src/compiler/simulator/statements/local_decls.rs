@@ -98,11 +98,43 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
+        let scoped_class_w = match data_type {
+            crate::ast::types::DataType::TypeReference {
+                name, dimensions, ..
+            } if name.has_scope() => {
+                let width = self
+                    .scoped_inherited_typedef(name)
+                    .map(|(target, params)| {
+                        super::elaborate::resolve_type_width(
+                            &target,
+                            Some(&params),
+                            Some(&self.module.typedefs),
+                        )
+                    })
+                    .filter(|&w| w > 0)
+                    .or_else(|| super::elaborate::specialized_class_scope_width(name, &self.module));
+                width.and_then(|w| {
+                    let mut total: u64 = u64::from(w);
+                    for d in dimensions {
+                        let crate::ast::types::PackedDimension::Range { left, right, .. } = d
+                        else {
+                            return None;
+                        };
+                        let l = super::elaborate::const_eval_i64_with_params(left, None)?;
+                        let r = super::elaborate::const_eval_i64_with_params(right, None)?;
+                        total = total.checked_mul(l.abs_diff(r) + 1)?;
+                    }
+                    u32::try_from(total).ok()
+                })
+            }
+            _ => None,
+        };
         // §8.25: a local sized by a class parameter or localparam
         // (`bit [N-1:0] x;` in a method of `C #(N)`) takes the executing
         // specialization's value; the module's parameter table has no `N`
         // (#681).
         let w0 = match tp_width
+            .or(scoped_class_w)
             .or_else(|| self.bound_agg_width(data_type))
             .or_else(|| self.class_param_sized_width(data_type))
         {
@@ -838,12 +870,7 @@ impl Simulator {
                         }
                     }
                 }
-                if let Some(fields) = super::elaborate::packed_struct_field_layout(
-                    data_type,
-                    &self.module.parameters,
-                    &self.module.typedefs,
-                    &self.module.typedef_types,
-                ) {
+                if let Some(fields) = self.packed_struct_layout_in_ctx(data_type) {
                     if !fields.is_empty() {
                         if env_set_cached!("XEZIM_PSDBG") {
                             eprintln!("[PSDBG] register packed local {}", d.name.name);
@@ -870,13 +897,9 @@ impl Simulator {
                 // elaboration: `a[i].f` slices the element. Without it a
                 // field write was dropped and a field read gave 0.
                 self.local_elem_layout = None;
-                if let Some(fields) = super::elaborate::packed_struct_field_layout(
-                    data_type,
-                    &self.module.parameters,
-                    &self.module.typedefs,
-                    &self.module.typedef_types,
-                )
-                .filter(|f| !f.is_empty())
+                if let Some(fields) = self
+                    .packed_struct_layout_in_ctx(data_type)
+                    .filter(|f| !f.is_empty())
                 {
                     let prev = self
                         .module
@@ -1175,8 +1198,16 @@ impl Simulator {
                         // `q[i] = v` back-fill - not the discard-out-of-
                         // range rule of an unallocated dynamic array.
                         // Mirror the module-scope classification.
-                        if matches!(first, UnpackedDimension::Queue { .. }) {
+                        if let UnpackedDimension::Queue { max_size, .. } = first {
                             self.module.queue_vars.insert(name.clone());
+                            if let Some(bound) = max_size
+                                && let Some(capacity) = self
+                                    .eval_expr(bound)
+                                    .to_i64()
+                                    .and_then(Self::bounded_queue_capacity)
+                            {
+                                self.module.queue_max_sizes.insert(name.clone(), capacity);
+                            }
                         }
                         self.widths.insert(name.clone(), w);
                         self.set_queue_size(&name, 0);

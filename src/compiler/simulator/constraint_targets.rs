@@ -896,12 +896,25 @@ impl Simulator {
         if self.is_string_keyed_array(scoped) {
             return Self::name_key_value(key);
         }
-        let (kw, signed) = self.assoc_index_width_for(scoped).unwrap_or((32, false));
+        // Some flattened struct-member stores carry keys but no index
+        // metadata. Preserve the stored sign and the full index in that case.
+        let (kw, signed) = self.assoc_index_width_for(scoped).unwrap_or_else(|| {
+            if key.starts_with('-') {
+                (if key.parse::<i32>().is_ok() { 32 } else { 64 }, true)
+            } else {
+                (if key.parse::<u32>().is_ok() { 32 } else { 64 }, false)
+            }
+        });
         if kw > 64 {
             // Wide numeric keys are keyed by hex digits.
             return Value::from_str_radix(key, 16, kw);
         }
-        let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+        let bits = if signed {
+            key.parse::<i64>().unwrap_or(0) as u64
+        } else {
+            key.parse::<u64>().unwrap_or(0)
+        };
+        let mut v = Value::from_u64(bits, kw);
         v.is_signed = signed;
         v
     }

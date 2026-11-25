@@ -332,9 +332,8 @@ pub(super) fn atom_type_keyword_width(name: &str) -> Option<u32> {
 }
 
 /// IEEE 1800-2017 §18.4: where a member of an aggregate (struct/union) CLASS
-/// property actually lives. Class properties are cells in `heap[h].properties`,
-/// not signals, so member access has to be routed here rather than through the
-/// flat-signal struct paths.
+/// property actually lives. The layout may use the object heap or the
+/// instance-scoped signal store.
 #[derive(Debug, Clone)]
 pub(super) enum ClassAggRef {
     /// Member of a PACKED struct/union — a bit slice `[off +: w]` of the
@@ -354,6 +353,8 @@ pub(super) enum ClassAggRef {
     },
     /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
     Unpacked { handle: usize, key: String, w: u32 },
+    /// Member of a fully indexed multidimensional fixed struct array.
+    Flat { handle: usize, key: String, w: u32 },
     /// A bit SLICE of one per-instance cell of an unpacked-struct property
     /// member: `[off +: w]` of the cell's `cell_w` bits. This is how a
     /// PACKED-ARRAY member of an unpacked struct is addressed (the whole

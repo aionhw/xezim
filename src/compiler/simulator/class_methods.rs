@@ -1125,6 +1125,23 @@ impl Simulator {
     /// parameter, or a typedef of the class naming one, in a method of
     /// `cname` called on `handle`: the receiver's specialization, else the
     /// class's defaults. `None` for a literal or non-packed type.
+    fn register_method_formal_type_metadata(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        name: &str,
+        dt: &DataType,
+        no_unpacked_dims: bool,
+    ) {
+        let saved_spec = self.seed_callee_spec_from_instance(handle, cname);
+        self.this_stack.push(Some(handle));
+        self.class_context_stack.push(Some(cname.to_string()));
+        self.register_formal_type_metadata(name, dt, no_unpacked_dims);
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.restore_spec_pooled(saved_spec);
+    }
+
     pub(super) fn method_formal_param_width(
         &mut self,
         handle: usize,
@@ -1700,11 +1717,28 @@ impl Simulator {
                     // of a named type (`lane_t [0:1] v`, or a typedef of
                     // one): its range labels its elements and their type
                     // gives them their signing, as for a function's formal.
-                    if !plain
-                        && (matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
-                            || self.names_packed_array_of_named(&port.data_type))
-                    {
-                        self.register_formal_type_metadata(
+                    if !plain && {
+                        let local = if let DataType::TypeReference {
+                            name,
+                            dimensions,
+                            type_args,
+                            ..
+                        } = &port.data_type
+                            && dimensions.is_empty()
+                            && type_args.is_empty()
+                            && !name.has_scope()
+                        {
+                            self.class_local_typedef(cname, &name.name.name)
+                        } else {
+                            None
+                        };
+                        let chk_dt = local.unwrap_or(&port.data_type);
+                        matches!(self.resolve_dt_ref(chk_dt), DataType::Struct(_))
+                            || self.names_packed_array_of_named(chk_dt)
+                    } {
+                        self.register_method_formal_type_metadata(
+                            handle,
+                            cname,
                             &port.name.name,
                             &port.data_type,
                             port.dimensions.is_empty(),
@@ -1803,7 +1837,9 @@ impl Simulator {
                                 } else {
                                     port.data_type.clone()
                                 };
-                            self.register_formal_type_metadata(
+                            self.register_method_formal_type_metadata(
+                                handle,
+                                cname,
                                 &port.name.name,
                                 &reg_dt,
                                 port.dimensions.is_empty(),
@@ -1925,9 +1961,8 @@ impl Simulator {
                     let param_w = if plan.ports[i].fixed_width.is_none()
                         && !plain_class
                         && (Self::actual_ctx_shape(port)
-                            || port.dimensions.is_empty()
-                                && port.direction == PortDirection::Input
-                                && matches!(&port.data_type, DataType::TypeReference { .. }))
+                            || (port.dimensions.is_empty()
+                                && matches!(&port.data_type, DataType::TypeReference { .. })))
                     {
                         self.method_formal_param_width(handle, cname, &port.data_type)
                     } else {
@@ -2245,7 +2280,13 @@ impl Simulator {
                             // §13.4.1: and the return variable is a variable
                             // of that type, so a whole-struct assignment to
                             // it (`f = s;`, `f = '{...};`) writes its members.
-                            self.register_formal_type_metadata(rn, &f.return_type, true);
+                            self.register_method_formal_type_metadata(
+                                handle,
+                                cname,
+                                rn,
+                                &f.return_type,
+                                true,
+                            );
                             for (k, seed) in self.struct_return_leaf_seeds(rn, &su) {
                                 locals.insert(k, seed);
                             }

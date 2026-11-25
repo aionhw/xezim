@@ -10,12 +10,46 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Bounded queues retain their capacity in class specializations, local
+  declarations and struct members. Inserting into a full queue drops the
+  highest-index element, and an input expression can read the queue before
+  the insertion changes it (§7.10.5, §8.25, §13.5.1).
+- Delayed blocking copies of unpacked structs preserve nested dynamic arrays,
+  queues and associative arrays, including their keys and lengths, when
+  copying whole values, fixed arrays, slices or queue elements (§7.2.1,
+  §7.6, §9.4.5).
+- Overlapping unpacked-struct array slices retain the original field values,
+  and copies between a queue and a descending fixed array follow the latter's
+  declared order (§7.4.6, §7.6, §7.10).
+- Delayed struct-array assignments evaluate a computed row index once and
+  sample queue lengths and element fields before suspending (§7.6, §9.4.5).
+- Specialized static associative arrays use their concrete key type, and
+  dimension queries report the fixed array's specialized bounds (§7.8, §8.25,
+  §20.7).
+- Type aliases in a derived class preserve the declaring specialization of
+  their inherited packed target (§6.18, §8.25).
+- Direct copies preserve unpacked-struct fields across fixed class arrays,
+  multidimensional class rows and module arrays (§7.6, §8.4).
+- Delayed blocking array assignments sample fields reached through a computed
+  class handle and evaluate the receiver once (§7.6, §9.4.5).
+- Fixed static array initializers can copy another array of the same
+  specialization (§7.6, §8.25).
+- Inherited packed typedef widths and field layouts use local parameters of
+  the declaring specialization (§6.18, §8.25).
+- A pending event at the maximum simulation timestamp still honors an earlier
+  `--max-time` cap.
+- Assignment patterns copy unpacked-struct array properties field by field,
+  including into multidimensional class properties. Delayed blocking
+  assignments sample those fields before the delay (§7.6, §9.4.5, §10.9.1,
+  #1553, #1554).
 - Runtime SDF annotation delays complex drivers of zero-delay specify paths
   and rejects pulses shorter than the annotated delay (§30.7, §32.9, #1630, #1631).
 - Library modules retain their source timescales and contribute to the
   simulation precision (§3.14, §22.7, #1632).
 - The public VPI header declares the coverage control operation codes and the
   DPI guide documents their support status (§40.5.3, #1619).
+- A run that `--max-time` stops reports the cap as its end time, and `final`
+  blocks see it, instead of the time of the last event that ran (#1633).
 - Static tasks can call automatic functions and class methods repeatedly,
   with each call initializing its own locals (§6.21, §8.6, #1629).
 - Nonblocking assignments copy unpacked structs through parenthesized
@@ -121,8 +155,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   initialized from assignment patterns and function returns, copy elements
   member-wise and preserve overlapping source ranges (§7.2, §7.4.6, §7.10.1,
   #1540).
+- Parameterized class static collections and fixed-size arrays isolate per
+  specialization, materialize on pre-instantiation scoped reads and writes, and
+  preserve parameter-dependent element widths. Fixed static arrays accept
+  unpacked concatenation initializers (§8.9, §8.25, §10.10).
+- Fixed-size array class property assignment patterns evaluate their items in
+  the declared element type context (§10.9.1).
+- Inherited and parameterized class-scoped packed typedefs and packed structs
+  retain their declaring-scope widths and field offsets across properties,
+  arrays, queues, method formals (`output`/`inout`/`ref`), and specialized scope
+  declarations, including when the base parameters come from an expression in
+  the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Class instantiation and startup skip redundant property-initializer sorting,
+  duplicate parameter-map cloning, and unused static collection copies; packed
+  property width lookups hit the cache without cloning parameter maps or values.
 
 - Packed declaration selects look up instance parameters by name, avoiding
   repeated scans of the design-wide parameter table (§23.10, #1563).

@@ -126,18 +126,21 @@ impl Simulator {
         // §8.7: every initializer runs once, in declaration order.
         // Splitting calls from plain expressions lets later calls capture
         // stale fields; replaying readers also repeats their side effects.
-        let mut inits: Vec<(String, &Expression)> = cdef
-            .property_inits
-            .iter()
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
-        inits.sort_by_key(|(name, _)| {
-            cdef.property_order
-                .iter()
-                .position(|p| p == name)
-                .unwrap_or(usize::MAX)
-        });
-        for (pname, init) in inits {
+        let mut ordered: Vec<(String, &Expression)> =
+            Vec::with_capacity(cdef.property_inits.len());
+        for name in &cdef.property_order {
+            if let Some(expr) = cdef.property_inits.get(name) {
+                ordered.push((name.clone(), expr));
+            }
+        }
+        if ordered.len() < cdef.property_inits.len() {
+            for (name, expr) in &cdef.property_inits {
+                if !cdef.property_order.iter().any(|p| p == name) {
+                    ordered.push((name.clone(), expr));
+                }
+            }
+        }
+        for (pname, init) in ordered {
             // A STATIC member is shared across all instances (it lives in
             // `class_statics`, not per-instance), so it must NOT be
             // re-initialized / re-allocated per instance. Doing so gave each
@@ -462,23 +465,38 @@ impl Simulator {
                         }
                     }
                     let prop_dt = cdef.property_types.get(&pname).cloned();
+                    let elem_dt = self.class_prop_elem_type(cdef, &pname).cloned();
+                    let is_str = self.is_string_collection(&scoped);
+                    let default_w = self.module.arrays.get(&scoped).map(|a| a.2).unwrap_or(0);
                     let elems = match prop_dt.as_ref() {
                         Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
                         None => self.pattern_elems(items, &indices),
                     };
+                    let mut en = String::with_capacity(scoped.len() + 12);
+                    en.push_str(&scoped);
+                    en.push('[');
+                    let prefix_len = en.len();
                     for (k, e) in elems.into_iter().enumerate() {
                         if let Some(e) = e {
-                            let en = format!("{}[{}]", scoped, indices[k]);
-                            let mut v = self.eval_expr(e);
+                            en.truncate(prefix_len);
+                            Self::push_i64(&mut en, indices[k]);
+                            en.push(']');
+                            let w = self.widths.get(&en).copied().unwrap_or(default_w);
+                            let mut v = if is_str {
+                                self.eval_expr(e)
+                            } else if let Some(dt) = elem_dt.as_ref() {
+                                self.eval_pattern_leaf_value(dt, e, (w > 0).then_some(w))
+                            } else if w > 0 {
+                                let v = self.eval_expr_ctx(e, w);
+                                self.fit_pattern_item_value(v, w)
+                            } else {
+                                self.eval_expr(e)
+                            };
                             // Each element is assigned (§10.9.1): it
                             // takes the element's width — an unsized
                             // fill `'1` too (§5.7.1).
-                            if !v.is_real && !self.is_string_collection(&scoped) {
-                                if let Some(&w) = self.widths.get(&en) {
-                                    if w > 0 && w != v.width {
-                                        v = v.resize_for_assign(w);
-                                    }
-                                }
+                            if !v.is_real && !is_str && w > 0 && w != v.width {
+                                v = v.resize_for_assign(w);
                             }
                             self.set_signal_value_by_name(&en, v);
                         }

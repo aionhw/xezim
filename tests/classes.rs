@@ -1417,3 +1417,9 @@ mod class_collection_member_index_write;
 mod class_scoped_blocking_task;
 #[path = "classes/class_array_packed_member_select.rs"]
 mod class_array_packed_member_select;
+
+#[path = "classes/param_static_collections.rs"]
+mod param_static_collections;
+
+#[path = "classes/inherited_packed_typedef_cousins.rs"]
+mod inherited_packed_typedef_cousins;

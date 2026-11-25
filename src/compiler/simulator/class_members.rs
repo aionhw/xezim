@@ -162,10 +162,22 @@ impl Simulator {
     /// base's copy; an inherited-only member resolves to the base's key, so
     /// every subclass shares the ONE store §8.9 prescribes).
     pub(super) fn static_fixed_key_in(&self, class_name: &str, member: &str) -> Option<String> {
+        self.static_fixed_key_in_spec(class_name, member, None)
+    }
+
+    pub(super) fn static_fixed_key_in_spec(
+        &self,
+        class_name: &str,
+        member: &str,
+        spec: Option<&(String, String)>,
+    ) -> Option<String> {
         let mut cur: Option<&str> = Some(class_name);
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
             if cd.static_fixed_arrays.iter().any(|(n, ..)| n == member) {
+                if self.class_is_parameterized(cn) {
+                    return self.static_prop_key_spec(cn, member, spec);
+                }
                 return Some(format!("{}::{}", cn, member));
             }
             cur = cd.extends.as_deref();
@@ -853,11 +865,9 @@ impl Simulator {
         // Borrowed walk: the owned form allocated the start class name and
         // one String per ancestor level, on a path that runs 22.3M times on
         // an axi4Lite UVM run.
-        let ctx: &str = self
-            .heap
-            .get(handle)
-            .and_then(|x| x.as_ref())
-            .map(|i| i.class_name.as_str())?;
+        let inst = self.heap.get(handle).and_then(|x| x.as_ref())?;
+        let ctx: &str = inst.class_name.as_str();
+        let inst_spec = inst.spec.as_ref();
         // Per-(class, name) verdict: every step below except a type-parameter
         // binding depends on the class tables only.
         loop {
@@ -869,19 +879,23 @@ impl Simulator {
                             return Some(Self::handle_member_key(handle, name));
                         }
                         MemberCollKind::Coll(Some(owner)) => {
+                            if self.class_is_parameterized(owner) {
+                                return Some(
+                                    self.static_fixed_key_in_spec(owner, name, inst_spec)
+                                        .unwrap_or_else(|| format!("{}::{}", owner, name)),
+                                );
+                            }
                             return Some(format!("{}::{}", owner, name));
                         }
                         MemberCollKind::StaticColl => {
-                            return Some(self.spec_static_coll_key_in_class(name, ctx));
+                            return Some(self.spec_static_coll_key_in_class_with(
+                                name, ctx, inst_spec,
+                            ));
                         }
                         MemberCollKind::Plain { raws, unbound } => {
                             let bound = !raws.is_empty()
-                                && self.heap.get(handle).and_then(|o| o.as_ref()).is_some_and(
-                                    |i| {
-                                        !i.type_bindings.is_empty()
-                                            && raws.iter().any(|r| i.type_bindings.contains_key(r))
-                                    },
-                                );
+                                && !inst.type_bindings.is_empty()
+                                && raws.iter().any(|r| inst.type_bindings.contains_key(r));
                             if !bound {
                                 return unbound.then(|| Self::handle_member_key(handle, name));
                             }
@@ -907,6 +921,9 @@ impl Simulator {
         if let Some(kind) = self.class_coll_lookup(ctx, name) {
             return Some(match kind {
                 None => Self::handle_member_key(handle, name),
+                Some(owner) if self.class_is_parameterized(&owner) => self
+                    .static_fixed_key_in_spec(&owner, name, inst_spec)
+                    .unwrap_or_else(|| format!("{}::{}", owner, name)),
                 Some(owner) => format!("{}::{}", owner, name),
             });
         }
@@ -920,7 +937,7 @@ impl Simulator {
         // and `exists` is false — uvm_config_db's `m_waiters` waiter map broke
         // exactly this way. Uses the runtime class of `this` as the concrete ctx.
         if self.collection_is_static_in(ctx, name) {
-            return Some(self.spec_static_coll_key_in_class(name, ctx));
+            return Some(self.spec_static_coll_key_in_class_with(name, ctx, inst_spec));
         }
         // Miss: only the per-instance type-binding case can still match.
         if self
@@ -1478,11 +1495,19 @@ impl Simulator {
                         return None;
                     };
                     if self.member_is_static_coll(&b, &member.name) {
+                        self.ensure_spec_statics(&b, &s);
                         let saved = self.current_spec.take();
                         self.current_spec = Some((b.clone(), s.clone()));
                         let key = self.static_prop_key(&b, &member.name);
                         self.current_spec = saved;
                         return key;
+                    }
+                    let spec_pair = (b.clone(), s.clone());
+                    if let Some(k) =
+                        self.static_fixed_key_in_spec(&b, &member.name, Some(&spec_pair))
+                    {
+                        self.ensure_spec_statics(&b, &s);
+                        return Some(k);
                     }
                     None
                 }
@@ -2626,13 +2651,17 @@ impl Simulator {
 
     /// The target of typedef `tn` declared in class `cn` or an ancestor.
     pub(super) fn class_local_typedef(&self, cn: &str, tn: &str) -> Option<&DataType> {
+        self.class_local_typedef_decl(cn, tn).map(|(_, dt)| dt)
+    }
+
+    pub(super) fn class_local_typedef_decl(&self, cn: &str, tn: &str) -> Option<(&str, &DataType)> {
         let mut cur: Option<&str> = Some(cn);
         let mut guard = 0;
         while let Some(c) = cur {
             guard += 1;
             let cd = self.module.classes.get(c)?;
             if let Some(dt) = cd.typedef_targets.get(tn) {
-                return Some(dt);
+                return Some((&cd.name, dt));
             }
             if guard > 64 {
                 return None;

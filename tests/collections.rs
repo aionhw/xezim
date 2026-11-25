@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "collections/bounded_class_queues.rs"]
+mod bounded_class_queues;
 #[path = "collections/struct_copy_selector.rs"]
 mod struct_copy_selector;
 

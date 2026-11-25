@@ -1000,6 +1000,7 @@ impl Simulator {
     pub(super) fn render_p_static_fixed(&mut self, cls: &str, prop: &str) -> Option<String> {
         let key = self.static_fixed_key_in(cls, prop)?;
         let decl = key.strip_suffix(prop)?.strip_suffix("::")?;
+        let decl = decl.split('#').next().unwrap_or(decl);
         let cd = self.module.classes.get(decl)?.clone();
         let &(_, lo, hi, _) = cd.static_fixed_arrays.iter().find(|(n, ..)| n == prop)?;
         if let Some(dt) = self.class_prop_decl_type(&cd, prop).cloned()

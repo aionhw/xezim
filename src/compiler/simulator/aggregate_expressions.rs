@@ -5809,6 +5809,22 @@ impl Simulator {
                     }
                 }
                 if let Some(arg) = args.first() {
+                    // §8.25 and §20.7: use the materialized declaration
+                    // rather than the generic class's bounds for a scoped static array.
+                    if dim == 1
+                        && matches!(&arg.kind, ExprKind::MemberAccess { expr, .. }
+                            if matches!(expr.kind, ExprKind::Specialization { .. }))
+                        && let Some(store) = self.array_operand_name(arg)
+                        && let Some(bounds) = self.module.unpacked_decl_dims.get(&store)
+                        && let Some(&(left, right)) = bounds.first()
+                    {
+                        let dims = super::elaborate::TypeQueryDims {
+                            dims: vec![(left, right)],
+                            unpacked: 1,
+                            whole: None,
+                        };
+                        return Self::type_query_value(&sn, &dims, dim);
+                    }
                     if let Some(rv) = self.member_array_query(&sn, arg, dim) {
                         return rv;
                     }

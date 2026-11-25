@@ -462,7 +462,8 @@ impl Simulator {
                         let w = match r {
                             ClassAggRef::Packed { w, .. }
                             | ClassAggRef::Unpacked { w, .. }
-                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                            | ClassAggRef::UnpackedSlice { w, .. }
+                            | ClassAggRef::Flat { w, .. } => w,
                         };
                         if w > 0 {
                             return w;
@@ -559,7 +560,8 @@ impl Simulator {
                         let w = match r {
                             ClassAggRef::Packed { w, .. }
                             | ClassAggRef::Unpacked { w, .. }
-                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                            | ClassAggRef::UnpackedSlice { w, .. }
+                            | ClassAggRef::Flat { w, .. } => w,
                         };
                         if w > 0 {
                             return w;
@@ -712,7 +714,8 @@ impl Simulator {
                         let w = match r {
                             ClassAggRef::Packed { w, .. }
                             | ClassAggRef::Unpacked { w, .. }
-                            | ClassAggRef::UnpackedSlice { w, .. } => w,
+                            | ClassAggRef::UnpackedSlice { w, .. }
+                            | ClassAggRef::Flat { w, .. } => w,
                         };
                         if w > 0 {
                             return w;

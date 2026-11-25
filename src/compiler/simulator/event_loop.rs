@@ -2832,7 +2832,7 @@ impl Simulator {
             } else {
                 None
             };
-            let next_time = [
+            let scheduled_time = [
                 next_eq_time,
                 next_clk_time,
                 next_delayed,
@@ -2841,8 +2841,8 @@ impl Simulator {
             ]
             .into_iter()
             .flatten()
-            .min()
-            .unwrap_or({
+            .min();
+            let next_time = scheduled_time.unwrap_or({
                 if has_waiters || has_reactive {
                     self.time
                 } else {
@@ -2863,6 +2863,12 @@ impl Simulator {
                         self.max_time
                     );
                     self.report_parked_waiters(8);
+                }
+                // The cap stops a run that still has later work: the run
+                // has reached the cap, whatever time its last event ran at,
+                // as `run <t>` does. A run with nothing left keeps its time.
+                if !self.finished && scheduled_time.is_some() && self.time < self.max_time {
+                    self.time = self.max_time;
                 }
                 break;
             }

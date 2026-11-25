@@ -456,7 +456,7 @@ module top;
     begin Item it; it = new(900); hq.push_front(it); end
     hq.delete(64);
     $display("T| handle n=%0d size=%0d %0d %0d %0d %0d null=%0d", n, hq.size(), hq[0].id, hq[1].id, hq[59].id, hq[$].id, hq[0] == null);
-    // a bounded queue drops what does not fit
+    // §7.10.5: a bounded queue drops the highest index after each insertion
     for (int i = 0; i < 14; i++) bq.push_front(i);
     $display("T| bound size=%0d %p", bq.size(), bq);
     void'(bq.pop_front()); bq.push_back(77); bq.push_back(78);
@@ -498,8 +498,8 @@ endmodule
             "T| pkt size=68 aa.5555 42.4242 45.4545",
             "T| enum size=71 BLUE GREEN GREEN GREEN RED",
             "T| handle n=45 size=61 900 10 68 69 null=0",
-            "T| bound size=10 '{9, 8, 7, 6, 5, 4, 3, 2, 1, 0}",
-            "T| bound size=10 '{8, 7, 6, 5, 4, 3, 2, 1, 0, 77}",
+            "T| bound size=10 '{13, 12, 11, 10, 9, 8, 7, 6, 5, 4}",
+            "T| bound size=10 '{12, 11, 10, 9, 8, 7, 6, 5, 4, 77}",
             "T| rec size=6 50/fifty 60/sixty 1/n1 5/n5",
             "T| fixed size=4 7,70 2,20 4,40",
             "T| assocq n=3 a='{0, 5, 1, 2} b='{8, 9}",
