@@ -2489,6 +2489,8 @@ impl Simulator {
         if self.lvalue_root_is_unpacked_struct_prop(lvalue, false)
             && self.queue_pop_call(rvalue).is_none()
             && self.class_unpacked_elem_is_heap_owned(lvalue)
+            // A whole fixed-array property must reach the array-copy path.
+            && self.fixed_array_operand(lvalue).is_none()
         {
             if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
                 self.assign_class_unpacked_elem(lvalue, rvalue, &su);
@@ -3494,21 +3496,27 @@ impl Simulator {
                 // element member by member, from the destination's left
                 // bound, into the instance cells its reads use.
                 if !dst_is_assoc
-                    && !self.is_associative_array(&src)
+                    && self.module.dynamic_arrays.contains(&src)
                     && let Some((_, lo, hi)) = self.fixed_array_operand(lvalue)
                     && let Some(su) = self
                         .queue_elem_struct(&src)
                         .or_else(|| self.queue_elem_struct(&dst))
                 {
                     let n = self.get_queue_size(&src).min((hi - lo + 1) as u64);
+                    let descending = self.module.descending_arrays.contains(&dst);
                     for i in 0..n {
-                        let (d, s) = (format!("{dst}[{}]", lo + i as i64), format!("{src}[{i}]"));
-                        self.copy_unpacked_struct(&d, &s, &su);
+                        let index = if descending { hi - i as i64 } else { lo + i as i64 };
+                        self.copy_unpacked_struct(
+                            &format!("{dst}[{index}]"),
+                            &format!("{src}[{i}]"),
+                            &su,
+                        );
                     }
                     self.settle_after_proc_write();
                     return;
                 }
                 if !dst_is_assoc
+                    && self.module.dynamic_arrays.contains(&src)
                     && (self.module.dynamic_arrays.contains(&dst)
                         || self.signals.contains_key(&format!("{}.size", dst)))
                 {
@@ -4784,15 +4792,9 @@ impl Simulator {
             // lives under "<handle>#member" — resolve it like element
             // accesses already do, else a whole-array copy involving
             // a property is silently dropped.
-            // A FIXED multi-dimensional member is not a collection: it
-            // copies element-wise by shape (`copy_multi_dim_array`).
+            // Fixed arrays use their declared bounds in the mixed copy.
             sim.expr_assoc_name(e)
-                .filter(|an| !sim.is_associative_array(an))
-                .filter(|an| {
-                    sim.module.dynamic_arrays.contains(an)
-                        || !(sim.module.arrays_2d.contains_key(an)
-                            || sim.module.arrays_nd.contains_key(an))
-                })
+                .filter(|an| sim.module.dynamic_arrays.contains(an))
                 .map(|an| (an, true))
         };
         let l_res = resolve_coll(self, lvalue);
