@@ -1647,11 +1647,13 @@ impl Simulator {
                 }
                 // §6.6.7, §7.2.2, §10.9.2: an explicit struct-valued item
                 // (including a resolver driver's nested member) supplies its
-                // own leaves. Only a scalar default broadcasts to every leaf.
+                // own leaves. A struct with dynamic members needs the whole
+                // value copy below, which also carries the collections.
                 if explicit
                     && let ExprKind::Ident(h) = &e.kind
                     && h.path.iter().all(|seg| seg.selects.is_empty())
                     && let Some(inner) = self.unpacked_struct_of(&mdt)
+                    && self.struct_coll_members(&inner).is_empty()
                     && let Some(src) = self.flat_member_name(e)
                     && self.struct_storage_exists(&src, &inner)
                 {
