@@ -2021,8 +2021,34 @@ impl Simulator {
             });
             return self.typename_of_dt(&target);
         }
-        // Otherwise a bare built-in keyword (`string`, `int`, ...) or the
-        // type name itself.
+        // Otherwise a built-in vector/atom keyword (`bit[7:0]`, `logic signed[15:0]`, ...)
+        // or the type name itself. Route parameterized vector fragments back
+        // through `typename_of_dt` so normalization (e.g. `reg` vs `logic`)
+        // matches IEEE 1800-2023 §20.6.1.
+        if concrete.contains('[') || concrete.contains(' ') {
+            let head = concrete
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if matches!(
+                head,
+                "bit"
+                    | "logic"
+                    | "reg"
+                    | "byte"
+                    | "shortint"
+                    | "int"
+                    | "longint"
+                    | "integer"
+                    | "time"
+                    | "real"
+                    | "shortreal"
+                    | "realtime"
+            ) && let Some(dt) = self.resolve_type_binding_dt(concrete)
+            {
+                return self.typename_of_dt(&dt);
+            }
+        }
         concrete.to_string()
     }
 

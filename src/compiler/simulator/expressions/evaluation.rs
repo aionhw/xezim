@@ -4566,6 +4566,13 @@ impl Simulator {
                 v
             }
             ExprKind::SystemCall { name, args } => {
+                if name == "$__xz_named_cast" && args.len() == 2 {
+                    if let Some(v) =
+                        self.try_eval_specialized_named_cast(expr, &args[0], &args[1], ctx_width)
+                    {
+                        return v;
+                    }
+                }
                 self.eval_expr_system_call(expr, ctx_width, name, args)
             }
             ExprKind::This => {

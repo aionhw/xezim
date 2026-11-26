@@ -90,9 +90,21 @@ impl Simulator {
         // So is a struct whose members name a type parameter (`typedef
         // struct packed { T inner; logic [3:0] tag; } wrap_t;`) with the
         // members bound: `w.inner` had no width in its layout.
+        let spec_res = if tp_concrete.is_none() {
+            super::elaborate::resolve_specialized_class_data_type(
+                data_type,
+                &self.module.parameters,
+                &self.module,
+            )
+        } else {
+            None
+        };
         let bound_typedef = match tp_concrete.as_deref() {
             Some(c) => self.bound_typedef_dt(c),
-            None => self.struct_with_bound_members(data_type),
+            None => spec_res
+                .as_ref()
+                .map(|r| r.data_type.clone())
+                .or_else(|| self.struct_with_bound_members(data_type)),
         };
         let resolved_dt: std::borrow::Cow<'a, DataType> = match bound_typedef {
             Some(dt) => std::borrow::Cow::Owned(dt),
@@ -102,36 +114,42 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
-        let scoped_class_w = match data_type {
-            crate::ast::types::DataType::TypeReference {
-                name, dimensions, ..
-            } if name.has_scope() => {
-                let width = self
-                    .scoped_inherited_typedef(name)
-                    .map(|(target, params)| {
-                        super::elaborate::resolve_type_width(
-                            &target,
-                            Some(&params),
-                            Some(&self.module.typedefs),
-                        )
+        let scoped_class_w = if let Some(res) = &spec_res {
+            Some(res.width)
+        } else {
+            match data_type {
+                crate::ast::types::DataType::TypeReference {
+                    name, dimensions, ..
+                } if name.has_scope() => {
+                    let width = self
+                        .scoped_inherited_typedef(name)
+                        .map(|(target, params)| {
+                            super::elaborate::resolve_type_width(
+                                &target,
+                                Some(&params),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .filter(|&w| w > 0)
+                        .or_else(|| {
+                            super::elaborate::specialized_class_scope_width(name, &self.module)
+                        });
+                    width.and_then(|w| {
+                        let mut total: u64 = u64::from(w);
+                        for d in dimensions {
+                            let crate::ast::types::PackedDimension::Range { left, right, .. } = d
+                            else {
+                                return None;
+                            };
+                            let l = super::elaborate::const_eval_i64_with_params(left, None)?;
+                            let r = super::elaborate::const_eval_i64_with_params(right, None)?;
+                            total = total.checked_mul(l.abs_diff(r) + 1)?;
+                        }
+                        u32::try_from(total).ok()
                     })
-                    .filter(|&w| w > 0)
-                    .or_else(|| super::elaborate::specialized_class_scope_width(name, &self.module));
-                width.and_then(|w| {
-                    let mut total: u64 = u64::from(w);
-                    for d in dimensions {
-                        let crate::ast::types::PackedDimension::Range { left, right, .. } = d
-                        else {
-                            return None;
-                        };
-                        let l = super::elaborate::const_eval_i64_with_params(left, None)?;
-                        let r = super::elaborate::const_eval_i64_with_params(right, None)?;
-                        total = total.checked_mul(l.abs_diff(r) + 1)?;
-                    }
-                    u32::try_from(total).ok()
-                })
+                }
+                _ => None,
             }
-            _ => None,
         };
         // §8.25: a local sized by a class parameter or localparam
         // (`bit [N-1:0] x;` in a method of `C #(N)`) takes the executing
@@ -700,6 +718,14 @@ impl Simulator {
                 self.claim_local_meta(&d.name.name, stmt);
             }
         }
+        let spec_udims: Vec<crate::ast::types::UnpackedDimension> =
+            super::elaborate::resolve_specialized_class_data_type(
+                data_type,
+                &self.module.parameters,
+                &self.module,
+            )
+            .map(|r| r.unpacked_dims)
+            .unwrap_or_default();
         let (resolved_dt, shape) = self.resolve_var_decl_shape(data_type);
         let data_type: &DataType = resolved_dt.as_ref();
         let VarDeclShape {
@@ -728,7 +754,9 @@ impl Simulator {
         let explicit_static = matches!(lifetime, Some(crate::ast::types::Lifetime::Static));
         let in_class_method = matches!(self.class_context_stack.last(), Some(Some(_)));
         // §6.18/§6.20.3: resolve typedef'd / type-param unpacked dims once per decl.
-        let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !plain_class {
+        let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !spec_udims.is_empty() {
+            spec_udims
+        } else if !plain_class {
             if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
                 let tn = &name.name.name;
                 let concrete = self

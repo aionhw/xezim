@@ -207,6 +207,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_undeclared_type_names(defs, elab, &pkg_names, &mut errs);
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
+    check_forward_typedefs(defs, elab, &mut errs);
+    check_unspecialized_class_scopes(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check_with_selection(defs, elab, &gen_sel));
         // §23.8: a hierarchical name that does not resolve is an error.
@@ -252,7 +254,6 @@ fn check_unit<'a>(
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
-    check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
     check_member_access_roots(u.items, errs);
     check_event_arguments(u.items, elab, errs);
@@ -5335,35 +5336,1608 @@ fn check_inherited_local_access(
     }
 }
 
-/// §8.25.1: outside its own declaration, a parameterized class is named with
-/// a parameter value list before `::` (`par_cls#()::b`), never bare.
-fn check_unspecialized_class_scope(
-    classes: &HashMap<&str, &ClassDeclaration>,
-    items: &[ModuleItem],
+/// §6.18 & §8.26.2: verify forward typedefs resolve within the same scope, match
+/// any explicitly specified basic data type (`enum`/`struct`/`union`/`class`/
+/// `interface class`), and do not have premature `C::T` value/variable uses or
+/// premature interface class `implements`/`extends` before the full definition.
+fn check_forward_typedefs(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
     errs: &mut Vec<String>,
 ) {
-    // Names the module declares as something other than a class.
-    let mut own = module_own_names(&PortList::Empty, &[], items);
-    for it in items {
-        if let ModuleItem::ClassDeclaration(c) = it {
-            own.remove(c.name.name.as_str());
+    use std::collections::{HashMap, HashSet};
+    use xezim_core::ast::decl::{
+        ForwardTypedefKind, FunctionDeclaration, PackageItem, TaskDeclaration,
+    };
+    use xezim_core::ast::stmt::ForInit;
+    use xezim_core::ast::types::StructUnionKind;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DefKind<'a> {
+        Class,
+        InterfaceClass,
+        Enum,
+        Struct,
+        Union,
+        TypeRef(Option<&'a str>),
+        TypeRefOpaque,
+        Other,
+    }
+
+    fn classify_full_typedef<'a>(td: &'a TypedefDeclaration) -> DefKind<'a> {
+        if matches!(
+            td.data_type,
+            DataType::Interface {
+                modport: Some(_),
+                ..
+            }
+        ) || !td.iface_selects.is_empty()
+        {
+            return DefKind::TypeRefOpaque;
+        }
+        match &td.data_type {
+            DataType::Enum(_) => DefKind::Enum,
+            DataType::Struct(su) => {
+                if su.kind == StructUnionKind::Union {
+                    DefKind::Union
+                } else {
+                    DefKind::Struct
+                }
+            }
+            DataType::TypeReference { name, .. } => {
+                if !name.has_scope() {
+                    DefKind::TypeRef(Some(name.name.name.as_str()))
+                } else {
+                    DefKind::TypeRefOpaque
+                }
+            }
+            _ => DefKind::Other,
         }
     }
-    let mut hits: Vec<String> = Vec::new();
-    module_exprs(items, &mut |e| {
-        for_each_expr(e, &mut |x| {
-            if let ExprKind::MemberAccess { expr, .. } = &x.kind
-                && let ExprKind::Ident(h) = &expr.kind
-                && h.path.len() == 1
-                && h.path[0].selects.is_empty()
-                && let n = h.path[0].name.name.as_str()
-                && classes.get(n).is_some_and(|c| !c.params.is_empty())
-                && !own.contains(n)
-            {
-                hits.push(n.to_string());
+
+    fn resolve_def_kind<'a>(
+        kind: DefKind<'a>,
+        defs_in_scope: &HashMap<&'a str, (usize, DefKind<'a>)>,
+    ) -> DefKind<'a> {
+        let mut cur = kind;
+        for _ in 0..8 {
+            match cur {
+                DefKind::TypeRef(Some(target)) => {
+                    if let Some((_, next)) = defs_in_scope.get(target) {
+                        cur = *next;
+                    } else {
+                        return DefKind::TypeRefOpaque;
+                    }
+                }
+                other => return other,
             }
-        })
-    });
+        }
+        DefKind::TypeRefOpaque
+    }
+
+    fn kind_matches(fwd: ForwardTypedefKind, actual: DefKind<'_>) -> bool {
+        match fwd {
+            ForwardTypedefKind::None | ForwardTypedefKind::Bare => true,
+            ForwardTypedefKind::Enum => matches!(actual, DefKind::Enum | DefKind::TypeRefOpaque),
+            ForwardTypedefKind::Struct => matches!(actual, DefKind::Struct | DefKind::TypeRefOpaque),
+            ForwardTypedefKind::Union => matches!(actual, DefKind::Union | DefKind::TypeRefOpaque),
+            ForwardTypedefKind::Class => matches!(actual, DefKind::Class | DefKind::TypeRefOpaque),
+            ForwardTypedefKind::InterfaceClass => {
+                matches!(actual, DefKind::InterfaceClass | DefKind::TypeRefOpaque)
+            }
+        }
+    }
+
+    fn fwd_kind_label(fwd: ForwardTypedefKind) -> &'static str {
+        match fwd {
+            ForwardTypedefKind::Enum => "enum",
+            ForwardTypedefKind::Struct => "struct",
+            ForwardTypedefKind::Union => "union",
+            ForwardTypedefKind::Class => "class",
+            ForwardTypedefKind::InterfaceClass => "interface class",
+            ForwardTypedefKind::Bare | ForwardTypedefKind::None => "typedef",
+        }
+    }
+
+    fn is_premature<'a>(
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        name: &str,
+        idx: usize,
+    ) -> bool {
+        first_fwd.get(name).is_some_and(|&(fidx, _)| fidx < idx)
+            && first_def.get(name).is_some_and(|&(didx, _)| idx < didx)
+    }
+
+    fn check_scoped_dt<'a>(
+        dt: &DataType,
+        idx: usize,
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        errs: &mut Vec<String>,
+    ) {
+        match dt {
+            DataType::TypeReference { name, .. } => {
+                if let Some(first_scope) = name.scopes.first() {
+                    let s = first_scope.name.name.as_str();
+                    if is_premature(first_fwd, first_def, s, idx) {
+                        errs.push(format!(
+                            "cannot select member type '{}::{}' before forward typedef '{s}' is \
+                             completed (IEEE 1800-2023 §6.18)",
+                            s, name.name.name
+                        ));
+                    }
+                }
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    check_scoped_dt(&m.data_type, idx, first_fwd, first_def, errs);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(bt) = &et.base_type {
+                    check_scoped_dt(bt, idx, first_fwd, first_def, errs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_stmt_dts<'a>(
+        st: &Statement,
+        idx: usize,
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        errs: &mut Vec<String>,
+    ) {
+        for_each_stmt(st, &mut |s| match &s.kind {
+            StatementKind::VarDecl { data_type, .. }
+            | StatementKind::ParamDecl { data_type, .. } => {
+                check_scoped_dt(data_type, idx, first_fwd, first_def, errs);
+            }
+            StatementKind::For { init, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl { data_type, .. } = i {
+                        check_scoped_dt(data_type, idx, first_fwd, first_def, errs);
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn check_func<'a>(
+        f: &FunctionDeclaration,
+        idx: usize,
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        errs: &mut Vec<String>,
+    ) {
+        check_scoped_dt(&f.return_type, idx, first_fwd, first_def, errs);
+        for p in &f.ports {
+            check_scoped_dt(&p.data_type, idx, first_fwd, first_def, errs);
+        }
+        for st in f.items.iter() {
+            check_stmt_dts(st, idx, first_fwd, first_def, errs);
+        }
+    }
+
+    fn check_task<'a>(
+        t: &TaskDeclaration,
+        idx: usize,
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        errs: &mut Vec<String>,
+    ) {
+        for p in &t.ports {
+            check_scoped_dt(&p.data_type, idx, first_fwd, first_def, errs);
+        }
+        for st in t.items.iter() {
+            check_stmt_dts(st, idx, first_fwd, first_def, errs);
+        }
+    }
+
+    fn check_class_item_dts<'a>(
+        c: &ClassDeclaration,
+        idx: usize,
+        first_fwd: &HashMap<&'a str, (usize, ForwardTypedefKind)>,
+        first_def: &HashMap<&'a str, (usize, DefKind<'a>)>,
+        errs: &mut Vec<String>,
+    ) {
+        for p in &c.params {
+            if let ParameterKind::Data { data_type, .. } = &p.kind {
+                check_scoped_dt(data_type, idx, first_fwd, first_def, errs);
+            }
+        }
+        for imp in &c.implements {
+            let n = imp.name.as_str();
+            if is_premature(first_fwd, first_def, n, idx)
+                && (first_fwd[n].1 == ForwardTypedefKind::InterfaceClass
+                    || matches!(first_def.get(n), Some((_, DefKind::InterfaceClass))))
+            {
+                errs.push(format!(
+                    "class '{}' cannot implement forward interface class '{n}' before its \
+                     definition (IEEE 1800-2023 §8.26.2)",
+                    c.name.name
+                ));
+            }
+        }
+        if c.is_interface
+            && let Some(ext) = &c.extends
+            && ext.scopes.is_empty()
+        {
+            let n = ext.name.name.as_str();
+            if is_premature(first_fwd, first_def, n, idx)
+                && (first_fwd[n].1 == ForwardTypedefKind::InterfaceClass
+                    || matches!(first_def.get(n), Some((_, DefKind::InterfaceClass))))
+            {
+                errs.push(format!(
+                    "interface class '{}' cannot extend forward interface class '{n}' before its \
+                     definition (IEEE 1800-2023 §8.26.2)",
+                    c.name.name
+                ));
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => {
+                    check_scoped_dt(&pr.data_type, idx, first_fwd, first_def, errs);
+                }
+                ClassItem::Parameter(pd) => {
+                    if let ParameterKind::Data { data_type, .. } = &pd.kind {
+                        check_scoped_dt(data_type, idx, first_fwd, first_def, errs);
+                    }
+                }
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => {
+                        check_func(f, idx, first_fwd, first_def, errs);
+                    }
+                    ClassMethodKind::Task(t) => check_task(t, idx, first_fwd, first_def, errs),
+                },
+                _ => {}
+            }
+        }
+    }
+
+    enum ScopeEntry<'a> {
+        ForwardTypedef(&'a TypedefDeclaration),
+        FullTypedef(&'a TypedefDeclaration),
+        Class(&'a ClassDeclaration),
+        ModuleItem(&'a ModuleItem),
+        PackageItem(&'a PackageItem),
+        ClassItem(&'a ClassItem),
+    }
+
+    fn verify_scope<'a>(entries: Vec<ScopeEntry<'a>>, errs: &mut Vec<String>) {
+        let mut first_def: HashMap<&'a str, (usize, DefKind<'a>)> = HashMap::new();
+        let mut first_fwd: HashMap<&'a str, (usize, ForwardTypedefKind)> = HashMap::new();
+        let mut fwds: Vec<&'a TypedefDeclaration> = Vec::new();
+        for (idx, ent) in entries.iter().enumerate() {
+            match ent {
+                ScopeEntry::ForwardTypedef(td) => {
+                    fwds.push(td);
+                    first_fwd
+                        .entry(td.name.name.as_str())
+                        .or_insert((idx, td.forward_kind));
+                }
+                ScopeEntry::FullTypedef(td) => {
+                    first_def
+                        .entry(td.name.name.as_str())
+                        .or_insert((idx, classify_full_typedef(td)));
+                }
+                ScopeEntry::Class(c) => {
+                    let dk = if c.is_interface {
+                        DefKind::InterfaceClass
+                    } else {
+                        DefKind::Class
+                    };
+                    first_def.entry(c.name.name.as_str()).or_insert((idx, dk));
+                }
+                _ => {}
+            }
+        }
+        let mut checked_names: HashSet<&'a str> = HashSet::new();
+        for td in fwds {
+            let n = td.name.name.as_str();
+            match first_def.get(n) {
+                None => {
+                    if checked_names.insert(n) {
+                        errs.push(format!(
+                            "forward typedef '{n}' does not resolve to a data type in the same \
+                             scope (IEEE 1800-2023 §6.18)"
+                        ));
+                    }
+                }
+                Some((_, raw_dk)) => {
+                    let resolved = resolve_def_kind(*raw_dk, &first_def);
+                    if !kind_matches(td.forward_kind, resolved) {
+                        errs.push(format!(
+                            "forward '{} {n}' does not match its actual definition (IEEE 1800-2023 \
+                             §6.18)",
+                            fwd_kind_label(td.forward_kind)
+                        ));
+                    }
+                }
+            }
+        }
+        if first_fwd.is_empty() {
+            return;
+        }
+        for (idx, ent) in entries.iter().enumerate() {
+            match ent {
+                ScopeEntry::Class(c) => {
+                    check_class_item_dts(c, idx, &first_fwd, &first_def, errs);
+                }
+                ScopeEntry::ModuleItem(mi) => match mi {
+                    ModuleItem::DataDeclaration(d) => {
+                        check_scoped_dt(&d.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::NetDeclaration(d) => {
+                        check_scoped_dt(&d.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::PortDeclaration(d) => {
+                        check_scoped_dt(&d.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                        if let ParameterKind::Data { data_type, .. } = &pd.kind {
+                            check_scoped_dt(data_type, idx, &first_fwd, &first_def, errs);
+                        }
+                    }
+                    ModuleItem::FunctionDeclaration(f) => {
+                        check_func(f, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::TaskDeclaration(t) => {
+                        check_task(t, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::InitialConstruct(i) => {
+                        check_stmt_dts(&i.stmt, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::AlwaysConstruct(a) => {
+                        check_stmt_dts(&a.stmt, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::FinalConstruct(f) => {
+                        check_stmt_dts(&f.stmt, idx, &first_fwd, &first_def, errs);
+                    }
+                    ModuleItem::ClassDeclaration(c) => {
+                        check_class_item_dts(c, idx, &first_fwd, &first_def, errs);
+                    }
+                    _ => {}
+                },
+                ScopeEntry::PackageItem(pi) => match pi {
+                    PackageItem::Data(d) => {
+                        check_scoped_dt(&d.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    PackageItem::Net(d) => {
+                        check_scoped_dt(&d.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    PackageItem::Parameter(pd) => {
+                        if let ParameterKind::Data { data_type, .. } = &pd.kind {
+                            check_scoped_dt(data_type, idx, &first_fwd, &first_def, errs);
+                        }
+                    }
+                    PackageItem::Function(f) => {
+                        check_func(f, idx, &first_fwd, &first_def, errs);
+                    }
+                    PackageItem::Task(t) => {
+                        check_task(t, idx, &first_fwd, &first_def, errs);
+                    }
+                    PackageItem::Class(c) => {
+                        check_class_item_dts(c, idx, &first_fwd, &first_def, errs);
+                    }
+                    _ => {}
+                },
+                ScopeEntry::ClassItem(ci) => match ci {
+                    ClassItem::Property(pr) => {
+                        check_scoped_dt(&pr.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    ClassItem::Parameter(pd) => {
+                        if let ParameterKind::Data { data_type, .. } = &pd.kind {
+                            check_scoped_dt(data_type, idx, &first_fwd, &first_def, errs);
+                        }
+                    }
+                    ClassItem::Method(m) => match &m.kind {
+                        ClassMethodKind::Function(f)
+                        | ClassMethodKind::PureVirtual(f)
+                        | ClassMethodKind::Extern(f) => {
+                            check_func(f, idx, &first_fwd, &first_def, errs);
+                        }
+                        ClassMethodKind::Task(t) => {
+                            check_task(t, idx, &first_fwd, &first_def, errs);
+                        }
+                    },
+                    ClassItem::Class(c) => {
+                        check_class_item_dts(c, idx, &first_fwd, &first_def, errs);
+                    }
+                    _ => {}
+                },
+                ScopeEntry::ForwardTypedef(_) | ScopeEntry::FullTypedef(_) => {}
+            }
+        }
+    }
+
+    fn walk_class<'a>(c: &'a ClassDeclaration, errs: &mut Vec<String>) {
+        let mut entries = Vec::with_capacity(c.items.len());
+        for it in &c.items {
+            match it {
+                ClassItem::Typedef(td) if td.forward_kind != ForwardTypedefKind::None => {
+                    entries.push(ScopeEntry::ForwardTypedef(td));
+                }
+                ClassItem::Typedef(td) => entries.push(ScopeEntry::FullTypedef(td)),
+                ClassItem::Class(inner) => {
+                    walk_class(inner, errs);
+                    entries.push(ScopeEntry::Class(inner));
+                }
+                other => entries.push(ScopeEntry::ClassItem(other)),
+            }
+        }
+        verify_scope(entries, errs);
+    }
+
+    fn flatten_generate_regions<'a>(items: &'a [ModuleItem], out: &mut Vec<&'a ModuleItem>) {
+        for it in items {
+            match it {
+                ModuleItem::GenerateRegion(g) => flatten_generate_regions(&g.items, out),
+                other => out.push(other),
+            }
+        }
+    }
+
+    fn walk_module_items<'a>(
+        items: &'a [ModuleItem],
+        non_unit_class_names: &mut HashSet<&'a str>,
+        errs: &mut Vec<String>,
+    ) {
+        let mut flat = Vec::new();
+        flatten_generate_regions(items, &mut flat);
+        let mut entries = Vec::with_capacity(flat.len());
+        for &it in &flat {
+            match it {
+                ModuleItem::TypedefDeclaration(td)
+                    if td.forward_kind != ForwardTypedefKind::None =>
+                {
+                    entries.push(ScopeEntry::ForwardTypedef(td));
+                }
+                ModuleItem::TypedefDeclaration(td) => entries.push(ScopeEntry::FullTypedef(td)),
+                ModuleItem::ClassDeclaration(c) => {
+                    non_unit_class_names.insert(c.name.name.as_str());
+                    walk_class(c, errs);
+                    entries.push(ScopeEntry::Class(c));
+                }
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, branch) in &gi.branches {
+                        walk_module_items(branch, non_unit_class_names, errs);
+                    }
+                    entries.push(ScopeEntry::ModuleItem(it));
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    walk_module_items(&gf.items, non_unit_class_names, errs);
+                    entries.push(ScopeEntry::ModuleItem(it));
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        walk_module_items(&arm.items, non_unit_class_names, errs);
+                    }
+                    entries.push(ScopeEntry::ModuleItem(it));
+                }
+                other => entries.push(ScopeEntry::ModuleItem(other)),
+            }
+        }
+        verify_scope(entries, errs);
+    }
+
+    let mut unit_classes: HashMap<&str, &ClassDeclaration> = HashMap::new();
+    let mut non_unit_class_names: HashSet<&str> = HashSet::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Class(c) => {
+                unit_classes.insert(c.name.name.as_str(), c);
+                walk_class(c, errs);
+            }
+            SourceDefinition::Package(p) => {
+                let mut entries = Vec::with_capacity(p.items.len());
+                for it in &p.items {
+                    match it {
+                        PackageItem::Typedef(td)
+                            if td.forward_kind != ForwardTypedefKind::None =>
+                        {
+                            entries.push(ScopeEntry::ForwardTypedef(td));
+                        }
+                        PackageItem::Typedef(td) => entries.push(ScopeEntry::FullTypedef(td)),
+                        PackageItem::Class(c) => {
+                            non_unit_class_names.insert(c.name.name.as_str());
+                            walk_class(c, errs);
+                            entries.push(ScopeEntry::Class(c));
+                        }
+                        other => entries.push(ScopeEntry::PackageItem(other)),
+                    }
+                }
+                verify_scope(entries, errs);
+            }
+            SourceDefinition::Module(m) => {
+                walk_module_items(&m.items, &mut non_unit_class_names, errs)
+            }
+            SourceDefinition::Interface(i) => {
+                walk_module_items(&i.items, &mut non_unit_class_names, errs)
+            }
+            SourceDefinition::Program(p) => {
+                walk_module_items(&p.items, &mut non_unit_class_names, errs)
+            }
+            SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => {}
+        }
+    }
+
+    for d in defs {
+        if let SourceDefinition::Typedef(td) = d
+            && td.forward_kind != ForwardTypedefKind::None
+        {
+            let n = td.name.name.as_str();
+            let unit_def = unit_classes
+                .get(n)
+                .map(|c| {
+                    if c.is_interface {
+                        DefKind::InterfaceClass
+                    } else {
+                        DefKind::Class
+                    }
+                })
+                .or_else(|| {
+                    (!non_unit_class_names.contains(n))
+                        .then(|| {
+                            elab.classes.get(n).and_then(|ec| {
+                                (ec.declaring_module.is_none() && ec.enclosing.is_none()).then_some(
+                                    if ec.is_interface {
+                                        DefKind::InterfaceClass
+                                    } else {
+                                        DefKind::Class
+                                    },
+                                )
+                            })
+                        })
+                        .flatten()
+                });
+            match unit_def {
+                None => errs.push(format!(
+                    "forward typedef '{n}' does not resolve to a data type in the same scope \
+                     (IEEE 1800-2023 §6.18)"
+                )),
+                Some(dk) => {
+                    if !kind_matches(td.forward_kind, dk) {
+                        errs.push(format!(
+                            "forward '{} {n}' does not match its actual definition (IEEE 1800-2023 \
+                             §6.18)",
+                            fwd_kind_label(td.forward_kind)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §8.25.1 & §6.25: outside its own declaration, a parameterized class is named
+/// with a parameter value list (`par_cls#()::member`), never bare, across both
+/// type references (`PC::T`, `pkg::PC::T`) and scoped expressions (`PC::K`,
+/// `PC::T'(x)`, `pkg::PC::K`).
+fn check_unspecialized_class_scopes(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
+    use std::collections::{HashMap, HashSet};
+    use xezim_core::ast::decl::{
+        FunctionDeclaration, ImportDeclaration, PackageItem, TaskDeclaration,
+    };
+    use xezim_core::ast::stmt::ForInit;
+
+    let mut unit_classes: HashMap<&str, &ClassDeclaration> = HashMap::new();
+    let mut pkg_classes: HashMap<(&str, &str), &ClassDeclaration> = HashMap::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Class(c) => {
+                unit_classes.insert(c.name.name.as_str(), c);
+            }
+            SourceDefinition::Package(p) => {
+                for it in &p.items {
+                    if let PackageItem::Class(c) = it {
+                        pkg_classes.insert((p.name.name.as_str(), c.name.name.as_str()), c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    struct ScopeEnv<'a> {
+        visible: HashMap<&'a str, &'a ClassDeclaration>,
+        local_classes: HashSet<&'a str>,
+        own: HashSet<&'a str>,
+        unit_classes: &'a HashMap<&'a str, &'a ClassDeclaration>,
+        pkg_classes: &'a HashMap<(&'a str, &'a str), &'a ClassDeclaration>,
+    }
+
+    fn apply_import<'a>(
+        imp: &'a ImportDeclaration,
+        visible: &mut HashMap<&'a str, &'a ClassDeclaration>,
+        pkg_classes: &HashMap<(&'a str, &'a str), &'a ClassDeclaration>,
+    ) {
+        for item in &imp.items {
+            let pkg = item.package.name.as_str();
+            match &item.item {
+                Some(sym) if sym.name != "*" => {
+                    if let Some(&cls) = pkg_classes.get(&(pkg, sym.name.as_str())) {
+                        visible.insert(cls.name.name.as_str(), cls);
+                    }
+                }
+                _ => {
+                    for (&(p, sym), &cls) in pkg_classes {
+                        if p == pkg {
+                            visible.insert(sym, cls);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_stmt_locals<'a>(s: &'a Statement, out: &mut HashSet<&'a str>) {
+        match &s.kind {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
+                out.extend(declarators.iter().map(|d| d.name.name.as_str()));
+            }
+            StatementKind::Typedef(td) => {
+                out.insert(td.name.name.as_str());
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                collect_stmt_locals(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    collect_stmt_locals(e, out);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    collect_stmt_locals(&it.stmt, out);
+                }
+            }
+            StatementKind::For { init, body, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        out.insert(name.name.as_str());
+                    }
+                }
+                collect_stmt_locals(body, out);
+            }
+            StatementKind::Foreach { vars, body, .. } => {
+                for v in vars.iter().flatten() {
+                    out.insert(v.name.as_str());
+                }
+                collect_stmt_locals(body, out);
+            }
+            StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => collect_stmt_locals(body, out),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for sub in stmts.iter() {
+                    collect_stmt_locals(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_data_type<'a>(
+        dt: &DataType,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        match dt {
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } => {
+                if !name.scopes.is_empty() {
+                    let s0 = name.scopes[0].name.name.as_str();
+                    let mut nested_cur: Option<&ClassDeclaration> = None;
+                    let mut start_nested = 0usize;
+                    if name.scopes.len() >= 2
+                        && !env.own.contains(s0)
+                        && !env.local_classes.contains(s0)
+                        && let Some(&c) = env
+                            .pkg_classes
+                            .get(&(s0, name.scopes[1].name.name.as_str()))
+                    {
+                        let l1 = &name.scopes[1];
+                        if !c.params.is_empty()
+                            && l1.type_args.is_empty()
+                            && !name.bound.has_explicit_empty_spec(1)
+                            && !enclosing.contains(&c.name.name.as_str())
+                        {
+                            hits.push(c.name.name.clone());
+                        }
+                        nested_cur = Some(c);
+                        start_nested = 2;
+                    } else if !env.own.contains(s0)
+                        && let Some(&c) = env.visible.get(s0)
+                    {
+                        let l0 = &name.scopes[0];
+                        if !c.params.is_empty()
+                            && l0.type_args.is_empty()
+                            && !name.bound.has_explicit_empty_spec(0)
+                            && !enclosing.contains(&c.name.name.as_str())
+                        {
+                            hits.push(c.name.name.clone());
+                        }
+                        nested_cur = Some(c);
+                        start_nested = 1;
+                    }
+                    let mut cur = nested_cur;
+                    for (idx, link) in name.scopes.iter().enumerate().skip(start_nested) {
+                        let Some(outer) = cur else { break };
+                        let next = outer.items.iter().find_map(|it| match it {
+                            ClassItem::Class(ic) if ic.name.name == link.name.name => Some(&**ic),
+                            _ => None,
+                        });
+                        if let Some(ic) = next {
+                            if !ic.params.is_empty()
+                                && link.type_args.is_empty()
+                                && !name.bound.has_explicit_empty_spec(idx)
+                                && !enclosing.contains(&ic.name.name.as_str())
+                            {
+                                hits.push(ic.name.name.clone());
+                            }
+                            cur = Some(ic);
+                        } else {
+                            cur = None;
+                        }
+                    }
+                }
+                for s in &name.scopes {
+                    for arg in &s.type_args {
+                        check_expr(arg, env, enclosing, hits);
+                    }
+                }
+                for d in dimensions {
+                    if let PackedDimension::Range { left, right, .. } = d {
+                        check_expr(left, env, enclosing, hits);
+                        check_expr(right, env, enclosing, hits);
+                    }
+                }
+                for arg in type_args {
+                    check_expr(arg, env, enclosing, hits);
+                }
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    check_data_type(&m.data_type, env, enclosing, hits);
+                    for d in &m.declarators {
+                        check_udims(&d.dimensions, env, enclosing, hits);
+                    }
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(bt) = &et.base_type {
+                    check_data_type(bt, env, enclosing, hits);
+                }
+            }
+            DataType::Interface { type_args, .. } => {
+                for arg in type_args {
+                    check_expr(arg, env, enclosing, hits);
+                }
+            }
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. } => {
+                for d in dimensions {
+                    if let PackedDimension::Range { left, right, .. } = d {
+                        check_expr(left, env, enclosing, hits);
+                        check_expr(right, env, enclosing, hits);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_udims<'a>(
+        udims: &[UnpackedDimension],
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        for d in udims {
+            match d {
+                UnpackedDimension::Associative {
+                    data_type: Some(dt), ..
+                } => {
+                    check_data_type(dt, env, enclosing, hits);
+                }
+                UnpackedDimension::Range { left, right, .. } => {
+                    check_expr(left, env, enclosing, hits);
+                    check_expr(right, env, enclosing, hits);
+                }
+                UnpackedDimension::Expression { expr, .. } => {
+                    check_expr(expr, env, enclosing, hits);
+                }
+                UnpackedDimension::Queue {
+                    max_size: Some(e), ..
+                } => {
+                    check_expr(e, env, enclosing, hits);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_expr<'a>(
+        e: &Expression,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        check_expr_ctx(e, env, enclosing, false, hits);
+    }
+
+    fn check_expr_ctx<'a>(
+        e: &Expression,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        in_type_ctx: bool,
+        hits: &mut Vec<String>,
+    ) {
+        match &e.kind {
+            ExprKind::TypeLiteral(dt) => check_data_type(dt, env, enclosing, hits),
+            ExprKind::TypedPattern { ty, pattern } => {
+                check_data_type(ty, env, enclosing, hits);
+                check_expr(pattern, env, enclosing, hits);
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    match it {
+                        AssignmentPatternItem::Typed(dt, ex) => {
+                            check_data_type(dt, env, enclosing, hits);
+                            check_expr(ex, env, enclosing, hits);
+                        }
+                        AssignmentPatternItem::Keyed(k, v) => {
+                            check_expr(k, env, enclosing, hits);
+                            check_expr(v, env, enclosing, hits);
+                        }
+                        other => check_expr(other.expr(), env, enclosing, hits),
+                    }
+                }
+            }
+            ExprKind::Specialization { base, .. } => {
+                // The immediate class reference inside `base` has `#(...)` applied
+                // to it; still recurse into deeper prefix qualifiers if any.
+                match &base.kind {
+                    ExprKind::Ident(_) => {}
+                    ExprKind::MemberAccess { expr: inner, .. }
+                        if matches!(&inner.kind, ExprKind::Ident(h) if h.path.len() == 1) => {}
+                    ExprKind::MemberAccess { expr: inner, .. } => {
+                        check_expr(inner, env, enclosing, hits);
+                    }
+                    _ => check_expr(base, env, enclosing, hits),
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if member.name == "new" {
+                    return;
+                }
+                match &expr.kind {
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty() =>
+                    {
+                        let n = h.path[0].name.name.as_str();
+                        if env.visible.get(n).is_some_and(|c| !c.params.is_empty())
+                            && !env.own.contains(n)
+                            && !enclosing.contains(&n)
+                        {
+                            hits.push(n.to_string());
+                        }
+                    }
+                    ExprKind::MemberAccess {
+                        expr: inner,
+                        member: cls_id,
+                    } if matches!(
+                        &inner.kind,
+                        ExprKind::Ident(h)
+                            if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+                    ) =>
+                    {
+                        let ExprKind::Ident(h) = &inner.kind else {
+                            unreachable!();
+                        };
+                        let pkg = h.path[0].name.name.as_str();
+                        let cls = cls_id.name.as_str();
+                        if !env.own.contains(pkg)
+                            && !env.local_classes.contains(pkg)
+                            && let Some(&c) = env.pkg_classes.get(&(pkg, cls))
+                        {
+                            if in_type_ctx && !c.params.is_empty() && !enclosing.contains(&cls) {
+                                hits.push(cls.to_string());
+                            }
+                        } else if !env.own.contains(pkg)
+                            && let Some(&outer) = env.visible.get(pkg)
+                        {
+                            if !outer.params.is_empty() && !enclosing.contains(&pkg) {
+                                hits.push(pkg.to_string());
+                            }
+                            if outer.items.iter().any(|it| {
+                                matches!(
+                                    it,
+                                    ClassItem::Class(ic)
+                                        if ic.name.name == cls && !ic.params.is_empty()
+                                )
+                            }) && !enclosing.contains(&cls)
+                            {
+                                hits.push(cls.to_string());
+                            }
+                        } else {
+                            check_expr(expr, env, enclosing, hits);
+                        }
+                    }
+                    _ => check_expr(expr, env, enclosing, hits),
+                }
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && !h.path.last().is_some_and(|s| s.name.name == "new") =>
+            {
+                let first = h.path[0].name.name.as_str();
+                if matches!(h.root, Some(xezim_core::ast::expr::HierRoot::Unit)) {
+                    if env.unit_classes.get(first).is_some_and(|c| !c.params.is_empty())
+                        && !enclosing.contains(&first)
+                    {
+                        hits.push(first.to_string());
+                    }
+                } else if h.root.is_none() && !env.own.contains(first) {
+                    let second = h.path[1].name.name.as_str();
+                    if !env.local_classes.contains(first)
+                        && let Some(&c) = env.pkg_classes.get(&(first, second))
+                    {
+                        if in_type_ctx && !c.params.is_empty() && !enclosing.contains(&second) {
+                            hits.push(second.to_string());
+                        }
+                    } else if env.visible.get(first).is_some_and(|c| !c.params.is_empty())
+                        && !enclosing.contains(&first)
+                    {
+                        hits.push(first.to_string());
+                    }
+                }
+            }
+            ExprKind::Unary { operand, .. } => check_expr(operand, env, enclosing, hits),
+            ExprKind::Binary { left, right, .. } => {
+                check_expr(left, env, enclosing, hits);
+                check_expr(right, env, enclosing, hits);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                check_expr(condition, env, enclosing, hits);
+                check_expr(then_expr, env, enclosing, hits);
+                check_expr(else_expr, env, enclosing, hits);
+            }
+            ExprKind::Concatenation(xs) => {
+                xs.iter().for_each(|x| check_expr(x, env, enclosing, hits));
+            }
+            ExprKind::Replication { count, exprs } => {
+                check_expr(count, env, enclosing, hits);
+                exprs
+                    .iter()
+                    .for_each(|x| check_expr(x, env, enclosing, hits));
+            }
+            ExprKind::Call { func, args } => {
+                check_expr(func, env, enclosing, hits);
+                args.iter().for_each(|x| check_expr(x, env, enclosing, hits));
+            }
+            ExprKind::SystemCall { name, args } => {
+                for (idx, x) in args.iter().enumerate() {
+                    let is_cast_target = idx == 0 && name == "$__xz_named_cast";
+                    check_expr_ctx(x, env, enclosing, is_cast_target, hits);
+                }
+            }
+            ExprKind::NamedArg { expr: Some(ex), .. } => check_expr(ex, env, enclosing, hits),
+            ExprKind::Inside { expr, ranges } => {
+                check_expr(expr, env, enclosing, hits);
+                ranges
+                    .iter()
+                    .for_each(|x| check_expr(x, env, enclosing, hits));
+            }
+            ExprKind::Index { expr, index } => {
+                check_expr(expr, env, enclosing, hits);
+                check_expr(index, env, enclosing, hits);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                check_expr(expr, env, enclosing, hits);
+                check_expr(left, env, enclosing, hits);
+                check_expr(right, env, enclosing, hits);
+            }
+            ExprKind::Range(a, b) => {
+                check_expr(a, env, enclosing, hits);
+                check_expr(b, env, enclosing, hits);
+            }
+            ExprKind::Paren(x) | ExprKind::ShallowCopy { source: x } => {
+                check_expr(x, env, enclosing, hits);
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                check_expr(lvalue, env, enclosing, hits);
+                check_expr(rvalue, env, enclosing, hits);
+            }
+            ExprKind::WithClause { expr, filter } => {
+                check_expr(expr, env, enclosing, hits);
+                check_expr(filter, env, enclosing, hits);
+            }
+            ExprKind::RandomizeWith { call, .. } => check_expr(call, env, enclosing, hits),
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => {
+                if let Some(s) = slice_size {
+                    check_expr(s, env, enclosing, hits);
+                }
+                exprs
+                    .iter()
+                    .for_each(|x| check_expr(x, env, enclosing, hits));
+            }
+            ExprKind::Tagged { inner: Some(ex), .. } => check_expr(ex, env, enclosing, hits),
+            ExprKind::Matches { expr, .. } | ExprKind::SvaClocked { body: expr, .. } => {
+                check_expr(expr, env, enclosing, hits);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_stmt<'a>(
+        stmt: &'a Statement,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        for_each_stmt(stmt, &mut |s| match &s.kind {
+            StatementKind::Expr(e) => check_expr(e, env, enclosing, hits),
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                check_expr(lvalue, env, enclosing, hits);
+                check_expr(rvalue, env, enclosing, hits);
+            }
+            StatementKind::NonblockingAssign {
+                lvalue,
+                rvalue,
+                delay,
+            } => {
+                check_expr(lvalue, env, enclosing, hits);
+                check_expr(rvalue, env, enclosing, hits);
+                if let Some(d) = delay {
+                    check_expr(d, env, enclosing, hits);
+                }
+            }
+            StatementKind::If { condition, .. }
+            | StatementKind::While { condition, .. }
+            | StatementKind::DoWhile { condition, .. } => {
+                check_expr(condition, env, enclosing, hits);
+            }
+            StatementKind::Case { expr, .. } => check_expr(expr, env, enclosing, hits),
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                ..
+            } => {
+                for i in init {
+                    match i {
+                        ForInit::VarDecl {
+                            data_type, init: e, ..
+                        } => {
+                            check_data_type(data_type, env, enclosing, hits);
+                            check_expr(e, env, enclosing, hits);
+                        }
+                        ForInit::Assign { lvalue, rvalue } => {
+                            check_expr(lvalue, env, enclosing, hits);
+                            check_expr(rvalue, env, enclosing, hits);
+                        }
+                    }
+                }
+                if let Some(c) = condition {
+                    check_expr(c, env, enclosing, hits);
+                }
+                for st in step {
+                    check_expr(st, env, enclosing, hits);
+                }
+            }
+            StatementKind::Foreach { array, .. } => check_expr(array, env, enclosing, hits),
+            StatementKind::Repeat { count, .. } => check_expr(count, env, enclosing, hits),
+            StatementKind::Wait { condition, .. } => check_expr(condition, env, enclosing, hits),
+            StatementKind::Return(Some(e)) => check_expr(e, env, enclosing, hits),
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                check_data_type(data_type, env, enclosing, hits);
+                for d in declarators {
+                    check_udims(&d.dimensions, env, enclosing, hits);
+                    if let Some(init) = &d.init {
+                        check_expr(init, env, enclosing, hits);
+                    }
+                }
+            }
+            StatementKind::Typedef(td) => {
+                check_data_type(&td.data_type, env, enclosing, hits);
+                check_udims(&td.dimensions, env, enclosing, hits);
+            }
+            StatementKind::TimingControl { control, .. } => {
+                if let xezim_core::ast::stmt::TimingControl::Delay(e) = control {
+                    check_expr(e, env, enclosing, hits);
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn check_param_decl<'a>(
+        pd: &'a ParameterDeclaration,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        match &pd.kind {
+            ParameterKind::Data {
+                data_type,
+                assignments,
+            } => {
+                check_data_type(data_type, env, enclosing, hits);
+                for a in assignments {
+                    check_udims(&a.dimensions, env, enclosing, hits);
+                    if let Some(init) = &a.init {
+                        check_expr(init, env, enclosing, hits);
+                    }
+                }
+            }
+            ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    if let Some(dt) = &a.init {
+                        check_data_type(dt, env, enclosing, hits);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_func<'a>(
+        f: &'a FunctionDeclaration,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        let out_of_block = f.name.scopes.last().map(|s| s.name.name.as_str());
+        let mut enc_buf: Vec<&str> = enclosing.to_vec();
+        let mut local_own = env.own.clone();
+        if let Some(ooc) = out_of_block {
+            enc_buf.push(ooc);
+            if let Some(&cls) = env.visible.get(ooc) {
+                for it in &cls.items {
+                    match it {
+                        ClassItem::Property(pr) => {
+                            local_own.extend(pr.declarators.iter().map(|d| d.name.name.as_str()));
+                        }
+                        ClassItem::Typedef(td) => {
+                            local_own.insert(td.name.name.as_str());
+                        }
+                        ClassItem::Parameter(pd) => {
+                            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                                local_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for p in &f.ports {
+            local_own.insert(p.name.name.as_str());
+        }
+        for st in f.items.iter() {
+            collect_stmt_locals(st, &mut local_own);
+        }
+        let sub_env = ScopeEnv {
+            visible: env.visible.clone(),
+            local_classes: env.local_classes.clone(),
+            own: local_own,
+            unit_classes: env.unit_classes,
+            pkg_classes: env.pkg_classes,
+        };
+        check_data_type(&f.return_type, &sub_env, &enc_buf, hits);
+        for p in &f.ports {
+            check_data_type(&p.data_type, &sub_env, &enc_buf, hits);
+            check_udims(&p.dimensions, &sub_env, &enc_buf, hits);
+            if let Some(def) = &p.default {
+                check_expr(def, &sub_env, &enc_buf, hits);
+            }
+        }
+        for st in f.items.iter() {
+            check_stmt(st, &sub_env, &enc_buf, hits);
+        }
+    }
+
+    fn check_task<'a>(
+        t: &'a TaskDeclaration,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        let out_of_block = t.name.scopes.last().map(|s| s.name.name.as_str());
+        let mut enc_buf: Vec<&str> = enclosing.to_vec();
+        let mut local_own = env.own.clone();
+        if let Some(ooc) = out_of_block {
+            enc_buf.push(ooc);
+            if let Some(&cls) = env.visible.get(ooc) {
+                for it in &cls.items {
+                    if let ClassItem::Property(pr) = it {
+                        local_own.extend(pr.declarators.iter().map(|d| d.name.name.as_str()));
+                    }
+                }
+            }
+        }
+        for p in &t.ports {
+            local_own.insert(p.name.name.as_str());
+        }
+        for st in t.items.iter() {
+            collect_stmt_locals(st, &mut local_own);
+        }
+        let sub_env = ScopeEnv {
+            visible: env.visible.clone(),
+            local_classes: env.local_classes.clone(),
+            own: local_own,
+            unit_classes: env.unit_classes,
+            pkg_classes: env.pkg_classes,
+        };
+        for p in &t.ports {
+            check_data_type(&p.data_type, &sub_env, &enc_buf, hits);
+            check_udims(&p.dimensions, &sub_env, &enc_buf, hits);
+            if let Some(def) = &p.default {
+                check_expr(def, &sub_env, &enc_buf, hits);
+            }
+        }
+        for st in t.items.iter() {
+            check_stmt(st, &sub_env, &enc_buf, hits);
+        }
+    }
+
+    fn check_class<'a>(
+        c: &'a ClassDeclaration,
+        env: &ScopeEnv<'a>,
+        enclosing: &[&str],
+        hits: &mut Vec<String>,
+    ) {
+        let mut enc_buf: Vec<&str> = enclosing.to_vec();
+        enc_buf.push(c.name.name.as_str());
+        let mut cls_visible = env.visible.clone();
+        let mut cls_local = env.local_classes.clone();
+        let mut cls_own = env.own.clone();
+        for p in &c.params {
+            match &p.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    cls_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                }
+                ParameterKind::Type { assignments } => {
+                    cls_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                }
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Import(imp) => apply_import(imp, &mut cls_visible, env.pkg_classes),
+                ClassItem::Class(ic) => {
+                    cls_visible.insert(ic.name.name.as_str(), ic);
+                    cls_local.insert(ic.name.name.as_str());
+                    cls_own.remove(ic.name.name.as_str());
+                }
+                ClassItem::Property(pr) => {
+                    cls_own.extend(pr.declarators.iter().map(|d| d.name.name.as_str()));
+                }
+                ClassItem::Typedef(td) => {
+                    cls_own.insert(td.name.name.as_str());
+                }
+                ClassItem::Parameter(pd) => {
+                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                        cls_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                    } else if let ParameterKind::Type { assignments } = &pd.kind {
+                        cls_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let cls_env = ScopeEnv {
+            visible: cls_visible,
+            local_classes: cls_local,
+            own: cls_own,
+            unit_classes: env.unit_classes,
+            pkg_classes: env.pkg_classes,
+        };
+        for p in &c.params {
+            check_param_decl(p, &cls_env, &enc_buf, hits);
+        }
+        if let Some(ext) = &c.extends {
+            for arg in &ext.args {
+                match arg {
+                    xezim_core::ast::decl::ParamValue::Expr(ex) => {
+                        check_expr(ex, &cls_env, &enc_buf, hits);
+                    }
+                    xezim_core::ast::decl::ParamValue::Type(dt) => {
+                        check_data_type(dt, &cls_env, &enc_buf, hits);
+                    }
+                }
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => {
+                    check_data_type(&pr.data_type, &cls_env, &enc_buf, hits);
+                    for d in &pr.declarators {
+                        check_udims(&d.dimensions, &cls_env, &enc_buf, hits);
+                        if let Some(init) = &d.init {
+                            check_expr(init, &cls_env, &enc_buf, hits);
+                        }
+                    }
+                }
+                ClassItem::Typedef(td) => {
+                    check_data_type(&td.data_type, &cls_env, &enc_buf, hits);
+                    check_udims(&td.dimensions, &cls_env, &enc_buf, hits);
+                }
+                ClassItem::Parameter(pd) => check_param_decl(pd, &cls_env, &enc_buf, hits),
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => {
+                        check_func(f, &cls_env, &enc_buf, hits);
+                    }
+                    ClassMethodKind::Task(t) => check_task(t, &cls_env, &enc_buf, hits),
+                },
+                ClassItem::Class(ic) => check_class(ic, &cls_env, &enc_buf, hits),
+                _ => {}
+            }
+        }
+    }
+
+    fn check_module_items<'a>(
+        ports: &'a PortList,
+        params: &'a [ParameterDeclaration],
+        items: &'a [ModuleItem],
+        parent_env: &ScopeEnv<'a>,
+        hits: &mut Vec<String>,
+    ) {
+        let mut visible = parent_env.visible.clone();
+        let mut local_classes = parent_env.local_classes.clone();
+        let mut own = parent_env.own.clone();
+        for o in module_own_names(ports, params, items) {
+            own.insert(o);
+        }
+        for it in items {
+            match it {
+                ModuleItem::ImportDeclaration(imp) => {
+                    apply_import(imp, &mut visible, parent_env.pkg_classes);
+                }
+                ModuleItem::ClassDeclaration(c) => {
+                    visible.insert(c.name.name.as_str(), c);
+                    local_classes.insert(c.name.name.as_str());
+                    own.remove(c.name.name.as_str());
+                }
+                ModuleItem::GenerateRegion(g) => {
+                    let mut q: Vec<&ModuleItem> = g.items.iter().collect();
+                    let mut idx = 0;
+                    while idx < q.len() {
+                        match q[idx] {
+                            ModuleItem::GenerateRegion(inner) => {
+                                q.extend(inner.items.iter());
+                            }
+                            ModuleItem::ImportDeclaration(imp) => {
+                                apply_import(imp, &mut visible, parent_env.pkg_classes);
+                            }
+                            ModuleItem::ClassDeclaration(c) => {
+                                visible.insert(c.name.name.as_str(), c);
+                                local_classes.insert(c.name.name.as_str());
+                                own.remove(c.name.name.as_str());
+                            }
+                            _ => {}
+                        }
+                        idx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let env = ScopeEnv {
+            visible,
+            local_classes,
+            own,
+            unit_classes: parent_env.unit_classes,
+            pkg_classes: parent_env.pkg_classes,
+        };
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                if let Some(dt) = &p.data_type {
+                    check_data_type(dt, &env, &[], hits);
+                }
+                check_udims(&p.dimensions, &env, &[], hits);
+                if let Some(def) = &p.default {
+                    check_expr(def, &env, &[], hits);
+                }
+            }
+        }
+        for p in params {
+            check_param_decl(p, &env, &[], hits);
+        }
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    check_data_type(&d.data_type, &env, &[], hits);
+                    for v in &d.declarators {
+                        check_udims(&v.dimensions, &env, &[], hits);
+                        if let Some(init) = &v.init {
+                            check_expr(init, &env, &[], hits);
+                        }
+                    }
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    check_data_type(&d.data_type, &env, &[], hits);
+                    for v in &d.declarators {
+                        check_udims(&v.dimensions, &env, &[], hits);
+                        if let Some(init) = &v.init {
+                            check_expr(init, &env, &[], hits);
+                        }
+                    }
+                }
+                ModuleItem::PortDeclaration(d) => {
+                    check_data_type(&d.data_type, &env, &[], hits);
+                    for v in &d.declarators {
+                        check_udims(&v.dimensions, &env, &[], hits);
+                        if let Some(init) = &v.init {
+                            check_expr(init, &env, &[], hits);
+                        }
+                    }
+                }
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    check_param_decl(pd, &env, &[], hits);
+                }
+                ModuleItem::TypedefDeclaration(td) => {
+                    check_data_type(&td.data_type, &env, &[], hits);
+                    check_udims(&td.dimensions, &env, &[], hits);
+                }
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, r) in &ca.assignments {
+                        check_expr(l, &env, &[], hits);
+                        check_expr(r, &env, &[], hits);
+                    }
+                }
+                ModuleItem::InitialConstruct(i) => check_stmt(&i.stmt, &env, &[], hits),
+                ModuleItem::AlwaysConstruct(a) => check_stmt(&a.stmt, &env, &[], hits),
+                ModuleItem::FinalConstruct(f) => check_stmt(&f.stmt, &env, &[], hits),
+                ModuleItem::FunctionDeclaration(f) => check_func(f, &env, &[], hits),
+                ModuleItem::TaskDeclaration(t) => check_task(t, &env, &[], hits),
+                ModuleItem::ClassDeclaration(c) => check_class(c, &env, &[], hits),
+                ModuleItem::GenerateRegion(g) => {
+                    check_module_items(&PortList::Empty, &[], &g.items, &env, hits);
+                }
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, branch) in &gi.branches {
+                        check_module_items(&PortList::Empty, &[], branch, &env, hits);
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    check_module_items(&PortList::Empty, &[], &gf.items, &env, hits);
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        check_module_items(&PortList::Empty, &[], &arm.items, &env, hits);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let unit_env = ScopeEnv {
+        visible: unit_classes.clone(),
+        local_classes: HashSet::new(),
+        own: HashSet::new(),
+        unit_classes: &unit_classes,
+        pkg_classes: &pkg_classes,
+    };
+
+    let mut hits: Vec<String> = Vec::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Class(c) => check_class(c, &unit_env, &[], &mut hits),
+            SourceDefinition::Typedef(td) => {
+                check_data_type(&td.data_type, &unit_env, &[], &mut hits);
+                check_udims(&td.dimensions, &unit_env, &[], &mut hits);
+            }
+            SourceDefinition::Module(m) => {
+                check_module_items(&m.ports, &m.params, &m.items, &unit_env, &mut hits);
+            }
+            SourceDefinition::Interface(i) => {
+                check_module_items(&i.ports, &i.params, &i.items, &unit_env, &mut hits);
+            }
+            SourceDefinition::Program(p) => {
+                check_module_items(&p.ports, &p.params, &p.items, &unit_env, &mut hits);
+            }
+            SourceDefinition::Package(p) => {
+                let mut visible = unit_classes.clone();
+                let mut local_classes = HashSet::new();
+                for it in &p.items {
+                    match it {
+                        PackageItem::Import(imp) => {
+                            apply_import(imp, &mut visible, &pkg_classes);
+                        }
+                        PackageItem::Class(c) => {
+                            visible.insert(c.name.name.as_str(), c);
+                            local_classes.insert(c.name.name.as_str());
+                        }
+                        _ => {}
+                    }
+                }
+                let pkg_env = ScopeEnv {
+                    visible,
+                    local_classes,
+                    own: HashSet::new(),
+                    unit_classes: &unit_classes,
+                    pkg_classes: &pkg_classes,
+                };
+                for it in &p.items {
+                    match it {
+                        PackageItem::Parameter(pd) => {
+                            check_param_decl(pd, &pkg_env, &[], &mut hits);
+                        }
+                        PackageItem::Typedef(td) => {
+                            check_data_type(&td.data_type, &pkg_env, &[], &mut hits);
+                            check_udims(&td.dimensions, &pkg_env, &[], &mut hits);
+                        }
+                        PackageItem::Data(d) => {
+                            check_data_type(&d.data_type, &pkg_env, &[], &mut hits);
+                            for v in &d.declarators {
+                                check_udims(&v.dimensions, &pkg_env, &[], &mut hits);
+                                if let Some(init) = &v.init {
+                                    check_expr(init, &pkg_env, &[], &mut hits);
+                                }
+                            }
+                        }
+                        PackageItem::Net(d) => {
+                            check_data_type(&d.data_type, &pkg_env, &[], &mut hits);
+                            for v in &d.declarators {
+                                check_udims(&v.dimensions, &pkg_env, &[], &mut hits);
+                                if let Some(init) = &v.init {
+                                    check_expr(init, &pkg_env, &[], &mut hits);
+                                }
+                            }
+                        }
+                        PackageItem::Function(f) => check_func(f, &pkg_env, &[], &mut hits),
+                        PackageItem::Task(t) => check_task(t, &pkg_env, &[], &mut hits),
+                        PackageItem::Class(c) => check_class(c, &pkg_env, &[], &mut hits),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Udp(_) => {}
+        }
+    }
+
     hits.sort();
     hits.dedup();
     for n in hits {

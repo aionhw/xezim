@@ -5419,6 +5419,12 @@ impl Simulator {
                         .collect();
                     return Some((target_cls, frags.join(",")));
                 }
+                if tn.scopes.is_empty()
+                    && type_args.is_empty()
+                    && self.module.classes.contains_key(&target_cls)
+                {
+                    return Some((target_cls, String::new()));
+                }
                 if tn.scopes.is_empty() && type_args.is_empty() {
                     alias_name = tn.name.name;
                     continue;
@@ -5511,8 +5517,21 @@ impl Simulator {
         }
         let canon_sig = self.canonicalize_spec_sig(&cls_name, &raw_sig);
 
-        // Walk `cls_name` and its `extends` chain to find `leaf` in `typedef_targets`.
-        let mut cur_cls = cls_name.clone();
+        self.resolve_spec_class_member_dt(&cls_name, &orig_cls_name, &canon_sig, leaf, 0)
+    }
+
+    fn resolve_spec_class_member_dt(
+        &self,
+        cls_name: &str,
+        orig_cls_name: &str,
+        canon_sig: &str,
+        leaf: &str,
+        depth: u32,
+    ) -> Option<DataType> {
+        if depth >= 16 {
+            return None;
+        }
+        let mut cur_cls = cls_name.to_string();
         for _ in 0..32 {
             let cd = self.module.classes.get(&cur_cls)?;
             let bare_cls = cur_cls.rsplit_once("::").map_or(cur_cls.as_str(), |(_, r)| r);
@@ -5532,76 +5551,22 @@ impl Simulator {
                 });
             if let Some(target) = target {
                 let cur_sig = self
-                    .ancestor_spec(&cls_name, &canon_sig, &cur_cls)
-                    .unwrap_or_else(|| canon_sig.clone());
+                    .ancestor_spec(cls_name, canon_sig, &cur_cls)
+                    .unwrap_or_else(|| canon_sig.to_string());
                 let spec_args = Self::split_spec_args(&cur_sig);
-
-                // §8.25: `typedef T cw_t;` where `T` is a class type parameter.
-                if let DataType::TypeReference {
-                    name: tn,
-                    dimensions,
-                    type_args,
-                    ..
-                } = target
-                    && tn.scopes.is_empty()
-                    && type_args.is_empty()
-                    && cd.type_param_names.iter().any(|p| p == &tn.name.name)
-                    && let Some(pos) = cd.param_order.iter().position(|p| p == &tn.name.name)
-                    && let Some(arg) = spec_args.get(pos)
-                    && let Some(mut bound_dt) = self.resolve_type_binding_dt(arg)
-                {
-                    if !dimensions.is_empty() {
-                        match &mut bound_dt {
-                            DataType::IntegerVector {
-                                dimensions: bd, ..
-                            }
-                            | DataType::Implicit { dimensions: bd, .. }
-                            | DataType::TypeReference { dimensions: bd, .. } => {
-                                let mut merged = dimensions.clone();
-                                merged.extend(bd.drain(..));
-                                *bd = merged;
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Some(bound_dt);
-                }
-
-                // §8.25: `typedef logic [W-1:0] vec_t;` where packed dims
-                // reference a value parameter of the specialized class.
-                let has_value_params = cd
-                    .param_order
-                    .iter()
-                    .any(|p| !cd.type_param_names.iter().any(|tp| tp == p));
-                if has_value_params && Self::data_type_has_packed_dims(target) {
-                    let mut val_params: HashMap<String, Value> = HashMap::default();
-                    for (pn, init) in &cd.param_defaults {
-                        if let Some(init) = init
-                            && let Some(v) = super::elaborate::const_eval_i64_with_params(
-                                init,
-                                Some(&self.module.parameters),
-                            )
-                        {
-                            let mut val = Value::from_u64(v as u64, 32);
-                            val.is_signed = true;
-                            val_params.insert(pn.clone(), val);
-                        }
-                    }
-                    for (i, arg) in spec_args.iter().enumerate() {
-                        if let Some(pn) = cd.param_order.get(i)
-                            && !cd.type_param_names.iter().any(|tp| tp == pn)
-                            && let Ok(v) = arg.trim().parse::<i64>()
-                        {
-                            let mut val = Value::from_u64(v as u64, 32);
-                            val.is_signed = true;
-                            val_params.insert(pn.clone(), val);
-                        }
-                    }
-                    if !val_params.is_empty() {
-                        return Some(Self::fold_packed_dims_with_params(target, &val_params));
-                    }
-                }
-                return Some(target.clone());
+                let val_params = self.build_class_spec_val_params(cd, &spec_args);
+                return Some(self.subst_spec_class_member_dt(
+                    target,
+                    cd,
+                    &cur_cls,
+                    cls_name,
+                    orig_cls_name,
+                    canon_sig,
+                    &cur_sig,
+                    &spec_args,
+                    &val_params,
+                    depth + 1,
+                ));
             }
             let Some(next) = cd.extends.as_ref() else {
                 break;
@@ -5611,13 +5576,158 @@ impl Simulator {
         None
     }
 
-    fn data_type_has_packed_dims(dt: &DataType) -> bool {
-        match dt {
-            DataType::IntegerVector { dimensions, .. }
-            | DataType::Implicit { dimensions, .. }
-            | DataType::TypeReference { dimensions, .. } => !dimensions.is_empty(),
-            _ => false,
+    fn build_class_spec_val_params(
+        &self,
+        cd: &crate::elaborate::ElaboratedClass,
+        spec_args: &[String],
+    ) -> HashMap<String, Value> {
+        let mut val_params: HashMap<String, Value> = HashMap::default();
+        for (i, arg) in spec_args.iter().enumerate() {
+            if let Some(pn) = cd.param_order.get(i)
+                && !cd.type_param_names.iter().any(|tp| tp == pn)
+            {
+                let trimmed = arg.trim();
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    let mut val = Value::from_u64(v as u64, 32);
+                    val.is_signed = true;
+                    val_params.insert(pn.clone(), val);
+                } else if let Some(pv) = self.module.parameters.get(trimmed) {
+                    val_params.insert(pn.clone(), pv.clone());
+                }
+            }
         }
+        for (pn, init) in &cd.param_defaults {
+            if val_params.contains_key(pn) {
+                continue;
+            }
+            if let Some(init) = init {
+                let v = super::elaborate::eval_const_expr_val_env(
+                    init,
+                    &super::elaborate::ParamEnv::Overlay {
+                        base: &self.module.parameters,
+                        top: &val_params,
+                    },
+                );
+                val_params.insert(pn.clone(), v);
+            }
+        }
+        val_params
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subst_spec_class_member_dt(
+        &self,
+        target: &DataType,
+        cd: &crate::elaborate::ElaboratedClass,
+        cur_cls: &str,
+        root_cls: &str,
+        orig_cls: &str,
+        root_canon_sig: &str,
+        cur_sig: &str,
+        spec_args: &[String],
+        val_params: &HashMap<String, Value>,
+        depth: u32,
+    ) -> DataType {
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: val_params,
+        };
+        let flat_params: HashMap<String, Value> = super::elaborate::ParamLookup::rows(&env)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        match target {
+            DataType::TypeReference {
+                name: tn,
+                dimensions,
+                type_args,
+                ..
+            } if tn.scopes.is_empty() && type_args.is_empty() => {
+                if cd.type_param_names.iter().any(|p| p == &tn.name.name)
+                    && let Some(pos) = cd.param_order.iter().position(|p| p == &tn.name.name)
+                    && let Some(arg) = spec_args.get(pos)
+                    && let Some(bound_dt) = self.resolve_type_binding_dt(arg)
+                {
+                    let expanded = super::elaborate::apply_outer_packed_dims_dt(
+                        bound_dt,
+                        dimensions,
+                        &flat_params,
+                    );
+                    return Self::fold_packed_dims_with_params(&expanded, &flat_params);
+                }
+                if depth < 16
+                    && let Some(sib_dt) = self.resolve_spec_class_member_dt(
+                        cur_cls,
+                        cur_cls,
+                        cur_sig,
+                        &tn.name.name,
+                        depth + 1,
+                    )
+                {
+                    let expanded = super::elaborate::apply_outer_packed_dims_dt(
+                        sib_dt,
+                        dimensions,
+                        &flat_params,
+                    );
+                    return Self::fold_packed_dims_with_params(&expanded, &flat_params);
+                }
+                let _ = (root_cls, orig_cls, root_canon_sig);
+                Self::fold_packed_dims_with_params(target, &flat_params)
+            }
+            DataType::Struct(su) => {
+                let mut out = su.clone();
+                for m in &mut out.members {
+                    m.data_type = self.subst_spec_class_member_dt(
+                        &m.data_type,
+                        cd,
+                        cur_cls,
+                        root_cls,
+                        orig_cls,
+                        root_canon_sig,
+                        cur_sig,
+                        spec_args,
+                        val_params,
+                        depth + 1,
+                    );
+                }
+                let wrapped = DataType::Struct(out);
+                Self::fold_packed_dims_with_params(&wrapped, &flat_params)
+            }
+            DataType::Enum(et) => {
+                let mut out = et.clone();
+                if let Some(bt) = &et.base_type {
+                    out.base_type = Some(Box::new(self.subst_spec_class_member_dt(
+                        bt,
+                        cd,
+                        cur_cls,
+                        root_cls,
+                        orig_cls,
+                        root_canon_sig,
+                        cur_sig,
+                        spec_args,
+                        val_params,
+                        depth + 1,
+                    )));
+                }
+                let wrapped = DataType::Enum(out);
+                Self::fold_packed_dims_with_params(&wrapped, &flat_params)
+            }
+            _ => Self::fold_packed_dims_with_params(target, &flat_params),
+        }
+    }
+
+    pub(super) fn try_eval_specialized_named_cast(
+        &mut self,
+        call_expr: &Expression,
+        type_expr: &Expression,
+        val_expr: &Expression,
+        ctx_width: u32,
+    ) -> Option<Value> {
+        let dt = self.resolve_specialized_class_typedef_expr(type_expr)?;
+        let type_lit = Expression::new(ExprKind::TypeLiteral(Box::new(dt)), type_expr.span);
+        let args = vec![type_lit, val_expr.clone()];
+        let name = String::from("$__xz_type_cast");
+        Some(self.eval_expr_system_call(call_expr, ctx_width, &name, &args))
     }
 
     fn fold_packed_dims_with_params(
@@ -5672,6 +5782,18 @@ impl Simulator {
             | DataType::Implicit { dimensions, .. }
             | DataType::TypeReference { dimensions, .. } => {
                 *dimensions = fold_dims(dimensions);
+            }
+            DataType::Struct(su) => {
+                su.dimensions = fold_dims(&su.dimensions);
+                for m in &mut su.members {
+                    m.data_type = Self::fold_packed_dims_with_params(&m.data_type, params);
+                }
+            }
+            DataType::Enum(et) => {
+                et.dimensions = fold_dims(&et.dimensions);
+                if let Some(bt) = &mut et.base_type {
+                    **bt = Self::fold_packed_dims_with_params(bt, params);
+                }
             }
             _ => {}
         }

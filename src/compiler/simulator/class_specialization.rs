@@ -2125,6 +2125,11 @@ impl Simulator {
         if let Some(folded) = self.fold_vector_frag_ranges(frag_norm) {
             return self.canonicalize_spec_frag(&folded);
         }
+        // §6.22.1: matching built-in types share one specialization signature
+        // (`int` <-> `bit signed[31:0]`, `logic[7:0]` <-> `reg[7:0]`, `real` <-> `realtime`).
+        if let Some(canon) = super::elaborate::canonicalize_builtin_type_fragment(frag_norm) {
+            return canon;
+        }
         // §6.22.1: `pkg::T` and the imported `T` are one type, so they
         // key one specialization.
         if let Some(leaf) = self.package_type_leaf(frag_norm) {
