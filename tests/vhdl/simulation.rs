@@ -613,6 +613,20 @@ fn array_word_drivers() {
     check("array_word_drivers");
 }
 
+/// §10.5.2.2, §14.7.2: packed record fields preserve descending index
+/// order and partial writes; delayed and disjoint drivers retain their
+/// independent waveforms, and aggregate initialization is unchanged (#214).
+#[test]
+fn packed_record_arrays() {
+    check("packed_record_arrays");
+}
+
+/// §8.4: a packed record field write must check its dynamic array index.
+#[test]
+fn packed_record_index() {
+    check("packed_record_index");
+}
+
 /// NUMERIC_STD relational operators on operands with metavalues: the
 /// result and the warning of each overload; 'L' and 'H' compare as '0' and
 /// '1' (xezim-core #212).
@@ -666,6 +680,11 @@ fn singleton_pending_scalar_parts() {
 #[test]
 fn record_driver_activity() {
     check("record_driver_activity");
+}
+
+#[test]
+fn disjoint_record_events() {
+    check("disjoint_record_events");
 }
 
 /// §14.7.5.2: a startup list crossing the batching boundary runs ordinary

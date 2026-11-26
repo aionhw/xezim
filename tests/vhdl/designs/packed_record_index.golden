@@ -1,0 +1,2 @@
+ghdl:error: index (3) out of bounds (2 downto -1) at packed_record_index.vhd:12
+ghdl:error: simulation failed

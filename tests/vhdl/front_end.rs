@@ -72,6 +72,38 @@ fn work_library_of_design_units() {
     );
 }
 
+/// IEEE 1076-2008 §15.4: explicit VHDL entity names are case-insensitive,
+/// unlike the lowered SystemVerilog name.
+#[test]
+fn explicit_vhdl_top_is_case_insensitive() {
+    for top in ["clock_report", "CLOCK_REPORT", "Clock_Report"] {
+        let (out, text) = xezim(&["--compile", "-s", top, "designs/clock_report.vhd"], &[]);
+        assert!(out.status.success(), "{top}: {text}");
+    }
+    let (out, text) = xezim(
+        &["--compile", "-s", "not_a_top", "designs/clock_report.vhd"],
+        &[],
+    );
+    assert!(!out.status.success(), "{text}");
+}
+
+#[test]
+fn explicit_sv_top_in_mixed_design_is_case_sensitive() {
+    for (top, success) in [("mixed_sv_top", true), ("MIXED_SV_TOP", false)] {
+        let (out, text) = xezim(
+            &[
+                "--compile",
+                "-s",
+                top,
+                "mixed/mixed_sv_top.sv",
+                "mixed/mixed_sv_top.vhd",
+            ],
+            &[],
+        );
+        assert_eq!(out.status.success(), success, "{top}: {text}");
+    }
+}
+
 /// VHDL-2008 and VHDL-2019 are supported; another `--std=` is rejected.
 #[test]
 fn std_other_than_2008_or_2019_is_rejected() {
