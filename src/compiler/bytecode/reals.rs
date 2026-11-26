@@ -452,7 +452,7 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Ident(h) => self.ident_may_be_real(h),
             // §11.5.1: a part-select is integral (a real has none).
             ExprKind::RangeSelect { .. } => false,
-            ExprKind::Index { expr: base, .. } => match &base.kind {
+            ExprKind::Index { expr: base, index } => match &base.kind {
                 ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                     let raw = Self::hier_raw_name(h);
                     if let Some(ab) = self.local_var_array.get(&raw) {
@@ -460,6 +460,20 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(h) {
                         // §7.4: the element type of an unpacked array.
+                        if let Some(idx) = self.eval_const_bound(index) {
+                            return self
+                                .lookup_signal_id_by_name(&format!("{name}[{idx}]"))
+                                .is_none_or(|id| self.signal_is_real(id));
+                        }
+                        if let Some(&(lo, hi, _)) = self.arrays.get(&name) {
+                            let (a, b) = (lo.min(hi), lo.max(hi));
+                            if (b - a) < 64 {
+                                return (a..=b).any(|i| {
+                                    self.lookup_signal_id_by_name(&format!("{name}[{i}]"))
+                                        .is_none_or(|id| self.signal_is_real(id))
+                                });
+                            }
+                        }
                         let lo = self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo);
                         return self
                             .lookup_signal_id_by_name(&format!("{name}[{lo}]"))
@@ -705,15 +719,17 @@ impl<'a> BytecodeCompiler<'a> {
     pub(super) fn lvalue_is_real(&self, lv: &Expression) -> bool {
         match &lv.kind {
             ExprKind::Ident(_) => self.expr_is_real_static(lv),
-            ExprKind::Index { expr: base, .. } => match &base.kind {
+            ExprKind::Index { expr: base, index } => match &base.kind {
                 ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                     if let Some(ab) = self.local_var_array.get(&Self::hier_raw_name(h)) {
                         return ab.is_real;
                     }
                     self.signal_real.is_some()
                         && self.lookup_array_name(h).is_some_and(|name| {
-                            let lo = self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo);
-                            self.lookup_signal_id_by_name(&format!("{name}[{lo}]"))
+                            let idx = self
+                                .eval_const_bound(index)
+                                .unwrap_or_else(|| self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo));
+                            self.lookup_signal_id_by_name(&format!("{name}[{idx}]"))
                                 .is_some_and(|id| self.signal_is_real(id))
                         })
                 }

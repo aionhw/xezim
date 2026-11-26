@@ -261,6 +261,7 @@ fn check_unit<'a>(
     check_param_override_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
+    check_interconnect_usage(u, elab, errs);
 }
 
 /// The per-item value checks of a definition, in every scope its constants
@@ -1948,6 +1949,9 @@ fn check_class_member_names(c: &ClassDeclaration, errs: &mut Vec<String>) {
             ClassItem::Typedef(t) if !t.forward && !matches!(t.data_type, DataType::Void(_)) => {
                 names.extend(enum_names(&t.data_type));
                 names.push(&t.name.name);
+            }
+            ClassItem::Nettype(nt) => {
+                names.push(&nt.name.name);
             }
             _ => {}
         }
@@ -4442,6 +4446,10 @@ fn note_class_names(c: &ClassDeclaration, out: &mut HashSet<String>) {
                 out.insert(td.name.name.clone());
                 note_data_type_names(&td.data_type, out);
             }
+            ClassItem::Nettype(nt) => {
+                out.insert(nt.name.name.clone());
+                note_data_type_names(&nt.data_type, out);
+            }
             ClassItem::Parameter(pd) => note_param_names(pd, out),
             ClassItem::Method(m) => match &m.kind {
                 ClassMethodKind::Function(f)
@@ -4688,6 +4696,7 @@ impl<'a> UndeclaredFinder<'a> {
                     }
                 }
                 ClassItem::Typedef(td) => self.data_type(&td.data_type, &td.name.name),
+                ClassItem::Nettype(nt) => self.data_type(&nt.data_type, &nt.name.name),
                 ClassItem::Parameter(pd) => self.param_default(pd, &owner),
                 ClassItem::Method(m) => match &m.kind {
                     ClassMethodKind::Function(f)
@@ -4851,8 +4860,22 @@ fn check_nettype_partial_drivers(
         return;
     }
     let is_nettype = |dt: &DataType| {
-        matches!(dt, DataType::TypeReference { name, .. }
-            if elab.nettype_resolvers.contains_key(&name.name.name))
+        let DataType::TypeReference { name, .. } = dt else {
+            return false;
+        };
+        if name.scopes.is_empty() {
+            !elab.shadowed_nettypes.contains(&name.name.name)
+                && elab.nettype_resolvers.contains_key(&name.name.name)
+        } else {
+            let scoped = name
+                .scopes
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .chain(std::iter::once(name.name.name.as_str()))
+                .collect::<Vec<_>>()
+                .join("::");
+            elab.nettype_resolvers.contains_key(&scoped)
+        }
     };
     fn nets_in(
         items: &[ModuleItem],
@@ -5336,6 +5359,7 @@ fn check_inherited_local_access(
                     out.push((n.as_str(), m.qualifiers.contains(&ClassQualifier::Local)));
                 }
                 ClassItem::Typedef(t) => out.push((t.name.name.as_str(), false)),
+                ClassItem::Nettype(nt) => out.push((nt.name.name.as_str(), false)),
                 ClassItem::Parameter(pd) => {
                     if let xezim_core::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind
                     {
@@ -5818,6 +5842,9 @@ fn check_forward_typedefs(
                 ScopeEntry::ClassItem(ci) => match ci {
                     ClassItem::Property(pr) => {
                         check_scoped_dt(&pr.data_type, idx, &first_fwd, &first_def, errs);
+                    }
+                    ClassItem::Nettype(nt) => {
+                        check_scoped_dt(&nt.data_type, idx, &first_fwd, &first_def, errs);
                     }
                     ClassItem::Parameter(pd) => {
                         if let ParameterKind::Data { data_type, .. } = &pd.kind {
@@ -6626,6 +6653,9 @@ fn check_unspecialized_class_scopes(defs: &[&SourceDefinition], errs: &mut Vec<S
                         ClassItem::Typedef(td) => {
                             local_own.insert(td.name.name.as_str());
                         }
+                        ClassItem::Nettype(nt) => {
+                            local_own.insert(nt.name.name.as_str());
+                        }
                         ClassItem::Parameter(pd) => {
                             if let ParameterKind::Data { assignments, .. } = &pd.kind {
                                 local_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
@@ -6741,6 +6771,9 @@ fn check_unspecialized_class_scopes(defs: &[&SourceDefinition], errs: &mut Vec<S
                 ClassItem::Typedef(td) => {
                     cls_own.insert(td.name.name.as_str());
                 }
+                ClassItem::Nettype(nt) => {
+                    cls_own.insert(nt.name.name.as_str());
+                }
                 ClassItem::Parameter(pd) => {
                     if let ParameterKind::Data { assignments, .. } = &pd.kind {
                         cls_own.extend(assignments.iter().map(|a| a.name.name.as_str()));
@@ -6787,6 +6820,9 @@ fn check_unspecialized_class_scopes(defs: &[&SourceDefinition], errs: &mut Vec<S
                 ClassItem::Typedef(td) => {
                     check_data_type(&td.data_type, &cls_env, &enc_buf, hits);
                     check_udims(&td.dimensions, &cls_env, &enc_buf, hits);
+                }
+                ClassItem::Nettype(nt) => {
+                    check_data_type(&nt.data_type, &cls_env, &enc_buf, hits);
                 }
                 ClassItem::Parameter(pd) => check_param_decl(pd, &cls_env, &enc_buf, hits),
                 ClassItem::Method(m) => match &m.kind {
@@ -8042,6 +8078,13 @@ impl<'a> UndeclaredTypeFinder<'a> {
                     ClassMethodKind::Task(t) => self.task(t),
                 },
                 ClassItem::Typedef(td) => self.typedef_name(td),
+                ClassItem::Nettype(nt) => {
+                    if self.collecting {
+                        self.declared.insert(nt.name.name.clone());
+                    } else {
+                        self.data_type(&nt.data_type, &nt.name.name);
+                    }
+                }
                 ClassItem::Class(inner) => self.class(inner),
                 ClassItem::Covergroup(cg) => self.covergroup(cg),
                 _ => {}
@@ -8154,6 +8197,541 @@ fn check_undeclared_type_names(
     // `defs` iterates a hash map; keep the report order stable.
     f.errs.sort();
     errs.extend(f.errs);
+}
+
+/// §6.6.8 / §10.3: an `interconnect` net can only participate in port connections
+/// and `alias` declarations; continuous assignments and procedural references
+/// (aside from array/type query system functions such as `$bits`) are illegal.
+fn check_interconnect_usage(u: &Unit<'_>, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    use xezim_core::ast::stmt::{EventControl, ForInit, Pattern, ProceduralContinuous, TimingControl};
+    use xezim_core::ast::types::NetType;
+
+    fn collect_ic_nets<'a>(items: &'a [ModuleItem], out: &mut HashSet<&'a str>) {
+        for it in items {
+            match it {
+                ModuleItem::NetDeclaration(n) if n.net_type == NetType::Interconnect => {
+                    out.extend(n.declarators.iter().map(|d| d.name.name.as_str()));
+                }
+                ModuleItem::PortDeclaration(p) if p.net_type == Some(NetType::Interconnect) => {
+                    out.extend(p.declarators.iter().map(|d| d.name.name.as_str()));
+                }
+                ModuleItem::GenerateRegion(g) => collect_ic_nets(&g.items, out),
+                _ => {}
+            }
+        }
+    }
+
+    let mut ic_nets: HashSet<&str> = HashSet::new();
+    if let PortList::Ansi(ps) = u.ports {
+        for p in ps {
+            if p.net_type == Some(NetType::Interconnect) {
+                ic_nets.insert(p.name.name.as_str());
+            }
+        }
+    }
+    collect_ic_nets(u.items, &mut ic_nets);
+    if ic_nets.is_empty() {
+        return;
+    }
+
+    struct Ctx<'a, 'b> {
+        ic_nets: &'a HashSet<&'a str>,
+        shadows: Vec<HashSet<&'a str>>,
+        elab: &'a ElaboratedModule,
+        errs: &'b mut Vec<String>,
+        owner: &'a str,
+    }
+
+    impl<'a, 'b> Ctx<'a, 'b> {
+        fn is_shadowed(&self, name: &str) -> bool {
+            self.shadows.iter().any(|s| s.contains(name))
+        }
+
+        fn push_scope(&mut self) {
+            self.shadows.push(HashSet::new());
+        }
+
+        fn pop_scope(&mut self) {
+            self.shadows.pop();
+        }
+
+        fn bind_name(&mut self, name: &'a str) {
+            if let Some(top) = self.shadows.last_mut() {
+                top.insert(name);
+            }
+        }
+
+        fn bind_pattern(&mut self, pat: &'a Pattern) {
+            match pat {
+                Pattern::Wildcard => {}
+                Pattern::Binding(id) => self.bind_name(id.name.as_str()),
+                Pattern::Tagged { inner: Some(p), .. } => self.bind_pattern(p),
+                Pattern::Tagged { inner: None, .. } => {}
+                Pattern::Expr(e) => self.expr(e),
+                Pattern::Struct(fields) => {
+                    for (_, p) in fields {
+                        self.bind_pattern(p);
+                    }
+                }
+            }
+        }
+
+        fn check_pattern_exprs_and_bind(&mut self, e: &'a Expression) {
+            if let ExprKind::Matches { expr, pattern } = &e.kind {
+                self.expr(expr);
+                self.bind_pattern(pattern);
+            } else {
+                self.expr(e);
+            }
+        }
+
+        fn report(&mut self, name: &str, span: xezim_core::ast::Span, ctx: &str) {
+            let at = xezim_core::elaborate::span_location_of(self.elab, span, self.owner)
+                .map(|a| format!(" (at {a})"))
+                .unwrap_or_default();
+            self.errs.push(format!(
+                "interconnect net '{name}' cannot be used in {ctx} (IEEE 1800-2017 §6.6.8){at}"
+            ));
+        }
+
+        fn expr(&mut self, e: &'a Expression) {
+            self.expr_in(e, "procedural expression");
+        }
+
+        fn expr_in(&mut self, e: &'a Expression, ctx: &str) {
+            match &e.kind {
+                ExprKind::Number(_)
+                | ExprKind::StringLiteral(_)
+                | ExprKind::TypeLiteral(_)
+                | ExprKind::Dollar
+                | ExprKind::Null
+                | ExprKind::This
+                | ExprKind::Empty => {}
+                ExprKind::Ident(h) => {
+                    if h.root.is_none()
+                        && let Some(first) = h.path.first()
+                    {
+                        let n = first.name.name.as_str();
+                        if self.ic_nets.contains(n) && !self.is_shadowed(n) {
+                            self.report(n, h.span, ctx);
+                        }
+                    }
+                    for seg in &h.path {
+                        for sel in &seg.selects {
+                            self.expr_in(sel, ctx);
+                        }
+                    }
+                }
+                ExprKind::Unary { operand, .. }
+                | ExprKind::Paren(operand)
+                | ExprKind::MemberAccess { expr: operand, .. }
+                | ExprKind::ShallowCopy { source: operand } => self.expr_in(operand, ctx),
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Range(left, right)
+                | ExprKind::WithClause {
+                    expr: left,
+                    filter: right,
+                } => {
+                    self.expr_in(left, ctx);
+                    self.expr_in(right, ctx);
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    self.expr_in(condition, ctx);
+                    self.expr_in(then_expr, ctx);
+                    self.expr_in(else_expr, ctx);
+                }
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        self.expr_in(x, ctx);
+                    }
+                }
+                ExprKind::Replication { count, exprs } => {
+                    self.expr_in(count, ctx);
+                    for x in exprs {
+                        self.expr_in(x, ctx);
+                    }
+                }
+                ExprKind::AssignmentPattern(items) => {
+                    for it in items {
+                        match it {
+                            AssignmentPatternItem::Keyed(k, v) => {
+                                self.expr_in(k, ctx);
+                                self.expr_in(v, ctx);
+                            }
+                            other => self.expr_in(other.expr(), ctx),
+                        }
+                    }
+                }
+                ExprKind::TypedPattern { pattern, .. } => self.expr_in(pattern, ctx),
+                ExprKind::Call { func, args } => {
+                    self.expr_in(func, ctx);
+                    for a in args {
+                        self.expr_in(a, ctx);
+                    }
+                }
+                ExprKind::SystemCall { name, args } => {
+                    if !matches!(
+                        name.as_str(),
+                        "$bits"
+                            | "$size"
+                            | "$left"
+                            | "$right"
+                            | "$low"
+                            | "$high"
+                            | "$increment"
+                            | "$dimensions"
+                            | "$unpacked_dimensions"
+                    ) {
+                        for a in args {
+                            self.expr_in(a, ctx);
+                        }
+                    }
+                }
+                ExprKind::NamedArg { expr: Some(inner), .. } => self.expr_in(inner, ctx),
+                ExprKind::NamedArg { expr: None, .. } => {}
+                ExprKind::Inside { expr, ranges } => {
+                    self.expr_in(expr, ctx);
+                    for r in ranges {
+                        self.expr_in(r, ctx);
+                    }
+                }
+                ExprKind::Matches { expr, pattern } => {
+                    self.expr_in(expr, ctx);
+                    self.visit_pattern_exprs(pattern, ctx);
+                }
+                ExprKind::Specialization { base, .. } => self.expr_in(base, ctx),
+                ExprKind::Index { expr, index } => {
+                    self.expr_in(expr, ctx);
+                    self.expr_in(index, ctx);
+                }
+                ExprKind::RangeSelect {
+                    expr, left, right, ..
+                } => {
+                    self.expr_in(expr, ctx);
+                    self.expr_in(left, ctx);
+                    self.expr_in(right, ctx);
+                }
+                ExprKind::RandomizeWith { call, .. } => self.expr_in(call, ctx),
+                ExprKind::AssignExpr { lvalue, rvalue } => {
+                    self.expr_in(lvalue, ctx);
+                    self.expr_in(rvalue, ctx);
+                }
+                ExprKind::StreamOp {
+                    slice_size, exprs, ..
+                } => {
+                    if let Some(s) = slice_size {
+                        self.expr_in(s, ctx);
+                    }
+                    for x in exprs {
+                        self.expr_in(x, ctx);
+                    }
+                }
+                ExprKind::Tagged { inner: Some(x), .. } => self.expr_in(x, ctx),
+                ExprKind::Tagged { inner: None, .. } => {}
+                ExprKind::SvaClocked { events, body } => {
+                    for ev in events {
+                        self.expr_in(&ev.expr, ctx);
+                        if let Some(iff) = &ev.iff {
+                            self.expr_in(iff, ctx);
+                        }
+                    }
+                    self.expr_in(body, ctx);
+                }
+            }
+        }
+
+        fn visit_pattern_exprs(&mut self, pat: &'a Pattern, ctx: &str) {
+            match pat {
+                Pattern::Wildcard | Pattern::Binding(_) | Pattern::Tagged { inner: None, .. } => {}
+                Pattern::Tagged { inner: Some(p), .. } => self.visit_pattern_exprs(p, ctx),
+                Pattern::Expr(e) => self.expr_in(e, ctx),
+                Pattern::Struct(fields) => {
+                    for (_, p) in fields {
+                        self.visit_pattern_exprs(p, ctx);
+                    }
+                }
+            }
+        }
+
+        fn timing(&mut self, tc: &'a TimingControl) {
+            match tc {
+                TimingControl::Delay(e) => self.expr(e),
+                TimingControl::Event(ec) => match ec {
+                    EventControl::Star | EventControl::ParenStar => {}
+                    EventControl::Identifier(id) => {
+                        let n = id.name.as_str();
+                        if self.ic_nets.contains(n) && !self.is_shadowed(n) {
+                            self.report(n, id.span, "event control");
+                        }
+                    }
+                    EventControl::HierIdentifier(e) => self.expr(e),
+                    EventControl::EventExpr(evs) => {
+                        for ev in evs {
+                            self.expr(&ev.expr);
+                            if let Some(iff) = &ev.iff {
+                                self.expr(iff);
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        fn stmt(&mut self, s: &'a Statement) {
+            match &s.kind {
+                StatementKind::Null
+                | StatementKind::ScopePop
+                | StatementKind::LoopStep
+                | StatementKind::DisableFork
+                | StatementKind::WaitFork
+                | StatementKind::Break
+                | StatementKind::Continue
+                | StatementKind::RsReturn
+                | StatementKind::Typedef(_)
+                | StatementKind::Disable(_) => {}
+                StatementKind::Expr(e) | StatementKind::Coverpoint { expr: e, .. } => self.expr(e),
+                StatementKind::BlockingAssign { lvalue, rvalue } => {
+                    self.expr(lvalue);
+                    self.expr(rvalue);
+                }
+                StatementKind::NonblockingAssign {
+                    lvalue,
+                    delay,
+                    rvalue,
+                } => {
+                    self.expr(lvalue);
+                    if let Some(d) = delay {
+                        self.expr(d);
+                    }
+                    self.expr(rvalue);
+                }
+                StatementKind::If {
+                    condition,
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    self.push_scope();
+                    self.check_pattern_exprs_and_bind(condition);
+                    self.stmt(then_stmt);
+                    self.pop_scope();
+                    if let Some(el) = else_stmt {
+                        self.stmt(el);
+                    }
+                }
+                StatementKind::Case { expr, items, .. } => {
+                    self.expr(expr);
+                    for it in items {
+                        for p in &it.patterns {
+                            self.expr(p);
+                        }
+                        self.push_scope();
+                        if let Some(pat) = &it.pattern {
+                            self.bind_pattern(pat);
+                        }
+                        if let Some(g) = &it.guard {
+                            self.expr(g);
+                        }
+                        self.stmt(&it.stmt);
+                        self.pop_scope();
+                    }
+                }
+                StatementKind::For {
+                    init,
+                    condition,
+                    step,
+                    body,
+                } => {
+                    self.push_scope();
+                    for fi in init {
+                        match fi {
+                            ForInit::VarDecl { name, init, .. } => {
+                                self.expr(init);
+                                self.bind_name(name.name.as_str());
+                            }
+                            ForInit::Assign { lvalue, rvalue } => {
+                                self.expr(lvalue);
+                                self.expr(rvalue);
+                            }
+                        }
+                    }
+                    if let Some(c) = condition {
+                        self.expr(c);
+                    }
+                    for st in step {
+                        self.expr(st);
+                    }
+                    self.stmt(body);
+                    self.pop_scope();
+                }
+                StatementKind::Foreach { array, vars, body } => {
+                    self.expr(array);
+                    self.push_scope();
+                    for v in vars.iter().flatten() {
+                        self.bind_name(v.name.as_str());
+                    }
+                    self.stmt(body);
+                    self.pop_scope();
+                }
+                StatementKind::ForeachTail(ft) => self.stmt(&ft.body),
+                StatementKind::While { condition, body }
+                | StatementKind::DoWhile { body, condition }
+                | StatementKind::Wait {
+                    condition,
+                    stmt: body,
+                } => {
+                    self.expr(condition);
+                    self.stmt(body);
+                }
+                StatementKind::Repeat { count, body } => {
+                    self.expr(count);
+                    self.stmt(body);
+                }
+                StatementKind::Forever { body }
+                | StatementKind::ForeverTail { body }
+                | StatementKind::RsAction { body } => self.stmt(body),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    self.push_scope();
+                    for st in stmts {
+                        self.stmt(st);
+                    }
+                    self.pop_scope();
+                }
+                StatementKind::TimingControl { control, stmt } => {
+                    self.timing(control);
+                    self.stmt(stmt);
+                }
+                StatementKind::EventTrigger { target, .. } => {
+                    if let Some(t) = target {
+                        self.expr(t);
+                    }
+                }
+                StatementKind::Return(Some(e)) => self.expr(e),
+                StatementKind::Return(None) => {}
+                StatementKind::Assertion(a) => {
+                    self.expr(&a.expr);
+                    if let Some(ic) = &a.inferred_clock {
+                        self.expr(&ic.expr);
+                        if let Some(iff) = &ic.iff {
+                            self.expr(iff);
+                        }
+                    }
+                    if let Some(ac) = &a.action {
+                        self.stmt(ac);
+                    }
+                    if let Some(el) = &a.else_action {
+                        self.stmt(el);
+                    }
+                }
+                StatementKind::ProceduralContinuous(pc) => match pc {
+                    ProceduralContinuous::Assign { lvalue, rvalue }
+                    | ProceduralContinuous::Force { lvalue, rvalue } => {
+                        self.expr(lvalue);
+                        self.expr(rvalue);
+                    }
+                    ProceduralContinuous::Deassign(lvalue)
+                    | ProceduralContinuous::Release(lvalue) => self.expr(lvalue),
+                },
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
+                    for d in declarators {
+                        if let Some(init) = &d.init {
+                            self.expr(init);
+                        }
+                        self.bind_name(d.name.name.as_str());
+                    }
+                }
+                StatementKind::RandCase { items } => {
+                    for (w, st) in items {
+                        self.expr(w);
+                        self.stmt(st);
+                    }
+                }
+                StatementKind::Cross { items, .. } => {
+                    for it in items {
+                        self.expr(it);
+                    }
+                }
+                StatementKind::WaitOrder { pass, fail, .. } => {
+                    if let Some(p) = pass {
+                        self.stmt(p);
+                    }
+                    if let Some(f) = fail {
+                        self.stmt(f);
+                    }
+                }
+            }
+        }
+
+        fn walk_items(&mut self, items: &'a [ModuleItem]) {
+            for it in items {
+                match it {
+                    ModuleItem::ContinuousAssign(ca) => {
+                        for (l, r) in &ca.assignments {
+                            self.expr_in(l, "continuous assignment");
+                            self.expr_in(r, "continuous assignment");
+                        }
+                    }
+                    ModuleItem::InitialConstruct(p) => self.stmt(&p.stmt),
+                    ModuleItem::AlwaysConstruct(p) => self.stmt(&p.stmt),
+                    ModuleItem::FinalConstruct(p) => self.stmt(&p.stmt),
+                    ModuleItem::FunctionDeclaration(f) => {
+                        self.push_scope();
+                        self.bind_name(f.name.name.name.as_str());
+                        for p in &f.ports {
+                            if let Some(def) = &p.default {
+                                self.expr(def);
+                            }
+                            self.bind_name(p.name.name.as_str());
+                        }
+                        for st in f.items.iter() {
+                            self.stmt(st);
+                        }
+                        self.pop_scope();
+                    }
+                    ModuleItem::TaskDeclaration(t) => {
+                        self.push_scope();
+                        for p in &t.ports {
+                            if let Some(def) = &p.default {
+                                self.expr(def);
+                            }
+                            self.bind_name(p.name.name.as_str());
+                        }
+                        for st in t.items.iter() {
+                            self.stmt(st);
+                        }
+                        self.pop_scope();
+                    }
+                    ModuleItem::GenerateRegion(g) => self.walk_items(&g.items),
+                    ModuleItem::GenerateIf(g) => {
+                        for (_, its) in &g.branches {
+                            self.walk_items(its);
+                        }
+                    }
+                    ModuleItem::GenerateFor(g) => self.walk_items(&g.items),
+                    ModuleItem::GenerateCase(g) => {
+                        for arm in &g.arms {
+                            self.walk_items(&arm.items);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut ctx = Ctx {
+        ic_nets: &ic_nets,
+        shadows: Vec::new(),
+        elab,
+        errs,
+        owner: u.name,
+    };
+    ctx.walk_items(u.items);
 }
 
 #[cfg(test)]

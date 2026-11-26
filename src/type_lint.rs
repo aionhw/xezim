@@ -620,6 +620,11 @@ impl<'a> Ck<'a> {
         };
     }
 
+    fn declare_nettype(&mut self, nt: &xezim_core::ast::decl::NettypeDeclaration) {
+        let t = self.resolve(&nt.data_type);
+        self.top().types.insert(nt.name.name.clone(), t);
+    }
+
     fn base_kind(&self, td: &TypedefDeclaration) -> Option<BaseKind> {
         if let Some(d) = td.dimensions.first() {
             return Some(BaseKind::Illegal(match d {
@@ -900,6 +905,7 @@ impl<'a> Ck<'a> {
         for it in items {
             match it {
                 ModuleItem::TypedefDeclaration(td) => self.declare_typedef(td),
+                ModuleItem::NettypeDeclaration(nt) => self.declare_nettype(nt),
                 ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                     self.declare_param(pd)
                 }
@@ -1017,6 +1023,7 @@ impl<'a> Ck<'a> {
         for it in &c.items {
             match it {
                 ClassItem::Typedef(td) => self.declare_typedef(td),
+                ClassItem::Nettype(nt) => self.declare_nettype(nt),
                 ClassItem::Parameter(pd) => self.declare_param(pd),
                 ClassItem::Import(imp) => self.declare_import(imp),
                 _ => {}
@@ -2888,6 +2895,7 @@ impl<'a> Ck<'a> {
         for it in &c.items {
             match it {
                 ClassItem::Typedef(td) => self.declare_typedef(td),
+                ClassItem::Nettype(nt) => self.declare_nettype(nt),
                 ClassItem::Parameter(pd) => self.declare_param(pd),
                 ClassItem::Import(imp) => self.declare_import(imp),
                 _ => {}
@@ -3517,6 +3525,7 @@ fn declare_package_items(ck: &mut Ck<'_>, items: &[PackageItem]) {
     for it in items {
         match it {
             PackageItem::Typedef(td) => ck.declare_typedef(td),
+            PackageItem::Nettype(nt) => ck.declare_nettype(nt),
             PackageItem::Parameter(pd) => ck.declare_param(pd),
             PackageItem::Import(imp) => ck.declare_import(imp),
             PackageItem::Data(d) => {

@@ -3609,6 +3609,31 @@ impl Simulator {
                     }
                 }
             }
+            if !module.interconnect_elem_types.is_empty()
+                && module.interconnect_nets.contains(base.as_str())
+            {
+                for idx in lo..=hi {
+                    elem_name_buf.clear();
+                    elem_name_buf.push_str(base);
+                    elem_name_buf.push('[');
+                    Self::push_i64(&mut elem_name_buf, idx);
+                    elem_name_buf.push(']');
+                    if let Some(&(ew, is_real, _)) =
+                        module.interconnect_elem_types.get(elem_name_buf.as_str())
+                    {
+                        let elem_id = first_id + (idx - lo) as usize;
+                        if elem_id < signal_table.len() {
+                            signal_widths_vec[elem_id] = ew;
+                            signal_real_vec[elem_id] = is_real;
+                            signal_table[elem_id] = if is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                Value::all_z(ew)
+                            };
+                        }
+                    }
+                }
+            }
         }
         // An array whose elements already carry values from elaboration — an
         // unpacked-array PARAMETER (`u32_t A[N] = {a, b}`, §6.20.2) — must keep

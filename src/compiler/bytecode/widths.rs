@@ -79,7 +79,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.widths.declared_width(&raw).unwrap_or(32)
                 }
             }
-            ExprKind::Index { expr, .. } => {
+            ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     // Register-bound LOCAL ARRAY element (inlined pure body):
                     // its declared element width. Missing this returned the
@@ -111,6 +111,14 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
+                        if let Some(idx) = self.eval_const_bound(index)
+                            && let Some(id) =
+                                self.lookup_signal_id_by_name(&format!("{name}[{idx}]"))
+                            && let Some(&w) = self.signal_widths.get(id)
+                            && w > 0
+                        {
+                            return w;
+                        }
                         if let Some((_, _, elem_w)) = self.arrays.get(&name) {
                             return *elem_w;
                         }

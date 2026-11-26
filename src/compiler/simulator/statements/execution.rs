@@ -2419,6 +2419,13 @@ impl Simulator {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
+                    if self.try_force_unpacked_struct(
+                        lvalue,
+                        rvalue,
+                        matches!(pc, ProceduralContinuous::Force { .. }),
+                    ) {
+                        return;
+                    }
                     // LRM §10.6.2 `force` / §10.6.1 procedural continuous
                     // `assign`: the override supersedes ordinary procedural
                     // assignments and continuous drivers until the matching
@@ -2485,6 +2492,12 @@ impl Simulator {
                     }
                 }
                 ProceduralContinuous::Release(lvalue) | ProceduralContinuous::Deassign(lvalue) => {
+                    if self.try_release_unpacked_struct(
+                        lvalue,
+                        matches!(pc, ProceduralContinuous::Release(_)),
+                    ) {
+                        return;
+                    }
                     // LRM §10.6.2 `release`: a VARIABLE keeps the forced
                     // value until the next procedural assignment — so we
                     // only lift the override and leave the stored value

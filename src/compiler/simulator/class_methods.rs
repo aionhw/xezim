@@ -1917,6 +1917,15 @@ impl Simulator {
                             } else {
                                 port.dimensions.clone()
                             };
+                        let queue_elem_w = matches!(
+                            eff_dims.first(),
+                            Some(
+                                crate::ast::types::UnpackedDimension::Queue { .. }
+                                    | crate::ast::types::UnpackedDimension::Unsized(_)
+                            )
+                        )
+                        .then(|| self.method_formal_param_width(handle, cname, &port.data_type))
+                        .flatten();
                         if let Some((store, caller)) = self.bind_queue_param(
                             &port.name.name,
                             &eff_dims,
@@ -1924,6 +1933,7 @@ impl Simulator {
                             actual,
                             &port.data_type,
                             port.direction,
+                            queue_elem_w,
                         ) {
                             let is_out = matches!(
                                 port.direction,

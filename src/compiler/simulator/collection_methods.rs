@@ -2535,6 +2535,7 @@ impl Simulator {
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
         dir: PortDirection,
+        elem_width_override: Option<u32>,
     ) -> Option<(String, String)> {
         use crate::ast::types::UnpackedDimension;
         self.meta_note(pname);
@@ -2552,6 +2553,7 @@ impl Simulator {
                 &selected,
                 queue_data_type,
                 dir,
+                elem_width_override,
             );
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
@@ -2604,8 +2606,8 @@ impl Simulator {
         }
         if let Some(parts) = literal_elems {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            let width = self
-                .declared_collection_elem_width(queue_data_type)
+            let width = elem_width_override
+                .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(32);
             self.module.arrays.insert(key.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(key.clone());
@@ -2647,8 +2649,8 @@ impl Simulator {
         }
         if let Some((vals, w)) = self.collection_slice_values(arg) {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            let w = self
-                .declared_collection_elem_width(queue_data_type)
+            let w = elem_width_override
+                .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(w);
             self.module.arrays.insert(key.clone(), (0, -1, w));
             self.module.dynamic_arrays.insert(key.clone());
@@ -2698,8 +2700,8 @@ impl Simulator {
             self.get_queue_size(&cname)
         };
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
-        let w = self
-            .declared_collection_elem_width(queue_data_type)
+        let w = elem_width_override
+            .or_else(|| self.declared_collection_elem_width(queue_data_type))
             .unwrap_or(w);
         let key = self.formal_dyn_key(pname, queue_data_type);
         self.register_formal_shape(&key, dims);

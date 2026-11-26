@@ -401,6 +401,7 @@ impl Simulator {
                     actual,
                     &port.data_type,
                     port.direction,
+                    None,
                 ) {
                     if is_out && !caller.is_empty() {
                         queue_writebacks.push((store, caller));
@@ -3071,6 +3072,7 @@ impl Simulator {
                     actual,
                     &port.data_type,
                     port.direction,
+                    None,
                 ) {
                     if matches!(
                         port.direction,
