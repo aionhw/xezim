@@ -3,6 +3,7 @@
 //! uninterrupted run prints after that slot. A checkpoint belongs to one
 //! design and one xezim build; anything else is refused.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,6 +28,113 @@ fn run(design: &Path, args: &[&str], env: &[(&str, &str)]) -> (Vec<String>, Stri
         .map(str::to_string)
         .collect();
     (lines, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+fn case_arm_design(selector: &str, condition: &str, stimulus: &str) -> String {
+    let mut design = format!(
+        "`timescale 1ns/1ps\nmodule tb;\n  {selector}\n  logic [7:0] a, drive;\n  wire [7:0] b = ~drive;\n"
+    );
+    // Give each data signal enough dependents to enable dynamic masking.
+    for i in 0..6 {
+        writeln!(
+            design,
+            r#"  logic [7:0] y{i};
+  always @* begin
+    case ({condition})
+      2'b00: y{i} = a;
+      2'b01: y{i} = b;
+      2'b10: y{i} = 8'd{i};
+      default: y{i} = 8'hff;
+    endcase
+  end"#
+        )
+        .unwrap();
+    }
+    writeln!(design, "{stimulus}\nendmodule").unwrap();
+    design
+}
+
+/// §11.5.1 and §12.5: a narrow selector at a high packed offset still
+/// tracks changes to the data used by its selected arm.
+#[test]
+fn case_arm_mask_reads_selector_above_bit_65535() {
+    let d = dir("wide_case_arm");
+    let f = d.join("tb.sv");
+    let design = case_arm_design(
+        "logic [65537:0] sel;",
+        "sel[65537:65536]",
+        r#"  initial begin
+    sel = '0; sel[65536] = 1; a = 8'h11; drive = 8'hdd;
+    #2 $display("R before=%h", y0);
+    drive = 8'hbb;
+    #2 $display("R after=%h", y0);
+    sel[65536] = 1'bx;
+    #2 $display("R unknown=%h", y0);
+    $finish;
+  end"#,
+    );
+    std::fs::write(&f, design).unwrap();
+    let backends: &[(&str, &str)] = if cfg!(feature = "jit") {
+        &[("0", "0"), ("1", "0"), ("1", "1")]
+    } else {
+        &[("0", "0")]
+    };
+    for &(jit, aot) in backends {
+        let (lines, err) = run(
+            &f,
+            &["--sim-debug"],
+            &[("XEZIM_CTL_MASK", "1"), ("XEZIM_JIT", jit), ("XEZIM_AOT", aot)],
+        );
+        assert!(err.contains("[CASE-CTL] 6 "), "{err}");
+        assert_eq!(
+            lines,
+            ["R before=22", "R after=44", "R unknown=ff"],
+            "XEZIM_JIT={jit} XEZIM_AOT={aot}: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Annex D.9 and §12.5: the dependency masks and the selected-arm state
+/// must agree when a checkpoint is restored.
+#[test]
+fn case_arm_masks_follow_selector_after_checkpoint_restore() {
+    let d = dir("case_arm_mask");
+    let f = d.join("tb.sv");
+    let design = case_arm_design(
+        "logic [1:0] sel;",
+        "sel",
+        r#"  initial begin #1 $display("checkpoint marker"); end
+  initial begin
+    sel = 0; a = 8'h11; drive = 8'hdd;
+    #3 sel = 1;
+    #1 $display("R selected=%h", y0);
+    drive = 8'hbb;
+    #2 $display("R after=%h", y0);
+    $finish;
+  end"#,
+    );
+    std::fs::write(&f, design).unwrap();
+    let ck = d.join("case.ckpt");
+    let spec = format!("2ns,{}", ck.display());
+    let (saved, err) = run(
+        &f,
+        &["--sim-debug", "--save-at", &spec],
+        &[("XEZIM_CTL_MASK", "1")],
+    );
+    assert!(err.contains("[CASE-CTL] 6 "), "{err}");
+    assert!(err.contains("at time 1000"), "{err}");
+    assert_eq!(saved, ["R selected=22", "R after=44"], "{err}");
+    for mask in ["1", "0"] {
+        let (restored, err) = run(
+            &f,
+            &["--restore", ck.to_str().unwrap()],
+            &[("XEZIM_CTL_MASK", mask)],
+        );
+        assert!(err.contains("restored"), "{err}");
+        assert_eq!(restored, saved, "XEZIM_CTL_MASK={mask}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 const DESIGN: &str = r#"module tb;
