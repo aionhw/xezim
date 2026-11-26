@@ -131,18 +131,14 @@ impl Simulator {
         if idx < 0 {
             return Some(false);
         }
-        let mut b = self.eval_expr(expr).sv_string_bytes();
+        let mut cur = self.eval_expr(expr);
         let mut cv = val.resize_for_assign(8);
         if cv.has_xz() {
             cv = cv.to_two_state();
         }
         let cbyte = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
-        let i = idx as usize;
-        if i < b.len() && cbyte != 0 {
-            b[i] = cbyte;
-            // A `Value` may carry string metadata; store the freshly rebuilt
-            // string so the element keeps its string-ness.
-            return Some(self.assign_value(expr, &Value::from_bytes(&b)));
+        if cur.sv_string_putc_in_place(idx, cbyte) {
+            return Some(self.assign_value(expr, &cur));
         }
         Some(false)
     }

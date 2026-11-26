@@ -394,3 +394,174 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn bytes_string_inline_signal_dsu_tran_and_two_state_fast_paths() {
+    let src = r#"
+module top;
+  wire n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15;
+  logic drv0;
+  assign n0 = drv0;
+  tran t00(n0, n1);   tran t01(n1, n2);   tran t02(n2, n3);   tran t03(n3, n4);
+  tran t04(n4, n5);   tran t05(n5, n6);   tran t06(n6, n7);   tran t07(n7, n8);
+  tran t08(n8, n9);   tran t09(n9, n10);  tran t10(n10, n11); tran t11(n11, n12);
+  tran t12(n12, n13); tran t13(n13, n14); tran t14(n14, n15);
+
+  wire u0, u1, u2, u3;
+  logic udrv0, udrv3;
+  assign u0 = udrv0;
+  assign u3 = udrv3;
+  tran tu0(u0, u1);
+  tran tu1(u1, u2);
+  tran tu2(u2, u3);
+
+  wire ca, cb;
+  logic cdrv_a, cdrv_b;
+  assign ca = cdrv_a;
+  assign cb = cdrv_b;
+  tran t_conf(ca, cb);
+
+  wire ta, tb;
+  logic tdrv_a, tdrv_b, t_en;
+  assign ta = tdrv_a;
+  assign tb = tdrv_b;
+  tranif1 sw_c(ta, tb, t_en);
+
+  logic [31:0] dc_src32;
+  bit   [31:0] dc_dst32;
+  assign dc_dst32 = dc_src32;
+
+  logic [63:0] dc_src64;
+  bit   [63:0] dc_dst64;
+  assign dc_dst64 = dc_src64;
+
+  real   r_arr[4];
+  string s_arr[4];
+
+  function automatic bit [31:0] conv_to_bit32(
+    input logic [31:0] lv,
+    input logic signed [7:0] sv8,
+    input logic [7:0] uv8,
+    input logic [127:0] w128,
+    input real rv,
+    input int mode
+  );
+    bit [31:0] res;
+    case (mode)
+      0: res = lv;
+      1: res = sv8;
+      2: res = uv8;
+      3: res = w128;
+      4: res = rv;
+      default: res = '1;
+    endcase
+    return res;
+  endfunction
+
+  function automatic string str_loop_op(input string a, input string b, input int idx, input byte ch);
+    string s;
+    s = {a, ":", b};
+    s = s.toupper();
+    s.putc(idx, ch);
+    return s;
+  endfunction
+
+  typedef struct packed {
+    logic signed [15:0] x;
+  } s16_t;
+  typedef logic signed [15:0] l16_t;
+
+  initial begin
+    string long_a, long_b, cat_s, rep_s, low_s, sub_s, nul_s;
+    string str_q[$];
+    int cmp1, cmp2;
+    longint fsum;
+    bit [31:0] b0, b1, b2, b3, b4, b5;
+    real r_neg;
+    logic [7:0] latin;
+    s16_t casted;
+    l16_t lcast;
+
+    long_a = "AlphaBetaGammaDeltaEpsilonZetaEtaThetaIotaKappaLambdaMuNuXiOmicronPiRho";
+    long_b = "0123456789_SigmaTauUpsilonPhiChiPsiOmega";
+    cat_s = {long_a, "-", long_b, 8'h21};
+    rep_s = {2{"Segment_0123456789_"}};
+    low_s = cat_s.tolower();
+    sub_s = cat_s.substr(5, 19);
+    cmp1 = cat_s.compare(low_s);
+    cmp2 = cat_s.icompare(low_s);
+    str_q.push_back(cat_s);
+    str_q.push_back(low_s);
+    str_q[0].putc(0, "Z");
+    fsum = 0;
+    foreach (cat_s[i]) begin
+      fsum += (cat_s.getc(i) ^ i);
+    end
+    nul_s = string'({8'h41, 8'h00, 8'h42, "LongTail_0123456789_0123456789_0123456789_0123456789"});
+    $display("STR len=%0d cat=%s sub=%s cmp=%0d,%0d q0=%c getc5=%c fsum=%0d nul=%s",
+             cat_s.len(), str_loop_op(long_a, long_b, 5, "_"), sub_s,
+             (cmp1 < 0) ? -1 : ((cmp1 > 0) ? 1 : 0), cmp2,
+             str_q[0].getc(0), cat_s.getc(5), fsum, nul_s);
+
+    latin = 8'hE9;
+    cat_s = {long_b, latin};
+    cat_s = cat_s.toupper();
+    r_neg = $bitstoreal(64'h8000_0000_0000_0000);
+    casted = s16_t'(16'hFFF5);
+    lcast = l16_t'(32'hFFFF_FFF4);
+    $display("MISC latin_last=%02x s_def_len=%0d r_def=%016x r_neg=%016x cast=%0d,%0d",
+             cat_s.getc(cat_s.len()-1), s_arr[2].len(),
+             $realtobits(r_arr[1]), $realtobits(r_neg), casted.x, lcast);
+
+    drv0 = 1'b1; udrv0 = 1'b1; udrv3 = 1'b0; #1;
+    $display("TRAN_1 n15=%b n7=%b u1=%b u2=%b", n15, n7, u1, u2);
+    drv0 = 1'b0; udrv3 = 1'bz; #1;
+    $display("TRAN_0 n15=%b n7=%b u1=%b u2=%b", n15, n7, u1, u2);
+    drv0 = 1'bz; #1;
+    $display("TRAN_Z n15=%b n7=%b", n15, n7);
+
+    cdrv_a = 1'b1; cdrv_b = 1'b0; #1;
+    $display("CONF_X ca=%b cb=%b", ca, cb);
+    cdrv_b = 1'bz; #1;
+    $display("CONF_1 ca=%b cb=%b", ca, cb);
+
+    tdrv_a = 1'b1; tdrv_b = 1'bz; t_en = 1'b0; #1;
+    $display("TIF_OFF ta=%b tb=%b", ta, tb);
+    t_en = 1'b1; #1;
+    $display("TIF_ON  ta=%b tb=%b", ta, tb);
+    tdrv_b = 1'b0; t_en = 1'bx; #1;
+    $display("TIF_UNK ta=%b tb=%b", ta, tb);
+
+    dc_src32 = 32'hA5x0_zF12;
+    dc_src64 = 64'hF00D_xz12_CAFE_zx99;
+    #1;
+    $display("DC dc32=%08x dc64=%016x", dc_dst32, dc_dst64);
+
+    b0 = conv_to_bit32(32'hA5x0_zF12, -8'sd5, 8'hAB, 128'h1111_2222_3333_4444_5555_6666_DEAD_BEEF, 3.75, 0);
+    b1 = conv_to_bit32(0, -8'sd5, 8'hAB, 0, 3.75, 1);
+    b2 = conv_to_bit32(0, -8'sd5, 8'hAB, 0, 3.75, 2);
+    b3 = conv_to_bit32(0, -8'sd5, 8'hAB, 128'h1111_2222_3333_4444_5555_6666_DEAD_BEEF, 3.75, 3);
+    b4 = conv_to_bit32(0, -8'sd5, 8'hAB, 0, 3.75, 4);
+    b5 = conv_to_bit32(0, -8'sd5, 8'hAB, 0, 3.75, 5);
+    $display("BA b0=%08x b1=%08x b2=%08x b3=%08x b4=%08x b5=%08x", b0, b1, b2, b3, b4, b5);
+  end
+endmodule
+"#;
+    assert_eq!(
+        sim_lines(src),
+        vec![
+            "STR len=113 cat=ALPHA_ETAGAMMADELTAEPSILONZETAETATHETAIOTAKAPPALAMBDAMUNUXIOMICRONPIRHO:0123456789_SIGMATAUUPSILONPHICHIPSIOMEGA sub=BetaGammaDeltaE cmp=-1,0 q0=Z getc5=B fsum=8588 nul=ABLongTail_0123456789_0123456789_0123456789_0123456789",
+            "MISC latin_last=e9 s_def_len=0 r_def=0000000000000000 r_neg=8000000000000000 cast=-11,-12",
+            "TRAN_1 n15=1 n7=1 u1=x u2=x",
+            "TRAN_0 n15=0 n7=0 u1=1 u2=1",
+            "TRAN_Z n15=z n7=z",
+            "CONF_X ca=x cb=x",
+            "CONF_1 ca=1 cb=1",
+            "TIF_OFF ta=1 tb=z",
+            "TIF_ON  ta=1 tb=1",
+            "TIF_UNK ta=x tb=x",
+            "DC dc32=a5000f12 dc64=f00d0012cafe0099",
+            "BA b0=a5000f12 b1=fffffffb b2=000000ab b3=deadbeef b4=00000004 b5=ffffffff",
+        ]
+    );
+}

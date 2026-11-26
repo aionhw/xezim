@@ -36,8 +36,8 @@ impl Simulator {
                     v(0).sv_string_slice(start as usize, end as usize)
                 }
             }
-            K::ToUpper => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), true)),
-            K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
+            K::ToUpper => v(0).sv_string_ascii_case(true),
+            K::ToLower => v(0).sv_string_ascii_case(false),
             K::Compare | K::ICompare | K::Order => {
                 let d = v(0).sv_string_cmp(v(1), matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
@@ -48,27 +48,15 @@ impl Simulator {
             K::AToHex => sv_ato_value(&v(0).to_sv_string(), 16),
             K::AToOct => sv_ato_value(&v(0).to_sv_string(), 8),
             K::AToBin => sv_ato_value(&v(0).to_sv_string(), 2),
-            K::Concat => {
-                let mut bytes: Vec<u8> = Vec::new();
-                for &r in args {
-                    bytes.extend_from_slice(&regs[r as usize].sv_string_bytes());
-                }
-                Value::from_bytes(&bytes)
-            }
+            K::Concat => Value::sv_string_concat_refs(args.iter().map(|&r| &regs[r as usize])),
             K::PutC => {
-                let mut b = v(0).sv_string_bytes();
                 let idx = Self::sv_int_arg(v(1));
                 let mut cv = v(2).resize_for_assign(8);
                 if cv.has_xz() {
                     cv = cv.to_two_state();
                 }
                 let ch = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
-                if idx >= 0 && (idx as usize) < b.len() && ch != 0 {
-                    b[idx as usize] = ch;
-                    Value::from_bytes(&b)
-                } else {
-                    v(0).clone()
-                }
+                v(0).sv_string_putc(i64::from(idx), ch)
             }
             K::IToA => Self::sv_int_toa(v(0), 10),
             K::HexToA => Self::sv_int_toa(v(0), 16),

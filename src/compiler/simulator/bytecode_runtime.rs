@@ -4207,8 +4207,10 @@ impl Simulator {
                     // already handled (drop the write on BOTH paths).
                     let mut handled =
                         !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id);
-                    // 2-state targets take the slow path so X/Z is dropped
-                    // (§6.11.1/§10.7); the raw-bit fast path would keep it.
+                    // Fast inline path for <=64-bit signals (including 2-state
+                    // targets, coercing X/Z -> 0 before change detection).
+                    let dst_two_state = self.signal_two_state.get(id).copied().unwrap_or(false);
+                    let src_ref = &self.vm_regs[*val_reg as usize];
                     if !handled
                         // Step 9e: width 0 (a class-handle signal — the plan
                         // widths of class formals are 0) must skip the raw-bit
@@ -4220,23 +4222,56 @@ impl Simulator {
                         && *width <= 64
                         && self.signal_widths[id] == *width
                         && !self.signal_real[id]
-                        && !self.signal_two_state.get(id).copied().unwrap_or(false)
+                        && !self.signal_is_string.get(id).copied().unwrap_or(false)
+                        && !src_ref.is_real
+                        && !src_ref.is_fill
+                        && (src_ref.width >= *width || !src_ref.is_signed)
                     {
-                        let mask = if *width >= 64 {
+                        let dst_mask = if *width >= 64 {
                             u64::MAX
                         } else {
                             (1u64 << *width) - 1
                         };
-                        let (src_v, src_x) = self.vm_regs[*val_reg as usize].raw_bits();
-                        let src_v = src_v & mask;
-                        let src_x = src_x & mask;
-                        let (dst_v, dst_x) = self.signal_table[id].raw_bits();
-                        if self.warn_x && self.time > 0 {
-                            self.warn_x_note_bits(id, dst_v & mask, dst_x & mask, src_v, src_x);
+                        let src_mask = if src_ref.width >= 64 {
+                            u64::MAX
+                        } else if src_ref.width == 0 {
+                            0
+                        } else {
+                            (1u64 << src_ref.width) - 1
+                        };
+                        let (mut src_v, mut src_x) = src_ref.raw_bits();
+                        let eff_mask = dst_mask & src_mask;
+                        src_v &= eff_mask;
+                        src_x &= eff_mask;
+                        if dst_two_state {
+                            src_v &= !src_x;
+                            src_x = 0;
                         }
-                        if src_v == (dst_v & mask) && src_x == (dst_x & mask) {
+                        let dst_ref = &self.signal_table[id];
+                        let (dst_v, dst_x) = dst_ref.raw_bits();
+                        let dst_shape_ok = dst_ref.width == *width
+                            && !dst_ref.is_real
+                            && !dst_ref.is_fill
+                            && dst_ref.is_signed == self.signal_signed[id];
+                        if self.warn_x && self.time > 0 && !dst_two_state {
+                            self.warn_x_note_bits(
+                                id,
+                                dst_v & dst_mask,
+                                dst_x & dst_mask,
+                                src_v,
+                                src_x,
+                            );
+                        }
+                        if dst_shape_ok
+                            && src_v == (dst_v & dst_mask)
+                            && src_x == (dst_x & dst_mask)
+                        {
                             handled = true;
-                        } else if self.signal_table[id].set_inline_bits(src_v, src_x) {
+                        } else if self.signal_table[id].width == *width
+                            && !self.signal_table[id].is_real
+                            && !self.signal_table[id].is_fill
+                            && self.signal_table[id].set_inline_bits(src_v, src_x)
+                        {
                             self.sync_mirror(id);
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {

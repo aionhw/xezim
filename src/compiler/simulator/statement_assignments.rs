@@ -3380,10 +3380,11 @@ impl Simulator {
                 let mut out: Vec<u8> = Vec::new();
                 for p in parts {
                     let pv = self.eval_expr(p);
+                    let bytes = pv.sv_string_bytes_cow();
                     if self.operand_has_string_type(p) {
-                        out.extend_from_slice(&pv.sv_string_bytes());
+                        out.extend_from_slice(&bytes);
                     } else {
-                        out.extend(pv.sv_string_bytes().into_iter().filter(|&b| b != 0));
+                        out.extend(bytes.iter().copied().filter(|&b| b != 0));
                     }
                 }
                 let sval = Value::from_bytes(&out);

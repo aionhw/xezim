@@ -5480,8 +5480,8 @@ impl Simulator {
                 }
                 if let Some(nm) = target {
                     // (a) Full typedef (carries signedness / real-ness).
-                    if let Some(dt) = self.module.typedef_types.get(&nm).cloned() {
-                        if self.dt_is_real(&dt) {
+                    if let Some(dt) = self.module.typedef_types.get(&nm) {
+                        if self.dt_is_real(dt) {
                             return Value::from_f64(inner_v.to_f64());
                         }
                         // §6.24.1 cast to an UNPACKED ARRAY / QUEUE typedef
@@ -5496,19 +5496,19 @@ impl Simulator {
                             let mut out = if inner_v.is_real {
                                 Self::real_to_int(
                                     inner_v.to_f64(),
-                                    self.cast_context_width(&dt).max(1),
+                                    self.cast_context_width(dt).max(1),
                                 )
                             } else {
                                 inner_v
                             };
                             out.is_signed = super::elaborate::is_type_signed_resolved(
-                                &dt,
+                                dt,
                                 &self.module.typedef_types,
                             );
                             return out;
                         }
                         let w = super::elaborate::resolve_type_width(
-                            &dt,
+                            dt,
                             Some(&self.module.parameters),
                             Some(&self.module.typedefs),
                         )
@@ -5520,13 +5520,13 @@ impl Simulator {
                         };
                         // §6.24.1: a 2-state typedef target takes x/z as 0.
                         if super::elaborate::is_type_two_state_resolved(
-                            &dt,
+                            dt,
                             &self.module.typedef_types,
                         ) {
                             out = out.to_two_state();
                         }
                         out.is_signed = super::elaborate::is_type_signed_resolved(
-                            &dt,
+                            dt,
                             &self.module.typedef_types,
                         );
                         return out;
@@ -5788,7 +5788,7 @@ impl Simulator {
                                     .map_or_else(|| fixed(&rname), |s| fixed(&s));
                             }
                             if !is_fixed_array {
-                                let len = self.eval_expr(arg).sv_string_bytes().len() as u64;
+                                let len = self.eval_expr(arg).sv_string_len() as u64;
                                 return Self::dynamic_query_result(&sn, len);
                             }
                         }

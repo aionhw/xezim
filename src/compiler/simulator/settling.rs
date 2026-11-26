@@ -2699,33 +2699,63 @@ impl Simulator {
                             // (need a true resize), or Wide values.
                             let dst_w = self.signal_widths[*dst_id];
                             let mut handled = false;
-                            // 2-state / real destinations take the slow (fit) path so
-                            // X/Z is dropped and real<->int converts (§10.7); the
-                            // raw-bit fast path would copy them verbatim.
-                            if *width <= 64
+                            // Fast inline path for <=64-bit DirectCopy (including
+                            // 2-state targets, coercing X/Z -> 0 per §10.7).
+                            if *width > 0
+                                && *width <= 64
                                 && dst_w == *width
                                 && self.signal_widths[*src_id] == *width
                                 && !self.signal_real[*dst_id]
-                                && !self.signal_two_state.get(*dst_id).copied().unwrap_or(false)
+                                && !self.signal_real[*src_id]
+                                && !self
+                                    .signal_is_string
+                                    .get(*dst_id)
+                                    .copied()
+                                    .unwrap_or(false)
+                                && !self.signal_table[*src_id].is_real
+                                && !self.signal_table[*src_id].is_fill
+                                && self.signal_table[*src_id].width == *width
+                                && !self.signal_table[*dst_id].is_real
+                                && !self.signal_table[*dst_id].is_fill
+                                && self.signal_table[*dst_id].width == *width
                                 && (self.sdf_delays.is_empty()
                                     || self.sdf_delays.get(*dst_id).copied().unwrap_or(0) == 0)
                             {
-                                let (sv, sx) = self.signal_table[*src_id].raw_bits();
-                                let (dv, dx) = self.signal_table[*dst_id].raw_bits();
-                                if warn_x_on {
-                                    self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
+                                let dst_two_state =
+                                    self.signal_two_state.get(*dst_id).copied().unwrap_or(false);
+                                let mask = if *width >= 64 {
+                                    u64::MAX
+                                } else {
+                                    (1u64 << *width) - 1
+                                };
+                                let (mut sv, mut sx) = self.signal_table[*src_id].raw_bits();
+                                sv &= mask;
+                                sx &= mask;
+                                if dst_two_state {
+                                    sv &= !sx;
+                                    sx = 0;
                                 }
-                                if sv == dv && sx == dx {
+                                let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                                let dv_m = dv & mask;
+                                let dx_m = dx & mask;
+                                let signed_match =
+                                    self.signal_table[*dst_id].is_signed == self.signal_signed[*dst_id];
+                                if warn_x_on && !dst_two_state {
+                                    self.warn_x_note_bits(*dst_id, dv_m, dx_m, sv, sx);
+                                }
+                                if signed_match && sv == dv_m && sx == dx_m {
                                     // Already equal; no work, no dirty mark.
                                     handled = true;
                                 } else if self.signal_table[*dst_id].set_inline_bits(sv, sx) {
+                                    self.signal_table[*dst_id].is_signed =
+                                        self.signal_signed[*dst_id];
                                     self.table_modified = true;
                                     self.after_signal_write(*dst_id);
                                     if capture_churn {
                                         churn.push((*dst_id, eidx));
                                     }
                                     note_toggle!(*dst_id);
-                                    trigger_deps!(*dst_id, eidx, (sv ^ dv) | (sx ^ dx));
+                                    trigger_deps!(*dst_id, eidx, (sv ^ dv_m) | (sx ^ dx_m));
                                     handled = true;
                                 }
                                 // If set_inline_bits returned false (Wide storage),

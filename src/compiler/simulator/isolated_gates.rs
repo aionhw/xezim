@@ -382,17 +382,33 @@ impl Simulator {
                 let dst_w = signal_widths[*dst_id];
                 let dst_two_state = signal_two_state.get(*dst_id).copied().unwrap_or(false);
                 let mut handled = false;
-                // Inline raw-bit copy only when src and dst widths match;
-                // set_inline_bits does not mask, so narrowing must go through
-                // the resize branch below (pr2224949).
-                if *width <= 64
+                // Inline raw-bit copy when src and dst are <=64-bit matched widths
+                // (2-state targets coerce X/Z -> 0 before write).
+                if *width > 0
+                    && *width <= 64
                     && dst_w == *width
                     && signal_widths[*src_id] == *width
-                    && !dst_two_state
+                    && !view[*src_id].is_real
+                    && !view[*src_id].is_fill
+                    && view[*src_id].width == *width
+                    && !view[*dst_id].is_real
+                    && !view[*dst_id].is_fill
+                    && view[*dst_id].width == *width
                 {
-                    let (sv, sx) = view[*src_id].raw_bits();
+                    let mask = if *width >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << *width) - 1
+                    };
+                    let (mut sv, mut sx) = view[*src_id].raw_bits();
+                    sv &= mask;
+                    sx &= mask;
+                    if dst_two_state {
+                        sv &= !sx;
+                        sx = 0;
+                    }
                     let (dv, dx) = view[*dst_id].raw_bits();
-                    if sv == dv && sx == dx {
+                    if sv == (dv & mask) && sx == (dx & mask) {
                         handled = true;
                     } else if view[*dst_id].set_inline_bits(sv, sx) {
                         dirtied.push(*dst_id as u32);

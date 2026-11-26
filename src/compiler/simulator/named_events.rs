@@ -2704,7 +2704,7 @@ impl Simulator {
         // realtoa(v)` MODIFY the receiver in place. Every one of them was a
         // silent no-op.
         if mname == "putc" && args.len() == 2 {
-            let mut b = self.eval_expr(recv).sv_string_bytes();
+            let mut cur = self.eval_expr(recv);
             let idx = Self::sv_int_arg(&self.eval_expr(&args[0]));
             let mut cv = self.eval_expr(&args[1]).resize_for_assign(8);
             if cv.has_xz() {
@@ -2713,10 +2713,8 @@ impl Simulator {
             let ch = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
             // §6.16.4: an out-of-range index or a null character leaves the
             // string unchanged.
-            if idx >= 0 && (idx as usize) < b.len() && ch != 0 {
-                b[idx as usize] = ch;
-                let v = Value::from_bytes(&b);
-                self.assign_value(recv, &v);
+            if cur.sv_string_putc_in_place(i64::from(idx), ch) {
+                self.assign_value(recv, &cur);
             }
             return Some(Value::zero(1));
         }

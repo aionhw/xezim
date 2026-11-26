@@ -3843,16 +3843,6 @@ impl Simulator {
         Self::sv_byte(byte)
     }
 
-    /// §6.16 `toupper`/`tolower`: ASCII letters only; every other byte,
-    /// including Latin-1 letters, is unchanged (and keeps its one-byte width).
-    pub(super) fn sv_ascii_case(s: &str, upper: bool) -> String {
-        if upper {
-            s.to_ascii_uppercase()
-        } else {
-            s.to_ascii_lowercase()
-        }
-    }
-
     /// §6.24.1: pack a call-returned dynamic array/queue (recorded in
     /// `pending_ret_collection`) into a `target_w`-bit vector — element 0
     /// most significant, each element sliced to target_w / n bits (the cast

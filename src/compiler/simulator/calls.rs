@@ -1244,8 +1244,9 @@ impl Simulator {
                 && args.is_empty()
                 && !self.class_expr_has_method(expr, mname)
             {
-                let s = self.eval_expr(expr).to_sv_string();
-                return Value::from_string(&Self::sv_ascii_case(&s, mname == "toupper"));
+                return self
+                    .eval_expr(expr)
+                    .sv_string_ascii_case(mname == "toupper");
             }
             // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal. A
             // user-defined class method of the same name (e.g. inherited
@@ -1710,16 +1711,10 @@ impl Simulator {
                         return Self::sv_byte(b);
                     }
                     "toupper" => {
-                        return Value::from_string(&Self::sv_ascii_case(
-                            &recv_val.to_sv_string(),
-                            true,
-                        ));
+                        return recv_val.sv_string_ascii_case(true);
                     }
                     "tolower" => {
-                        return Value::from_string(&Self::sv_ascii_case(
-                            &recv_val.to_sv_string(),
-                            false,
-                        ));
+                        return recv_val.sv_string_ascii_case(false);
                     }
                     "atoi" | "atohex" | "atooct" | "atobin" => {
                         let radix = match mname {
@@ -2524,8 +2519,9 @@ impl Simulator {
                 } else if (m == "tolower" || m == "toupper")
                     && !self.class_expr_has_method(&base_expr, &m)
                 {
-                    let s = self.eval_expr(&base_expr).to_sv_string();
-                    return Value::from_string(&Self::sv_ascii_case(&s, m == "toupper"));
+                    return self
+                        .eval_expr(&base_expr)
+                        .sv_string_ascii_case(m == "toupper");
                 } else if matches!(m.as_str(), "atoi" | "atohex" | "atooct" | "atobin")
                     && !self.class_expr_has_method(&base_expr, &m)
                 {
