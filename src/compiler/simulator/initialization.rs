@@ -3659,8 +3659,14 @@ impl Simulator {
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
                     signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
-                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
-                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri0
+                            | super::elaborate::ResolvedNetKind::Supply0,
+                        ) => Value::zero(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri1
+                            | super::elaborate::ResolvedNetKind::Supply1,
+                        ) => Value::ones(signal_widths_vec[id]),
                         _ => Value::all_z(signal_widths_vec[id]),
                     };
                 }
@@ -3940,8 +3946,14 @@ impl Simulator {
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
                     signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
-                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
-                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri0
+                            | super::elaborate::ResolvedNetKind::Supply0,
+                        ) => Value::zero(signal_widths_vec[id]),
+                        Some(
+                            super::elaborate::ResolvedNetKind::Tri1
+                            | super::elaborate::ResolvedNetKind::Supply1,
+                        ) => Value::ones(signal_widths_vec[id]),
                         _ => Value::all_z(signal_widths_vec[id]),
                     };
                 }
@@ -5268,7 +5280,11 @@ impl Simulator {
             comb_plan: Vec::new(),
             ts_arena: Vec::new(),
             ts_hdr: Vec::new(),
+            ts_has_overflow: false,
             ts_edge: Vec::new(),
+            ts_edge_arena: Vec::new(),
+            ts_edge_hdr: Vec::new(),
+            ts_edge_hdr_tsx: Vec::new(),
             ts_regs: Vec::new(),
             ts_xregs: Vec::new(),
             ts_hdr_tsx: Vec::new(),
@@ -5317,6 +5333,10 @@ impl Simulator {
             ts_ctl_by_entry: Vec::new(),
             ts_ctl_dsts: Vec::new(),
             ts_ctl_rearm_pending: Vec::new(),
+            case_ctl: Vec::new(),
+            case_ctl_by_entry: Vec::new(),
+            case_ctl_dsts: Vec::new(),
+            case_ctl_rearm_pending: Vec::new(),
             ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
                 && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
                 && std::env::var_os("XEZIM_BSP_SHADOW").is_none(),
@@ -5324,9 +5344,9 @@ impl Simulator {
             mux_guards: Vec::new(),
             mux_guard_by_entry: Vec::new(),
             prof_mux_skipped: 0,
-            ts_mux_stream_on: std::env::var("XEZIM_TS_MUX_STREAM").as_deref() == Ok("1"),
-            settle_pop_word: std::env::var("XEZIM_SETTLE_POP_WORD").as_deref() == Ok("1"),
-            ts_range_delta: std::env::var("XEZIM_TS_RANGE_DELTA").as_deref() == Ok("1"),
+            ts_mux_stream_on: std::env::var("XEZIM_TS_MUX_STREAM").ok().as_deref() != Some("0"),
+            settle_pop_word: std::env::var("XEZIM_SETTLE_POP_WORD").ok().as_deref() != Some("0"),
+            ts_range_delta: std::env::var("XEZIM_TS_RANGE_DELTA").ok().as_deref() != Some("0"),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),

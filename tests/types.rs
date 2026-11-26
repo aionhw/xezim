@@ -934,3 +934,6 @@ mod thomas_data_types_1638;
 
 #[path = "types/packed_struct_input_actual_1645.rs"]
 mod packed_struct_input_actual_1645;
+
+#[path = "types/chapter6_nets_1638.rs"]
+mod chapter6_nets_1638;

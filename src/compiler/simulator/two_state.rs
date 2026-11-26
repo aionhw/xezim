@@ -435,7 +435,31 @@ impl Simulator {
                 &mut self.ts_comb
             };
             slots[eidx] = match lowered {
-                Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
+                Some(ts) => {
+                    if edge
+                        && ts.insns.len() <= TS_HDR_LEN_MAX
+                        && ts.num_regs <= u16::MAX as u32
+                        && self.ts_edge_arena.len() < (u32::MAX as usize - ts.insns.len())
+                    {
+                        if self.ts_edge_hdr.len() <= eidx {
+                            self.ts_edge_hdr.resize(eidx + 1, TsHdr::default());
+                        }
+                        let off = self.ts_edge_arena.len() as u32;
+                        self.ts_edge_arena.extend(ts.insns.iter().cloned());
+                        let kind = Self::ts_kind_of(&ts);
+                        self.ts_edge_hdr[eidx] = TsHdr {
+                            off,
+                            len_kind: (ts.insns.len() as u16)
+                                | ((kind as u16) << TS_HDR_KIND_SHIFT),
+                            num_regs: ts.num_regs as u16,
+                        };
+                        if self.ts_edge_hdr_tsx.len() <= eidx {
+                            self.ts_edge_hdr_tsx.resize(eidx + 1, 0);
+                        }
+                        self.ts_edge_hdr_tsx[eidx] = ts.tsx as u8;
+                    }
+                    TsSlot::Yes(std::sync::Arc::new(ts))
+                }
                 None => TsSlot::No,
             };
             if !edge && matches!(self.ts_comb[eidx], TsSlot::Yes(_)) {
@@ -471,6 +495,11 @@ impl Simulator {
                     &mut self.ts_comb
                 };
                 slots[eidx] = TsSlot::No;
+                if edge {
+                    if let Some(h) = self.ts_edge_hdr.get_mut(eidx) {
+                        h.len_kind = 0;
+                    }
+                }
             }
         }
         ok
@@ -566,6 +595,12 @@ impl Simulator {
                     return;
                 };
                 rec.slot = Some(std::mem::replace(sl, TsSlot::No));
+                if let Some(h) = self.ts_edge_hdr.get_mut(idx) {
+                    if h.len_kind != 0 {
+                        rec.len_kind = h.len_kind;
+                        h.len_kind = 0;
+                    }
+                }
             }
         }
         // XEZIM_TS_DBG: which streams sleep, by opcode set (census input).
@@ -690,6 +725,11 @@ impl Simulator {
                     if let (Some(sl), Some(slot)) = (self.ts_edge.get_mut(idx), rec.slot) {
                         *sl = slot;
                     }
+                    if rec.len_kind != 0 {
+                        if let Some(h) = self.ts_edge_hdr.get_mut(idx) {
+                            h.len_kind = rec.len_kind;
+                        }
+                    }
                 }
             }
         }
@@ -806,66 +846,121 @@ impl Simulator {
     pub(super) const TS_AND2: u8 = 9;
     pub(super) const TS_OR2: u8 = 10;
     pub(super) const TS_EQ_STORE: u8 = 11;
+    pub(super) const TS_REPL_MASK: u8 = 12;
+    pub(super) const TS_AND_REDOR: u8 = 13;
+    pub(super) const TS_WMUX_STREAM: u8 = 14;
+    pub(super) const TS_WREPL_MASK: u8 = 15;
 
-    /// A lowered conditional whose inputs and one partial write can be
-    /// evaluated without filling a VM register file. The stream starts with
-    /// the existing fused load of the selector and the true arm.
+    /// A lowered conditional (`dst = sel ? yes : no`) whose selector can be
+    /// evaluated first so the unselected arm is never loaded (and may be
+    /// dynamically edge-masked via `TsCtl`).
     pub(super) fn is_mux_stream(insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
-        matches!(insns, [
-            LoadSigSigRange { dl, d: yes, .. },
-            SigRange { d: no, .. } | SigRangeW { d: no, .. },
-            Sel { d, c, a, b, .. },
-            RangeStore { s, .. } | RangeStoreW { s, .. },
-        ] if dl == c && yes == a && no == b && d == s
-            && dl != yes && dl != no && yes != no)
+        match insns {
+            [
+                LoadSigSigRange { dl, d: yes, .. },
+                LoadSig { d: no, .. } | SigRange { d: no, .. } | SigRangeW { d: no, .. },
+                Sel { d, c, a, b, .. },
+                Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. },
+            ] => dl == c && yes == a && no == b && d == s && dl != yes && dl != no && yes != no,
+            [
+                LoadSig { d: sel, .. },
+                LoadSig { d: yes, .. } | SigRange { d: yes, .. } | SigRangeW { d: yes, .. },
+                LoadSig { d: no, .. } | SigRange { d: no, .. } | SigRangeW { d: no, .. },
+                Sel { d, c, a, b, .. },
+                Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. },
+            ] => {
+                sel == c
+                    && yes == a
+                    && no == b
+                    && d == s
+                    && sel != yes
+                    && sel != no
+                    && yes != no
+            }
+            _ => false,
+        }
     }
 
-    /// Preserve the ordinary stream's X-read bails and range write hooks.
-    /// A bail happens before the only store, so the X-plane fallback can
-    /// execute the unmodified stream.
-    fn exec_mux_stream(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
+    /// IEEE 1800 §11.4.11: a known selector permits loading only the active arm.
+    #[inline(always)]
+    fn exec_mux_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
         use super::bytecode::TsInsn::*;
-        let [
-            LoadSigSigRange {
-                sig,
-                sig2,
-                lo,
-                mask,
-                ..
-            },
-            no,
-            Sel { m, .. },
-            store,
-        ] = insns
-        else {
-            unreachable!("lowered mux stream");
+        let (sel_sig, sel_mask, store) = match insns {
+            [
+                LoadSigSigRange { sig, .. },
+                _,
+                Sel { m, .. },
+                st,
+            ]
+            | [LoadSig { sig, .. }, _, _, Sel { m, .. }, st] => (*sig, *m, st),
+            _ => unreachable!("lowered mux stream"),
         };
-        let planes = |id: u32| {
-            self.signal_inline_bits.get(id as usize).map_or_else(
-                || self.signal_table[id as usize].raw_bits(),
-                |bits| (bits[0], bits[1]),
-            )
-        };
-        let (selector, sx) = planes(*sig);
-        let (yes, yx) = planes(*sig2);
-        let yes = (yes >> lo) & mask;
-        let (no, nx) = match *no {
-            SigRange { sig, lo, mask, .. } => {
-                let (value, unknown) = planes(sig);
-                ((value >> lo) & mask, unknown)
-            }
-            SigRangeW { sig, lo, w, .. } => {
-                Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w)
-            }
-            _ => unreachable!("lowered mux false arm"),
-        };
-        if sx | yx | nx != 0 {
+        let (selector, sx) =
+            unsafe { self.signal_table.get_unchecked(sel_sig as usize) }.raw_bits();
+        if sx != 0 {
+            self.ts_ctl_set_state(eidx, dep_edges, 0);
             self.ts_xread_bail = true;
             return false;
         }
-        let value = (if selector != 0 { yes } else { no }) & m;
+        let read_arm = |sim: &Self, insn: &super::bytecode::TsInsn| -> (u64, u64) {
+            match *insn {
+                LoadSig { sig, .. } => {
+                    unsafe { sim.signal_table.get_unchecked(sig as usize) }.raw_bits()
+                }
+                SigRange { sig, lo, mask, .. } => {
+                    let (v, x) = unsafe { sim.signal_table.get_unchecked(sig as usize) }.raw_bits();
+                    ((v >> lo) & mask, (x >> lo) & mask)
+                }
+                SigRangeW {
+                    sig, lo, w, mask, ..
+                } => {
+                    let (v, x) = Self::raw_bits_slice(
+                        unsafe { sim.signal_table.get_unchecked(sig as usize) },
+                        lo,
+                        w,
+                    );
+                    (v & mask, x & mask)
+                }
+                _ => unreachable!("lowered mux arm"),
+            }
+        };
+        let (val, vx, want_state) = if selector != 0 {
+            let (v, x) = match &insns[0] {
+                LoadSigSigRange {
+                    sig2, lo, mask, ..
+                } => {
+                    let (v, x) =
+                        unsafe { self.signal_table.get_unchecked(*sig2 as usize) }.raw_bits();
+                    ((v >> lo) & mask, (x >> lo) & mask)
+                }
+                _ => read_arm(self, &insns[1]),
+            };
+            (v, x, 2u8) // yes active, mask no (pos1)
+        } else {
+            let no_insn = if insns.len() == 4 {
+                &insns[1]
+            } else {
+                &insns[2]
+            };
+            let (v, x) = read_arm(self, no_insn);
+            (v, x, 1u8) // no active, mask yes (pos0)
+        };
+        if vx != 0 {
+            self.ts_ctl_set_state(eidx, dep_edges, 0);
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let value = val & sel_mask;
         match *store {
+            Store { sig, mask, .. } => {
+                self.ts_store(sig as usize, value & mask, mask);
+            }
             RangeStore {
                 sig, hi, lo, mask, ..
             } => {
@@ -878,6 +973,479 @@ impl Simulator {
             }
             _ => unreachable!("lowered mux destination"),
         }
+        if self.forced_signals.is_empty() {
+            self.ts_ctl_set_state(eidx, dep_edges, want_state);
+        }
+        true
+    }
+
+    /// Wide (65..=512-bit) short-circuiting mux: `dst = sel ? wide_a : wide_b`.
+    /// Never loads the unselected arm, preventing X-bails when an idle wide
+    /// slot holds X, and dynamically masks the unselected arm via `TsCtl`.
+    pub(super) fn is_wmux_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(
+            insns,
+            [
+                LoadSig { d: sel, .. },
+                WLoadSig { d: yes, .. } | WSigRange { d: yes, .. },
+                WLoadSig { d: no, .. } | WSigRange { d: no, .. },
+                WSel { d, c, a, b },
+                WStore { s, .. } | WRangeStore { s, .. },
+            ] if sel == c && yes == a && no == b && d == s
+                && sel != yes && sel != no && yes != no
+        )
+    }
+
+    #[inline(always)]
+    fn exec_wmux_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let LoadSig { sig: sel_sig, .. } = insns[0] else {
+            unreachable!("wmux sel");
+        };
+        let (selector, sx) =
+            unsafe { self.signal_table.get_unchecked(sel_sig as usize) }.raw_bits();
+        if sx != 0 {
+            self.ts_ctl_set_state(eidx, dep_edges, 0);
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (arm, want_state) = if selector != 0 {
+            (&insns[1], 2u8)
+        } else {
+            (&insns[2], 1u8)
+        };
+        let mut words = [0u64; 8];
+        let nw = match *arm {
+            WLoadSig { sig, .. } => {
+                let s = sig as usize;
+                let w = self.signal_widths[s] as usize;
+                let nw = w.div_ceil(64);
+                if nw > 8
+                    || !unsafe { self.signal_table.get_unchecked(s) }
+                        .words_if_clean(&mut words[..nw])
+                {
+                    self.ts_ctl_set_state(eidx, dep_edges, 0);
+                    self.ts_xread_bail = true;
+                    return false;
+                }
+                nw
+            }
+            WSigRange { sig, lo, w, .. } => {
+                let s = sig as usize;
+                let nw = (w as usize).div_ceil(64);
+                if nw > 8 {
+                    self.ts_ctl_set_state(eidx, dep_edges, 0);
+                    self.ts_xread_bail = true;
+                    return false;
+                }
+                let tbl = unsafe { self.signal_table.get_unchecked(s) };
+                let mut off = 0u16;
+                let mut i = 0usize;
+                while off < w {
+                    let n = (w - off).min(64);
+                    let (wv, wx) = Self::raw_bits_slice(tbl, lo + off, n);
+                    if wx != 0 {
+                        self.ts_ctl_set_state(eidx, dep_edges, 0);
+                        self.ts_xread_bail = true;
+                        return false;
+                    }
+                    words[i] = wv;
+                    i += 1;
+                    off += 64;
+                }
+                nw
+            }
+            _ => unreachable!("wmux arm"),
+        };
+        match insns[4] {
+            WStore { sig, .. } => {
+                self.ts_store_wide(sig as usize, &words[..nw]);
+            }
+            WRangeStore { sig, lo, w, .. } => {
+                self.ts_wide_range_store2(sig as usize, lo, &words[..nw], w);
+            }
+            _ => unreachable!("wmux dst"),
+        }
+        if self.forced_signals.is_empty() {
+            self.ts_ctl_set_state(eidx, dep_edges, want_state);
+        }
+        true
+    }
+
+    /// A zero enable short-circuits `{N{en}} & src` and masks the source edge.
+    pub(super) fn is_repl_mask_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        let dst_w = |st: &super::bytecode::TsInsn| -> Option<u32> {
+            match *st {
+                Store { mask, .. } => Some(mask.count_ones()),
+                RangeStore { hi, lo, .. } | RangeStoreW { hi, lo, .. } => {
+                    hi.checked_sub(lo).map(|d| d + 1)
+                }
+                _ => None,
+            }
+        };
+        match insns {
+            [
+                LoadSigRepl {
+                    dl,
+                    d: r1,
+                    w: 1,
+                    count,
+                    ..
+                },
+                SigRangeAnd {
+                    dr: r2,
+                    d: r3,
+                    a,
+                    b,
+                    ..
+                },
+                st @ (Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. }),
+            ] => {
+                dl != r1
+                    && r1 != r2
+                    && r3 == s
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && dst_w(st).is_some_and(|dw| (*count as u32) >= dw)
+            }
+            [
+                LoadSigRepl {
+                    dl,
+                    d: r1,
+                    w: 1,
+                    count,
+                    ..
+                },
+                LoadSig { d: r2, .. } | SigRange { d: r2, .. } | SigRangeW { d: r2, .. },
+                And { d: r3, a, b },
+                st @ (Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. }),
+            ] => {
+                dl != r1
+                    && r1 != r2
+                    && r3 == s
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && dst_w(st).is_some_and(|dw| (*count as u32) >= dw)
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn exec_repl_mask_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let LoadSigRepl { sig: en_sig, .. } = insns[0] else {
+            unreachable!("repl_mask en");
+        };
+        let store = insns.last().unwrap();
+        let (ev, ex) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if ex == 0 && (ev & 1) == 0 {
+            match *store {
+                Store { sig, mask, .. } => self.ts_store(sig as usize, 0, mask),
+                RangeStore { sig, hi, lo, .. } => self.ts_range_store(sig as usize, 0, lo, hi),
+                RangeStoreW { sig, hi, lo, .. } => {
+                    self.ts_wide_range_store(sig as usize, lo, hi, 0, 0)
+                }
+                _ => unreachable!("repl_mask dst"),
+            }
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if ex != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let (sv, sx) = match insns[1] {
+            SigRangeAnd { sig, lo, mask, .. } | SigRange { sig, lo, mask, .. } => {
+                let (v, x) = unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits();
+                ((v >> lo) & mask, (x >> lo) & mask)
+            }
+            LoadSig { sig, .. } => {
+                unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits()
+            }
+            SigRangeW {
+                sig, lo, w, mask, ..
+            } => {
+                let (v, x) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(sig as usize) },
+                    lo,
+                    w,
+                );
+                (v & mask, x & mask)
+            }
+            _ => unreachable!("repl_mask src"),
+        };
+        if sx != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        match *store {
+            Store { sig, mask, .. } => self.ts_store(sig as usize, sv & mask, mask),
+            RangeStore {
+                sig, hi, lo, mask, ..
+            } => self.ts_range_store(sig as usize, sv & mask, lo, hi),
+            RangeStoreW {
+                sig, hi, lo, mask, ..
+            } => self.ts_wide_range_store(sig as usize, lo, hi, sv & mask, 0),
+            _ => unreachable!("repl_mask dst"),
+        }
+        true
+    }
+
+    /// Wide replication mask with the same zero-enable shortcut.
+    pub(super) fn is_wrepl_mask_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        match insns {
+            [
+                LoadSig { d: r0, .. },
+                WRepl {
+                    d: r1,
+                    s,
+                    w: 1,
+                    count,
+                },
+                WLoadSig { d: r2, .. } | WSigRange { d: r2, .. },
+                WAnd { d: r3, a, b },
+                st @ (WStore { s: st_s, .. } | WRangeStore { s: st_s, .. }),
+            ] => {
+                let dst_ok = match *st {
+                    WStore { .. } => true,
+                    WRangeStore { w, .. } => (*count as u32) >= w,
+                    _ => false,
+                };
+                s == r0
+                    && r1 != r2
+                    && r3 == st_s
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && (*count as usize) <= 512
+                    && dst_ok
+            }
+            [
+                WLoadSig { d: r2, .. } | WSigRange { d: r2, .. },
+                LoadSig { d: r0, .. },
+                WRepl {
+                    d: r1,
+                    s,
+                    w: 1,
+                    count,
+                },
+                WAnd { d: r3, a, b },
+                st @ (WStore { s: st_s, .. } | WRangeStore { s: st_s, .. }),
+            ] => {
+                let dst_ok = match *st {
+                    WStore { .. } => true,
+                    WRangeStore { w, .. } => (*count as u32) >= w,
+                    _ => false,
+                };
+                s == r0
+                    && r1 != r2
+                    && r3 == st_s
+                    && ((*a == *r1 && *b == *r2) || (*a == *r2 && *b == *r1))
+                    && (*count as usize) <= 512
+                    && dst_ok
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn exec_wrepl_mask_stream(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        eidx: usize,
+        dep_edges: &mut [DepEdge],
+    ) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (en_sig, count, src_insn) = match (&insns[0], &insns[1], &insns[2]) {
+            (LoadSig { sig, .. }, WRepl { count, .. }, src) => (*sig, *count as u32, src),
+            (src, LoadSig { sig, .. }, WRepl { count, .. }) => (*sig, *count as u32, src),
+            _ => unreachable!("wrepl_mask shape"),
+        };
+        let (ev, ex) = unsafe { self.signal_table.get_unchecked(en_sig as usize) }.raw_bits();
+        if ex == 0 && (ev & 1) == 0 {
+            let zeros = [0u64; 8];
+            match insns[4] {
+                WStore { sig, .. } => {
+                    let s = sig as usize;
+                    let nw = (self.signal_widths[s] as usize).div_ceil(64).min(8);
+                    self.ts_store_wide(s, &zeros[..nw]);
+                }
+                WRangeStore { sig, lo, w, .. } => {
+                    let nw = (w as usize).div_ceil(64).min(8);
+                    self.ts_wide_range_store2(sig as usize, lo, &zeros[..nw], w);
+                }
+                _ => unreachable!("wrepl_mask dst"),
+            }
+            if self.forced_signals.is_empty() {
+                self.ts_ctl_set_masked(eidx, dep_edges, true);
+            }
+            return true;
+        }
+        self.ts_ctl_set_masked(eidx, dep_edges, false);
+        if ex != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let mut words = [0u64; 8];
+        let nw = match *src_insn {
+            WLoadSig { sig, .. } => {
+                let s = sig as usize;
+                let w = self.signal_widths[s] as usize;
+                let nw = w.div_ceil(64);
+                if nw > 8
+                    || !unsafe { self.signal_table.get_unchecked(s) }
+                        .words_if_clean(&mut words[..nw])
+                {
+                    self.ts_xread_bail = true;
+                    return false;
+                }
+                nw
+            }
+            WSigRange { sig, lo, w, .. } => {
+                let s = sig as usize;
+                let nw = (w as usize).div_ceil(64);
+                if nw > 8 {
+                    self.ts_xread_bail = true;
+                    return false;
+                }
+                let tbl = unsafe { self.signal_table.get_unchecked(s) };
+                let mut off = 0u16;
+                let mut i = 0usize;
+                while off < w {
+                    let n = (w - off).min(64);
+                    let (wv, wx) = Self::raw_bits_slice(tbl, lo + off, n);
+                    if wx != 0 {
+                        self.ts_xread_bail = true;
+                        return false;
+                    }
+                    words[i] = wv;
+                    i += 1;
+                    off += 64;
+                }
+                nw
+            }
+            _ => unreachable!("wrepl_mask src"),
+        };
+        // Apply replication-count mask in case `count` is narrower than `src`.
+        let full_w = (count as usize) / 64;
+        let rem_b = (count as usize) % 64;
+        if full_w < nw {
+            if rem_b != 0 {
+                words[full_w] &= (1u64 << rem_b) - 1;
+                for w in &mut words[full_w + 1..nw] {
+                    *w = 0;
+                }
+            } else {
+                for w in &mut words[full_w..nw] {
+                    *w = 0;
+                }
+            }
+        }
+        match insns[4] {
+            WStore { sig, .. } => {
+                self.ts_store_wide(sig as usize, &words[..nw]);
+            }
+            WRangeStore { sig, lo, w, .. } => {
+                self.ts_wide_range_store2(sig as usize, lo, &words[..nw], w);
+            }
+            _ => unreachable!("wrepl_mask dst"),
+        }
+        true
+    }
+
+    /// A zero first operand short-circuits `|(a & b)`.
+    pub(super) fn is_and_redor_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(
+            insns,
+            [
+                LoadSig { d: r0, .. } | SigRange { d: r0, .. } | SigRangeW { d: r0, .. },
+                SigRangeAnd {
+                    dr: r1,
+                    d: r2,
+                    a,
+                    b,
+                    ..
+                },
+                RedOr { d: r3, s: rs },
+                Store { s, .. } | RangeStore { s, .. } | RangeStoreW { s, .. },
+            ] if r0 != r1
+                && rs == r2
+                && s == r3
+                && ((*a == *r0 && *b == *r1) || (*a == *r1 && *b == *r0))
+        )
+    }
+
+    #[inline(always)]
+    fn exec_and_redor_stream(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (v1, x1) = match insns[0] {
+            LoadSig { sig, .. } => {
+                unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits()
+            }
+            SigRange { sig, lo, mask, .. } => {
+                let (v, x) = unsafe { self.signal_table.get_unchecked(sig as usize) }.raw_bits();
+                ((v >> lo) & mask, (x >> lo) & mask)
+            }
+            SigRangeW {
+                sig, lo, w, mask, ..
+            } => {
+                let (v, x) = Self::raw_bits_slice(
+                    unsafe { self.signal_table.get_unchecked(sig as usize) },
+                    lo,
+                    w,
+                );
+                (v & mask, x & mask)
+            }
+            _ => unreachable!("and_redor lhs"),
+        };
+        let store_bit = |sim: &mut Self, bit: u64| match insns[3] {
+            Store { sig, mask, .. } => sim.ts_store(sig as usize, bit & mask, mask),
+            RangeStore {
+                sig, hi, lo, mask, ..
+            } => sim.ts_range_store(sig as usize, bit & mask, lo, hi),
+            RangeStoreW {
+                sig, hi, lo, mask, ..
+            } => sim.ts_wide_range_store(sig as usize, lo, hi, bit & mask, 0),
+            _ => unreachable!("and_redor dst"),
+        };
+        if x1 == 0 && v1 == 0 {
+            store_bit(self, 0);
+            return true;
+        }
+        let SigRangeAnd {
+            sig: s2,
+            lo: lo2,
+            mask: m2,
+            ..
+        } = insns[1]
+        else {
+            unreachable!("and_redor rhs");
+        };
+        let (b, bx) = unsafe { self.signal_table.get_unchecked(s2 as usize) }.raw_bits();
+        let (v2, x2) = ((b >> lo2) & m2, (bx >> lo2) & m2);
+        if x2 == 0 && v2 == 0 {
+            store_bit(self, 0);
+            return true;
+        }
+        if (x1 | x2) != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        store_bit(self, u64::from((v1 & v2) != 0));
         true
     }
 
@@ -1007,7 +1575,7 @@ impl Simulator {
     }
 
     #[inline(always)]
-    pub(super) fn ts_ctl_set_masked(&mut self, eidx: usize, dep_edges: &mut [DepEdge], want: bool) {
+    pub(super) fn ts_ctl_set_state(&mut self, eidx: usize, dep_edges: &mut [DepEdge], want: u8) {
         let Some(&slot) = self.ts_ctl_by_entry.get(eidx) else {
             return;
         };
@@ -1015,26 +1583,40 @@ impl Simulator {
             return;
         }
         let c = unsafe { self.ts_ctl.get_unchecked_mut(slot as usize) };
-        if c.masked == want {
+        let prev = c.mask_state;
+        if prev == want {
             return;
         }
-        c.masked = want;
-        let m0 = if want { 0 } else { c.smask0 };
-        let (lo0, hi0) = (c.pos0 as usize, (c.pos0 + c.npos0) as usize);
-        if let Some(es) = dep_edges.get_mut(lo0..hi0) {
-            for e in es {
-                e.mask = m0;
-            }
-        }
-        if c.npos1 != 0 {
-            let m1 = if want { 0 } else { c.smask1 };
-            let (lo1, hi1) = (c.pos1 as usize, (c.pos1 + c.npos1) as usize);
-            if let Some(es) = dep_edges.get_mut(lo1..hi1) {
+        c.mask_state = want;
+        let mask0_now = (want & 1) != 0;
+        let mask0_was = (prev & 1) != 0;
+        if mask0_now != mask0_was {
+            let m0 = if mask0_now { 0 } else { c.smask0 };
+            let (lo0, hi0) = (c.pos0 as usize, (c.pos0 + c.npos0) as usize);
+            if let Some(es) = dep_edges.get_mut(lo0..hi0) {
                 for e in es {
-                    e.mask = m1;
+                    e.mask = m0;
                 }
             }
         }
+        if c.npos1 != 0 {
+            let mask1_now = (want & 2) != 0;
+            let mask1_was = (prev & 2) != 0;
+            if mask1_now != mask1_was {
+                let m1 = if mask1_now { 0 } else { c.smask1 };
+                let (lo1, hi1) = (c.pos1 as usize, (c.pos1 + c.npos1) as usize);
+                if let Some(es) = dep_edges.get_mut(lo1..hi1) {
+                    for e in es {
+                        e.mask = m1;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn ts_ctl_set_masked(&mut self, eidx: usize, dep_edges: &mut [DepEdge], want: bool) {
+        self.ts_ctl_set_state(eidx, dep_edges, if want { 3 } else { 0 });
     }
 
     #[inline(always)]
@@ -1525,7 +2107,15 @@ impl Simulator {
             Self::TS_AND2 => self.exec_and2_stream(insns, eidx, dep_edges),
             Self::TS_OR2 => self.exec_or2_stream(insns, eidx, dep_edges),
             Self::TS_EQ_STORE => self.exec_eq_store_stream(insns),
-            Self::TS_MUX_STREAM if self.ts_mux_stream_on => self.exec_mux_stream(insns),
+            Self::TS_REPL_MASK => self.exec_repl_mask_stream(insns, eidx, dep_edges),
+            Self::TS_WREPL_MASK => self.exec_wrepl_mask_stream(insns, eidx, dep_edges),
+            Self::TS_AND_REDOR => self.exec_and_redor_stream(insns),
+            Self::TS_MUX_STREAM if self.ts_mux_stream_on => {
+                self.exec_mux_stream(insns, eidx, dep_edges)
+            }
+            Self::TS_WMUX_STREAM if self.ts_mux_stream_on => {
+                self.exec_wmux_stream(insns, eidx, dep_edges)
+            }
             kind => self.exec_two_state_parts(insns, h.num_regs as u32, kind),
         };
         if !ok {
@@ -1552,6 +2142,69 @@ impl Simulator {
             self.prof_ts_bail_abort += 1;
             self.ts_exec_aborted = true;
             return false;
+        }
+        self.ts_save_list.truncate(save_base);
+        self.prof_ts_evals += 1;
+        true
+    }
+
+    /// Run an edge block from the arena and fall back to four-state bytecode.
+    pub(super) fn ts_guard_and_exec_edge_arena(&mut self, block_idx: usize, h: TsHdr) -> bool {
+        self.ts_exec_aborted = false;
+        self.ts_last_xbail = false;
+        if self.warn_x {
+            self.prof_ts_bail_warnx += 1;
+            return self.exec_bytecode_interp(block_idx);
+        }
+        if !self.forced_signals.is_empty() {
+            if let Some(TsSlot::Yes(ts)) = self.ts_edge.get(block_idx) {
+                let p: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
+                if self.ts_writes_forced(unsafe { &*p }) {
+                    self.prof_ts_bail_forced += 1;
+                    return self.exec_bytecode_interp(block_idx);
+                }
+            }
+        }
+        // SAFETY: `ts_edge_arena` only grows at lowering time, never inside
+        // an executor, and the executors never touch `ts_edge_arena`.
+        let insns: &[super::bytecode::TsInsn] = unsafe {
+            std::slice::from_raw_parts(self.ts_edge_arena.as_ptr().add(h.off as usize), h.len())
+        };
+        let save_base = self.ts_save_list.len();
+        self.ts_cur_eidx = u32::MAX;
+        let ok = self.exec_two_state_parts(insns, h.num_regs as u32, h.kind());
+        if !ok {
+            self.ts_restore_saved(save_base);
+            if std::mem::take(&mut self.ts_xread_bail) {
+                if self.tsx_on
+                    && self.ts_edge_hdr_tsx.get(block_idx).copied().unwrap_or(0) != 0
+                    && self.exec_two_state_x(insns, h.num_regs as u32)
+                {
+                    self.ts_save_list.truncate(save_base);
+                    self.prof_tsx_evals += 1;
+                    self.prof_ts_evals += 1;
+                    return true;
+                }
+                self.prof_ts_bail_xread += 1;
+                self.ts_last_xbail = true;
+                self.ts_xbail_note(2, block_idx);
+                return self.exec_bytecode_interp(block_idx);
+            }
+            self.prof_ts_bail_abort += 1;
+            self.ts_exec_aborted = true;
+            if block_idx >= self.ts_edge_abortn.len() {
+                self.ts_edge_abortn.resize(block_idx + 1, 0);
+            }
+            self.ts_edge_abortn[block_idx] = self.ts_edge_abortn[block_idx].saturating_add(1);
+            if self.ts_edge_abortn[block_idx] >= TS_ABORT_DEMOTE {
+                if let Some(sl) = self.ts_edge.get_mut(block_idx) {
+                    *sl = TsSlot::No;
+                }
+                if let Some(eh) = self.ts_edge_hdr.get_mut(block_idx) {
+                    eh.len_kind = 0;
+                }
+            }
+            return self.exec_bytecode_interp(block_idx);
         }
         self.ts_save_list.truncate(save_base);
         self.prof_ts_evals += 1;
@@ -2704,8 +3357,20 @@ impl Simulator {
     /// inside (`Value::raw_bits`) then fell out of the inlining budget and
     /// became calls — a C910 SoC ran 1% more instructions with nothing new
     /// executing.
-    #[inline(never)]
     pub(super) fn exec_two_state_line(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        num_regs: u32,
+    ) -> bool {
+        if self.signal_inline_bits.is_empty() {
+            self.exec_two_state_line_inner::<false>(insns, num_regs)
+        } else {
+            self.exec_two_state_line_inner::<true>(insns, num_regs)
+        }
+    }
+
+    #[inline(never)]
+    fn exec_two_state_line_inner<const MIRROR: bool>(
         &mut self,
         insns: &[super::bytecode::TsInsn],
         num_regs: u32,
@@ -2726,17 +3391,13 @@ impl Simulator {
         // every operand access are provably redundant, so go through a raw
         // pointer (this loop is a quarter of a c906 run).
         let rp: *mut u64 = regs.as_mut_ptr();
-        // Signal (value, x) planes for a load. The plane mirror exists only
-        // under XEZIM_INLINE_BITS / JIT runs; test for it once per block
-        // instead of per load (a load through `self` cannot be hoisted past
-        // the stores' `&mut self` calls). Signal ids come from the lowered
-        // stream, validated against the table at lowering, and the table
-        // never shrinks, so the index is unchecked (as in the store helpers).
-        let mirror = !self.signal_inline_bits.is_empty();
+        // Signal (value, x) planes for a load. Const-specialized on `MIRROR`
+        // so the common non-JIT path compiles with zero mirror branches and
+        // smaller I-cache footprint.
         macro_rules! planes {
             ($s:expr) => {{
                 let __s: usize = $s;
-                if mirror {
+                if MIRROR {
                     match self.signal_inline_bits.get(__s) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[__s].raw_bits(),
@@ -4147,6 +4808,7 @@ impl Simulator {
         true
     }
 
+    #[inline]
     pub(crate) fn ts_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
         if let Some(i) = self.nba_fast_index.get(id) {
             let target = &mut self.nba_fast[i].value;
@@ -4155,7 +4817,27 @@ impl Simulator {
             target.set_inline_bits(new_v, new_x);
             target.is_signed = self.signal_signed[id];
         } else {
-            let (base_v, base_x) = self.signal_table[id].raw_bits();
+            debug_assert!(id < self.signal_table.len());
+            let (base_v, base_x) = unsafe { self.signal_table.get_unchecked(id) }.raw_bits();
+            if hi >= lo && hi < 64 {
+                let width = hi - lo + 1;
+                let mask = (u64::MAX >> (64 - width)) << lo;
+                let dv = (base_v ^ (v << lo)) & mask;
+                let dx = base_x & mask;
+                if (dv | dx) == 0 {
+                    self.prof_nba_elided += 1;
+                    return;
+                }
+                let mut nv = Value::from_inline(base_v ^ dv, base_x ^ dx, self.signal_widths[id]);
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+                return;
+            }
             let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
             if new_v == base_v && new_x == base_x {
                 self.prof_nba_elided += 1;
@@ -4216,8 +4898,21 @@ impl Simulator {
     /// Control executor entered at stream index `start` (process FSMs resume
     /// mid-stream); a wait opcode records the suspend and returns true.
     /// Standalone for the same reason as `exec_two_state_line`.
-    #[inline(never)]
     pub(super) fn exec_two_state_ctrl_from(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        num_regs: u32,
+        start: usize,
+    ) -> bool {
+        if self.signal_inline_bits.is_empty() {
+            self.exec_two_state_ctrl_inner::<false>(insns, num_regs, start)
+        } else {
+            self.exec_two_state_ctrl_inner::<true>(insns, num_regs, start)
+        }
+    }
+
+    #[inline(never)]
+    fn exec_two_state_ctrl_inner<const MIRROR: bool>(
         &mut self,
         insns: &[super::bytecode::TsInsn],
         num_regs: u32,
@@ -4238,17 +4933,13 @@ impl Simulator {
         // `num_regs` and the file was just sized to it: every operand access
         // goes through a raw pointer, as in the straight-line executor.
         let rp: *mut u64 = regs.as_mut_ptr();
-        // Signal (value, x) planes for a load. The plane mirror exists only
-        // under XEZIM_INLINE_BITS / JIT runs; test for it once per block
-        // instead of per load (a load through `self` cannot be hoisted past
-        // the stores' `&mut self` calls). Signal ids come from the lowered
-        // stream, validated against the table at lowering, and the table
-        // never shrinks, so the index is unchecked (as in the store helpers).
-        let mirror = !self.signal_inline_bits.is_empty();
+        // Signal (value, x) planes for a load. Const-specialized on `MIRROR`
+        // so the common non-JIT path compiles with zero mirror branches and
+        // smaller I-cache footprint.
         macro_rules! planes {
             ($s:expr) => {{
                 let __s: usize = $s;
-                if mirror {
+                if MIRROR {
                     match self.signal_inline_bits.get(__s) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[__s].raw_bits(),
@@ -6132,6 +6823,9 @@ impl Simulator {
         }
         self.compiled_edge_blocks = compiled;
         self.ts_edge.clear();
+        self.ts_edge_arena.clear();
+        self.ts_edge_hdr.clear();
+        self.ts_edge_hdr_tsx.clear();
 
         // Process merging:
         // merge edge blocks with IDENTICAL plain sensitivities into one
@@ -6154,7 +6848,15 @@ impl Simulator {
         // `=census` sizes the population, and `=N` selects another cap.
         {
             use super::bytecode::Insn as EI;
-            let em = std::env::var("XEZIM_EDGE_MERGE").unwrap_or_else(|_| "8".to_string());
+            let em = std::env::var("XEZIM_EDGE_MERGE").unwrap_or_else(|_| {
+                if self.armed_edge
+                    && std::env::var("XEZIM_ARMED_EDGE_BATCH").ok().as_deref() == Some("1")
+                {
+                    "0".to_string()
+                } else {
+                    "8".to_string()
+                }
+            });
             let census_only = em == "census";
             let cap: usize = if census_only {
                 usize::MAX
@@ -7393,12 +8095,26 @@ module entry_m(
   output wire d_eq,
   output wire d_bit,
   output wire d_and,
-  output wire d_or
+  output wire d_or,
+  output wire [3:0] d_mux,
+  output wire [3:0] d_repl,
+  output wire d_redor,
+  input logic [79:0] w_a,
+  input logic [79:0] w_b,
+  output wire [79:0] d_wmux,
+  output wire [79:0] d_wrepl,
+  output wire [3:0] d_xnor
 );
-  assign d_eq  = en && (bus[3:0] == tag[3:0]);
-  assign d_bit = en && bus[0];
-  assign d_and = en && hot_bit;
-  assign d_or  = en || hot_bit;
+  assign d_eq    = en && (bus[3:0] == tag[3:0]);
+  assign d_bit   = en && bus[0];
+  assign d_and   = en && hot_bit;
+  assign d_or    = en || hot_bit;
+  assign d_mux   = en ? bus[3:0] : tag[3:0];
+  assign d_repl  = {4{en}} & bus[3:0];
+  assign d_redor = |(bus[3:0] & tag[3:0]);
+  assign d_wmux  = en ? w_a : w_b;
+  assign d_wrepl = {80{en}} & w_a;
+  assign d_xnor  = bus[3:0] ~^ tag[3:0];
 endmodule
 
 module top;
@@ -7406,15 +8122,24 @@ module top;
   logic [7:0]  bus;
   logic [7:0]  tag;
   logic        hot_bit;
-  wire [15:0]  d_eq, d_bit, d_and, d_or;
-  logic [7:0]  chk;
+  logic [79:0] w_a, w_b;
+  wire [15:0]  d_eq, d_bit, d_and, d_or, d_redor;
+  wire [3:0]   d_mux [0:15];
+  wire [3:0]   d_repl [0:15];
+  wire [79:0]  d_wmux [0:15];
+  wire [79:0]  d_wrepl [0:15];
+  wire [3:0]   d_xnor [0:15];
+  logic [15:0] chk;
   genvar i;
   generate
     for (i = 0; i < 16; i = i + 1) begin : gf
       wire en_i = en[i];
       entry_m u (
         .en(en_i), .bus(bus), .tag(tag), .hot_bit(hot_bit),
-        .d_eq(d_eq[i]), .d_bit(d_bit[i]), .d_and(d_and[i]), .d_or(d_or[i])
+        .d_eq(d_eq[i]), .d_bit(d_bit[i]), .d_and(d_and[i]), .d_or(d_or[i]),
+        .d_mux(d_mux[i]), .d_repl(d_repl[i]), .d_redor(d_redor[i]),
+        .w_a(w_a), .w_b(w_b), .d_wmux(d_wmux[i]), .d_wrepl(d_wrepl[i]),
+        .d_xnor(d_xnor[i])
       );
     end
   endgenerate
@@ -7425,30 +8150,39 @@ module top;
     bus = 8'h00;
     tag = 8'h5a;
     hot_bit = 1'b0;
+    w_a = 80'hx; // Unselected wide arm holds X while en == 0!
+    w_b = 80'h1234_5678_9abc_def0_1357;
     #1;
-    // Controlled state: en == 0, bus/hot_bit toggle while masked.
+    // Controlled state: en == 0, bus/hot_bit/w_a toggle while masked.
     bus = 8'h5a;
     hot_bit = 1'b1;
     #1;
     if (d_eq[0] !== 1'b0 || d_bit[0] !== 1'b0 || d_and[0] !== 1'b0 || d_or[0] !== 1'b1) chk = chk + 1;
-    // Unmask en[0]: must immediately observe live bus == 8'h5a and hot_bit == 1.
+    if (d_mux[0] !== 4'ha || d_repl[0] !== 4'h0 || d_redor[0] !== 1'b1) chk = chk + 128;
+    if (d_wmux[0] !== 80'h1234_5678_9abc_def0_1357 || d_wrepl[0] !== 80'h0 || d_xnor[0] !== 4'hf) chk = chk + 256;
+    // Unmask en[0]: switch muxes & repl to live bus/w_a (now clean).
+    w_a = 80'hdead_beef_cafe_babe_2468;
+    w_b = 80'hx; // Now unselected arm w_b is X!
     en[0] = 1'b1;
     #1;
     if (d_eq[0] !== 1'b1 || d_bit[0] !== 1'b0 || d_and[0] !== 1'b1 || d_or[0] !== 1'b1) chk = chk + 2;
-    // Toggle bus while unmasked.
+    if (d_mux[0] !== 4'ha || d_repl[0] !== 4'ha || d_wmux[0] !== 80'hdead_beef_cafe_babe_2468 || d_wrepl[0] !== 80'hdead_beef_cafe_babe_2468) chk = chk + 512;
+    // Toggle bus and w_a while unmasked.
     bus = 8'h5b;
+    w_a = 80'h0102_0304_0506_0708_090a;
     #1;
-    if (d_eq[0] !== 1'b0 || d_bit[0] !== 1'b1) chk = chk + 4;
+    if (d_eq[0] !== 1'b0 || d_bit[0] !== 1'b1 || d_mux[0] !== 4'hb || d_repl[0] !== 4'hb || d_wmux[0] !== 80'h0102_0304_0506_0708_090a || d_wrepl[0] !== 80'h0102_0304_0506_0708_090a || d_xnor[0] !== 4'he) chk = chk + 4;
     // Transition en[0] from 0 -> X while masked: must unmask so bus toggle sees X && 0 = 0.
     en[0] = 1'b0;
     bus = 8'h5a;
+    w_b = 80'h5555_5555_5555_5555_5555;
     #1;
     en[0] = 1'bx;
     #1;
     if (d_eq[0] !== 1'bx) chk = chk + 8;
     bus = 8'h00;
     #1;
-    if (d_eq[0] !== 1'b0) chk = chk + 16;
+    if (d_eq[0] !== 1'b0 || d_redor[0] !== 1'b0) chk = chk + 16;
     // Force and release while controlled.
     en[0] = 1'b0;
     bus = 8'h5a;
@@ -7470,6 +8204,132 @@ endmodule
         assert!(
             !sim.ts_ctl.is_empty(),
             "expected TsCtl slots to register on high-fanout bus"
+        );
+    }
+
+    #[test]
+    fn case_ctl_dynamic_masking_preserves_four_state_and_force() {
+        let source = r#"
+module entry_c(
+  input logic en0,
+  input logic en1,
+  input logic [3:0] create_sel,
+  input logic [7:0] bus0,
+  input logic [7:0] bus1,
+  input logic [7:0] bus2,
+  input logic [7:0] bus3,
+  input logic [7:0] hold_val,
+  output reg [7:0] out_lch,
+  output reg [7:0] out_create,
+  output reg [7:0] out_if,
+  output reg [3:0] out_fsm
+);
+  always @* begin
+    case ({en1, en0})
+      2'b01  : out_lch = bus0;
+      2'b10  : out_lch = bus1;
+      default: out_lch = hold_val;
+    endcase
+  end
+  always @* begin
+    case (create_sel[3:0])
+      4'h1   : out_create = bus0;
+      4'h2   : out_create = bus1;
+      4'h4   : out_create = bus2;
+      4'h8   : out_create = bus3;
+      default: out_create = 8'hxx;
+    endcase
+  end
+  always @* begin
+    if (en0) out_if = bus0;
+    else out_if = hold_val;
+  end
+  always @* begin
+    case (create_sel[3:0])
+      4'h1   : if (bus0[0]) out_fsm = 4'h2; else out_fsm = 4'h1;
+      4'h2   : if (bus1[0]) out_fsm = 4'h4; else out_fsm = 4'h2;
+      4'h4   : if (bus2[0]) out_fsm = 4'h8; else out_fsm = 4'h4;
+      4'h8   : if (bus3[0]) out_fsm = 4'h1; else out_fsm = 4'h8;
+      default: out_fsm = 4'h0;
+    endcase
+  end
+endmodule
+
+module top;
+  logic [7:0] en0, en1;
+  logic [3:0] create_sel [0:7];
+  logic [7:0] bus0, bus1, bus2, bus3, hold_val;
+  wire [7:0] out_lch [0:7];
+  wire [7:0] out_create [0:7];
+  wire [7:0] out_if [0:7];
+  wire [3:0] out_fsm [0:7];
+  logic [15:0] chk;
+  genvar i;
+  generate
+    for (i = 0; i < 8; i = i + 1) begin : gc
+      wire e0 = en0[i];
+      wire e1 = en1[i];
+      entry_c u (
+        .en0(e0), .en1(e1), .create_sel(create_sel[i]),
+        .bus0(bus0), .bus1(bus1), .bus2(bus2), .bus3(bus3),
+        .hold_val(hold_val),
+        .out_lch(out_lch[i]), .out_create(out_create[i]), .out_if(out_if[i]),
+        .out_fsm(out_fsm[i])
+      );
+    end
+  endgenerate
+
+  initial begin
+    chk = 0;
+    en0 = 8'h00; en1 = 8'h00;
+    for (int k = 0; k < 8; k++) create_sel[k] = 4'h0;
+    bus0 = 8'h11; bus1 = 8'h22; bus2 = 8'h33; bus3 = 8'h44;
+    hold_val = 8'haa;
+    #1;
+    // Idle default arm: broadcast buses toggle while masked.
+    bus0 = 8'h51; bus1 = 8'h62; bus2 = 8'h73; bus3 = 8'h84;
+    #1;
+    if (out_lch[0] !== 8'haa || out_create[0] !== 8'hxx || out_if[0] !== 8'haa || out_fsm[0] !== 4'h0) chk = chk + 1;
+    // Default arm still tracks hold_val.
+    hold_val = 8'hbb;
+    #1;
+    if (out_lch[0] !== 8'hbb || out_if[0] !== 8'hbb) chk = chk + 2;
+    // Activate non-default arms on lane 0: must unmask active arm's bus only.
+    en0[0] = 1'b1;
+    create_sel[0] = 4'h4;
+    #1;
+    if (out_lch[0] !== 8'h51 || out_create[0] !== 8'h73 || out_if[0] !== 8'h51 || out_fsm[0] !== 4'h8) chk = chk + 4;
+    // Toggle broadcast buses while active: bus2[0] flips 1 -> 0 so out_fsm flips 8 -> 4.
+    bus0 = 8'h99; bus2 = 8'hcc;
+    #1;
+    if (out_lch[0] !== 8'h99 || out_create[0] !== 8'hcc || out_if[0] !== 8'h99 || out_fsm[0] !== 4'h4) chk = chk + 8;
+    // Return to idle, then force/release.
+    en0[0] = 1'b0;
+    create_sel[0] = 4'h0;
+    #1;
+    if (out_lch[0] !== 8'hbb || out_create[0] !== 8'hxx || out_if[0] !== 8'hbb) chk = chk + 16;
+    force gc[0].u.out_lch = 8'hff;
+    #1;
+    if (out_lch[0] !== 8'hff) chk = chk + 32;
+    release gc[0].u.out_lch;
+    #1;
+    if (out_lch[0] !== 8'hbb) chk = chk + 64;
+    // Selector X must stay unmasked and evaluate default accurately.
+    en0[0] = 1'bx;
+    #1;
+    if (out_lch[0] !== 8'hbb || out_if[0] !== 8'hbb) chk = chk + 128;
+    $finish;
+  end
+endmodule
+"#;
+        let sim = crate::simulate(source, 100).expect("simulate case_ctl");
+        assert!(sim.finished);
+        assert_eq!(sim.error_count, 0);
+        assert_eq!(sim.get_signal("chk").and_then(Value::to_u64), Some(0));
+        assert!(
+            sim.case_ctl.len() >= 16,
+            "expected CaseCtl slots for case/if entries, got {}",
+            sim.case_ctl.len()
         );
     }
 }

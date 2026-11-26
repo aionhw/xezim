@@ -41,6 +41,8 @@ const QUEUED_SNAP: u8 = 8;
 struct SigWatchers {
     /// Parked waiters among `seqs`.
     live: u32,
+    /// Position in `EventWaiters::live_signals` while `live > 0`.
+    live_pos: usize,
     /// Their sequence numbers, with those of waiters that left since
     /// (dropped when the list is next purged).
     seqs: Vec<u64>,
@@ -101,6 +103,9 @@ pub(super) struct EventWaiters {
     hook_stamp: u64,
     /// Scratch for the drain's candidates.
     pub(super) cand_buf: Vec<u64>,
+    /// Signal IDs with live indexed waiters, kept dense on insertion/removal.
+    /// With at most 16 IDs, this is a compact filter before probing `watch`.
+    live_signals: Vec<u32>,
 }
 
 impl EventWaiters {
@@ -151,6 +156,17 @@ impl EventWaiters {
         self.hooked[id >> 6] |= 1u64 << (id & 63);
     }
 
+    /// Use the compact list to filter writes when at most 16 signals are watched.
+    #[inline(always)]
+    pub(super) fn check_and_note_write(&mut self, id: usize) {
+        if self.live_signals.len() <= 16 && !self.live_signals.contains(&(id as u32)) {
+            return;
+        }
+        if id < self.watch.len() && self.watch[id] & WATCH_ANY != 0 {
+            self.note_write(id);
+        }
+    }
+
     /// A watched signal was written: queue it for whoever asked.
     #[cold]
     #[inline(never)]
@@ -197,6 +213,10 @@ impl EventWaiters {
                 let entries = &self.entries;
                 s.seqs.retain(|q| entries.contains_key(q));
             }
+            if s.live == 0 {
+                s.live_pos = self.live_signals.len();
+                self.live_signals.push(id as u32);
+            }
             s.live += 1;
             s.seqs.push(seq);
             let f = &mut self.watch[id];
@@ -222,9 +242,15 @@ impl EventWaiters {
             let Some(s) = self.sigs.get_mut(&id) else {
                 continue;
             };
-            s.live = s.live.saturating_sub(1);
+            debug_assert_ne!(s.live, 0);
+            s.live -= 1;
             if s.live == 0 {
                 s.seqs.clear();
+                let pos = s.live_pos;
+                self.live_signals.swap_remove(pos);
+                if let Some(&moved) = self.live_signals.get(pos) {
+                    self.sigs.get_mut(&(moved as usize)).unwrap().live_pos = pos;
+                }
                 if let Some(f) = self.watch.get_mut(id) {
                     *f &= !WATCH_ANY;
                 }

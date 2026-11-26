@@ -2183,6 +2183,7 @@ impl Simulator {
                 }
             }
             self.ctl_build();
+            self.build_case_ctl();
             let mut ts_ctl_added = false;
             for eidx in 0..self.ts_hdr.len() {
                 ts_ctl_added |= self.ts_ctl_try_register(eidx);
@@ -2356,7 +2357,7 @@ impl Simulator {
     /// Turn every `CombItem::CtlGate` back into its `FusedGate` and restore
     /// the static masks of the edges it held (when they are still in place).
     pub(super) fn ctl_revert(&mut self) {
-        if self.ctl_gates.is_empty() && self.ts_ctl.is_empty() {
+        if self.ctl_gates.is_empty() && self.ts_ctl.is_empty() && self.case_ctl.is_empty() {
             return;
         }
         if !self.ctl_gates.is_empty() {
@@ -2380,7 +2381,7 @@ impl Simulator {
         }
         if !self.ts_ctl.is_empty() && self.comb_dep_edges.len() == self.comb_dep_entries.len() {
             for c in &self.ts_ctl {
-                if c.masked {
+                if c.mask_state != 0 {
                     let (lo0, hi0) = (c.pos0 as usize, (c.pos0 + c.npos0) as usize);
                     if let Some(edges) = self.comb_dep_edges.get_mut(lo0..hi0) {
                         for e in edges {
@@ -2398,6 +2399,24 @@ impl Simulator {
                 }
             }
         }
+        if !self.case_ctl.is_empty() && self.comb_dep_edges.len() == self.comb_dep_entries.len() {
+            for c in &self.case_ctl {
+                if c.cur_masked != 0 {
+                    let mut m = c.cur_masked;
+                    while m != 0 {
+                        let i = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let (pos, npos, smask) = c.edges[i];
+                        let (lo, hi) = (pos as usize, (pos + npos) as usize);
+                        if let Some(edges) = self.comb_dep_edges.get_mut(lo..hi) {
+                            for e in edges {
+                                e.mask = smask;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.ctl_gates.clear();
         self.ctl_sig.clear();
         self.ctl_dsts.clear();
@@ -2406,6 +2425,10 @@ impl Simulator {
         self.ts_ctl_by_entry.clear();
         self.ts_ctl_dsts.clear();
         self.ts_ctl_rearm_pending.clear();
+        self.case_ctl.clear();
+        self.case_ctl_by_entry.clear();
+        self.case_ctl_dsts.clear();
+        self.case_ctl_rearm_pending.clear();
         self.gate_lane_valid = false;
     }
 
@@ -2419,7 +2442,7 @@ impl Simulator {
     /// evaluation) or under the settle modes that evaluate entries outside
     /// the canonical loop (`ctl_on`).
     pub(super) fn ctl_build(&mut self) {
-        const CTL_MIN_FANOUT: u32 = 64;
+        const CTL_MIN_FANOUT: u32 = 16;
         debug_assert!(self.ctl_gates.is_empty());
         if !self.ctl_on || !self.sdf_delays.is_empty() {
             return;
@@ -2576,9 +2599,15 @@ impl Simulator {
         in_settle: bool,
     ) -> Option<BitRef> {
         let g = self.ctl_gates[slot as usize];
-        let (dst, new_bit) = self.fused_gate_eval(&g.op);
         let o = self.signal_table[g.other.sig_id as usize].get_bit_code(g.other.bit as usize);
-        let m = if o == g.ctl { 0 } else { g.smask };
+        let controlled = o == g.ctl;
+        let (dst, new_bit) = match g.op {
+            FusedGate::Bin2 { dst, invert, .. } if controlled => {
+                (dst, if invert { g.ctl ^ 1 } else { g.ctl })
+            }
+            _ => self.fused_gate_eval(&g.op),
+        };
+        let m = if controlled { 0 } else { g.smask };
         let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
         if let Some(es) = edges.get_mut(lo..hi) {
             for e in es {
@@ -2649,12 +2678,28 @@ impl Simulator {
                 self.ts_ctl_rearm_pending.extend(slots);
             }
         }
+        if !self.case_ctl_dsts.is_empty() {
+            let start = self.case_ctl_dsts.partition_point(|&(d, _)| d < id32);
+            let slots: Vec<u32> = self.case_ctl_dsts[start..]
+                .iter()
+                .take_while(|&&(d, _)| d == id32)
+                .map(|&(_, s)| s)
+                .collect();
+            if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
+                for s in slots {
+                    self.case_ctl_rearm(s);
+                }
+            } else {
+                self.case_ctl_rearm_pending.extend(slots);
+            }
+        }
     }
 
     /// `$deposit(target, ...)`: re-arm the gates driving the target's
     /// signal, or every gate when the target does not resolve statically.
     pub(super) fn ctl_note_deposit(&mut self, target: &Expression) {
-        if self.ctl_dsts.is_empty() && self.ts_ctl_dsts.is_empty() {
+        if self.ctl_dsts.is_empty() && self.ts_ctl_dsts.is_empty() && self.case_ctl_dsts.is_empty()
+        {
             return;
         }
         let mut root = target;
@@ -2668,6 +2713,7 @@ impl Simulator {
                     .ctl_dsts
                     .iter()
                     .chain(self.ts_ctl_dsts.iter())
+                    .chain(self.case_ctl_dsts.iter())
                     .map(|&(d, _)| d)
                     .collect();
                 for d in all {
@@ -2691,10 +2737,10 @@ impl Simulator {
         let Some(c) = self.ts_ctl.get_mut(slot as usize) else {
             return;
         };
-        if !c.masked {
+        if c.mask_state == 0 {
             return;
         }
-        c.masked = false;
+        c.mask_state = 0;
         let (pos0, npos0, smask0) = (c.pos0, c.npos0, c.smask0);
         let (pos1, npos1, smask1) = (c.pos1, c.npos1, c.smask1);
         let (lo0, hi0) = (pos0 as usize, (pos0 + npos0) as usize);
@@ -2713,13 +2759,1023 @@ impl Simulator {
         }
     }
 
+    /// Build per-arm masks for supported combinational branches.
+    /// Check exclusive ownership only for candidate destinations.
+    pub(super) fn build_case_ctl(&mut self) {
+        use super::bytecode::{BinOpConstKind, Insn};
+        const CASE_CTL_MIN_FANOUT: u32 = 4;
+        debug_assert!(self.case_ctl.is_empty());
+        if !self.ctl_on || !self.sdf_delays.is_empty() {
+            return;
+        }
+        let n_entries = self.comb_entries.len();
+        let nsig = self.comb_dep_offsets.len().saturating_sub(1);
+        if n_entries == 0 || nsig == 0 {
+            return;
+        }
+
+        // Phase 1: find structurally eligible `CompiledAlwaysBlock` candidates
+        // and collect their destination signal IDs & arm read sets.
+        struct Cand {
+            eidx: usize,
+            sel_sig0: u32,
+            sel_lo0: u32,
+            sel_w0: u16,
+            sel_sig1: u32,
+            sel_lo1: u32,
+            /// Maps selector value `v` to arm index into `arm_reads`.
+            val_to_arm: Vec<u16>,
+            default_arm: u16,
+            /// Per-arm read signal sets.
+            arm_reads: Vec<HashSet<u32>>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        let mut cand_dst_ids: HashSet<usize> = HashSet::default();
+
+        let bit_load = |ins: &Insn, widths: &[u32], reals: &[bool]| -> Option<(u16, u32, u32)> {
+            match *ins {
+                Insn::LoadSignal(r, s) => {
+                    let su = s as usize;
+                    if su < nsig
+                        && widths.get(su).copied().unwrap_or(0) == 1
+                        && !reals.get(su).copied().unwrap_or(true)
+                    {
+                        Some((r, s, 0))
+                    } else {
+                        None
+                    }
+                }
+                Insn::LoadSignalBit(r, s, bit) => {
+                    let su = s as usize;
+                    if su < nsig
+                        && bit < widths.get(su).copied().unwrap_or(0)
+                        && !reals.get(su).copied().unwrap_or(true)
+                    {
+                        Some((r, s, bit))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        // Collect reads for a forward-only arm with internal branches or jumps
+        // to the common end. Reject calls, dynamic array reads, and fallthrough.
+        let analyze_arm = |insns: &[Insn], lo: usize, hi: usize| -> Option<HashSet<u32>> {
+            let end = insns.len();
+            if lo > hi || hi > end {
+                return None;
+            }
+            if lo == hi {
+                return Some(HashSet::default());
+            }
+            if hi < end && !matches!(insns[hi - 1], Insn::Jump(t) if t as usize == end) {
+                return None;
+            }
+            let mut reads = HashSet::default();
+            for (rel, ins) in insns[lo..hi].iter().enumerate() {
+                let pc = lo + rel;
+                let check_tgt = |t: u32| -> bool {
+                    let tu = t as usize;
+                    tu == end || (tu > pc && tu < hi)
+                };
+                match ins {
+                    Insn::Jump(t) => {
+                        if !check_tgt(*t) {
+                            return None;
+                        }
+                    }
+                    Insn::BranchIfFalse(_, t)
+                    | Insn::BranchUnlessZero(_, t)
+                    | Insn::CmpBranch(_, _, _, _, t)
+                    | Insn::CmpBranchConst(_, _, _, _, t) => {
+                        if !check_tgt(*t) {
+                            return None;
+                        }
+                    }
+                    Insn::BranchIfSignalFalse(s, t, _) => {
+                        if !check_tgt(*t) {
+                            return None;
+                        }
+                        reads.insert(*s);
+                    }
+                    Insn::CaseJump(..) | Insn::CaseMaskJump(..) | Insn::LoadArrayElem(..) => {
+                        return None;
+                    }
+                    Insn::LoadSignal(_, s)
+                    | Insn::LoadSignalSigned(_, s)
+                    | Insn::LoadSignalBit(_, s, _)
+                    | Insn::LoadSignalRange(_, s, _, _)
+                    | Insn::LoadSignalRangeDyn(_, s, _, _) => {
+                        reads.insert(*s);
+                    }
+                    _ => {}
+                }
+            }
+            Some(reads)
+        };
+
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            let CombItem::CompiledAlwaysBlock { compiled, .. } = &entry.item else {
+                continue;
+            };
+            if entry.has_unresolved_reads
+                || compiled.has_fallback
+                || entry.cold.write_signal_ids.is_empty()
+                || self
+                    .is_clock_tree_entry
+                    .get(eidx)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let insns = &compiled.instructions;
+            if insns.len() < 3
+                || insns.iter().any(|ins| {
+                    matches!(
+                        ins,
+                        Insn::BlockingAssignArray(..)
+                            | Insn::BlockingAssignArrayRange(..)
+                            | Insn::BlockingAssignString(..)
+                            | Insn::NbaAssign(..)
+                            | Insn::NbaAssignConst(..)
+                            | Insn::NbaAssignRange(..)
+                            | Insn::NbaAssignRangeDyn(..)
+                            | Insn::NbaAssignBitDyn(..)
+                            | Insn::NbaAssignArray(..)
+                            | Insn::NbaAssignArrayRange(..)
+                            | Insn::NbaAssignArrayRead(..)
+                            | Insn::StmtFallback(..)
+                            | Insn::EvalExprFallback(..)
+                            | Insn::CallMethod(..)
+                            | Insn::CallScopedMethod(..)
+                            | Insn::CallFreeFunction(..)
+                            | Insn::CallStaticScoped(..)
+                            | Insn::CallCollMethod(..)
+                    )
+                })
+            {
+                continue;
+            }
+            // Reject self-loop (reads its own written signal).
+            if entry
+                .cold
+                .write_signal_ids
+                .iter()
+                .any(|d| entry.cold.read_signal_ids.contains(d))
+            {
+                continue;
+            }
+
+            let end = insns.len();
+            // Parse selector & arm partition.
+            let parsed = match insns.first() {
+                Some(Insn::BranchIfSignalFalse(sig, else_pc, bit)) => {
+                    let s = *sig as usize;
+                    let epc = *else_pc as usize;
+                    if s >= nsig
+                        || self.signal_real.get(s).copied().unwrap_or(true)
+                        || epc <= 1
+                        || epc > end
+                    {
+                        None
+                    } else {
+                        let lo_w = if *bit == u32::MAX {
+                            (self.signal_widths.get(s).copied().unwrap_or(0) == 1)
+                                .then_some((0u32, 1u16))
+                        } else if *bit < 64
+                            && (*bit) < self.signal_widths.get(s).copied().unwrap_or(0)
+                        {
+                            Some((*bit, 1u16))
+                        } else {
+                            None
+                        };
+                        lo_w.and_then(|(lo, w)| {
+                            let then_r = analyze_arm(insns, 1, epc)?;
+                            let else_r = analyze_arm(insns, epc, end)?;
+                            Some((
+                                *sig,
+                                lo,
+                                w,
+                                u32::MAX,
+                                0u32,
+                                vec![1u16, 0u16],
+                                1u16,
+                                vec![then_r, else_r],
+                            ))
+                        })
+                    }
+                }
+                _ => {
+                    let sel = match insns.as_slice() {
+                        [i0, i1, Insn::Concat(rc, parts), ..]
+                            if let (Some((r1, s1, b1)), Some((r0, s0, b0))) = (
+                                bit_load(i0, &self.signal_widths, &self.signal_real),
+                                bit_load(i1, &self.signal_widths, &self.signal_real),
+                            ) && parts.as_slice() == [r1, r0]
+                                && (s1 != s0 || b1 != b0) =>
+                        {
+                            Some((*rc, s1, b1, 1u16, s0, b0, 3usize))
+                        }
+                        [Insn::LoadSignal(r0, sig), Insn::RangeSelectConst(r1, r0b, hi, lo), ..]
+                            if r0 == r0b =>
+                        {
+                            let s = *sig as usize;
+                            if s < nsig
+                                && hi >= lo
+                                && (*hi - *lo) < 64
+                                && (*hi) < self.signal_widths.get(s).copied().unwrap_or(0)
+                                && !self.signal_real.get(s).copied().unwrap_or(true)
+                            {
+                                Some((
+                                    *r1,
+                                    *sig,
+                                    *lo,
+                                    (*hi - *lo + 1) as u16,
+                                    u32::MAX,
+                                    0u32,
+                                    2usize,
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        [
+                            Insn::LoadConst(ri, k),
+                            Insn::LoadArrayElem(re, arr, rib),
+                            rest @ ..,
+                        ] if ri == rib => {
+                            let elem_sig = match arr.as_ref() {
+                                super::bytecode::ArrayOperand::Dense {
+                                    first_id,
+                                    lo: alo,
+                                    hi: ahi,
+                                    ..
+                                } => k
+                                    .to_i64()
+                                    .filter(|&iv| iv >= *alo && iv <= *ahi)
+                                    .map(|iv| (*first_id + (iv - *alo) as usize) as u32),
+                                _ => None,
+                            };
+                            elem_sig.and_then(|sig| {
+                                let s = sig as usize;
+                                let sw = self.signal_widths.get(s).copied().unwrap_or(0);
+                                if s >= nsig
+                                    || self.signal_real.get(s).copied().unwrap_or(true)
+                                {
+                                    return None;
+                                }
+                                if let [Insn::RangeSelectConst(r1, reb, hi, lo), ..] = rest
+                                    && reb == re
+                                    && hi >= lo
+                                    && (*hi - *lo) < 64
+                                    && (*hi) < sw
+                                {
+                                    Some((
+                                        *r1,
+                                        sig,
+                                        *lo,
+                                        (*hi - *lo + 1) as u16,
+                                        u32::MAX,
+                                        0u32,
+                                        3usize,
+                                    ))
+                                } else if sw > 0
+                                    && sw <= 64
+                                    && !self.signal_signed.get(s).copied().unwrap_or(true)
+                                {
+                                    Some((*re, sig, 0, sw as u16, u32::MAX, 0, 2usize))
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                        [Insn::LoadSignal(r, sig), ..] => {
+                            let s = *sig as usize;
+                            let w = self.signal_widths.get(s).copied().unwrap_or(0);
+                            if s < nsig
+                                && w > 0
+                                && w <= 64
+                                && !self.signal_real.get(s).copied().unwrap_or(true)
+                                && !self.signal_signed.get(s).copied().unwrap_or(true)
+                            {
+                                Some((*r, *sig, 0, w as u16, u32::MAX, 0, 1usize))
+                            } else {
+                                None
+                            }
+                        }
+                        [Insn::LoadSignalRange(r, sig, hi, lo), ..] => {
+                            let s = *sig as usize;
+                            if s < nsig
+                                && hi >= lo
+                                && (*hi - *lo) < 64
+                                && (*hi) < self.signal_widths.get(s).copied().unwrap_or(0)
+                                && !self.signal_real.get(s).copied().unwrap_or(true)
+                            {
+                                Some((
+                                    *r,
+                                    *sig,
+                                    *lo,
+                                    (*hi - *lo + 1) as u16,
+                                    u32::MAX,
+                                    0u32,
+                                    1usize,
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    sel.and_then(|(r_sel, sig0, lo0, w0, sig1, lo1, sel_end)| {
+                        if sel_end >= end {
+                            return None;
+                        }
+                        match &insns[sel_end] {
+                            Insn::CaseJump(r_s, cj) if *r_s == r_sel && cj.table.len() <= 64 => {
+                                let mut starts: Vec<usize> =
+                                    cj.table.iter().map(|&t| t as usize).collect();
+                                starts.push(cj.default as usize);
+                                starts.sort_unstable();
+                                starts.dedup();
+                                if starts.len() < 2
+                                    || starts[0] <= sel_end
+                                    || *starts.last().unwrap() > end
+                                {
+                                    return None;
+                                }
+                                let mut arm_reads = Vec::with_capacity(starts.len());
+                                for i in 0..starts.len() {
+                                    let lo = starts[i];
+                                    let hi = if i + 1 < starts.len() {
+                                        starts[i + 1]
+                                    } else {
+                                        end
+                                    };
+                                    arm_reads.push(analyze_arm(insns, lo, hi)?);
+                                }
+                                let idx_of = |t: u32| -> u16 {
+                                    starts.binary_search(&(t as usize)).unwrap() as u16
+                                };
+                                let val_to_arm: Vec<u16> =
+                                    cj.table.iter().map(|&t| idx_of(t)).collect();
+                                let default_arm = idx_of(cj.default);
+                                Some((
+                                    sig0,
+                                    lo0,
+                                    w0,
+                                    sig1,
+                                    lo1,
+                                    val_to_arm,
+                                    default_arm,
+                                    arm_reads,
+                                ))
+                            }
+                            Insn::CmpBranchConst(BinOpConstKind::CaseEq, r_s, _, _, _)
+                                if *r_s == r_sel =>
+                            {
+                                let mut pc = sel_end;
+                                let mut arm_pats: Vec<(u64, HashSet<u32>)> = Vec::new();
+                                let mut max_v = 0u64;
+                                while pc < end {
+                                    let Insn::CmpBranchConst(
+                                        BinOpConstKind::CaseEq,
+                                        rs,
+                                        pat,
+                                        _,
+                                        next_pc,
+                                    ) = &insns[pc]
+                                    else {
+                                        break;
+                                    };
+                                    if *rs != r_sel
+                                        || pat.has_xz()
+                                        || pat.is_real
+                                        || pat.is_fill
+                                        || pat.width > 64
+                                    {
+                                        return None;
+                                    }
+                                    let v = pat.to_u64()?;
+                                    if v >= 64 {
+                                        return None;
+                                    }
+                                    let npc = *next_pc as usize;
+                                    if npc <= pc + 1 || npc > end {
+                                        return None;
+                                    }
+                                    let reads = analyze_arm(insns, pc + 1, npc)?;
+                                    max_v = max_v.max(v);
+                                    arm_pats.push((v, reads));
+                                    pc = npc;
+                                }
+                                if arm_pats.is_empty() {
+                                    return None;
+                                }
+                                let def_reads = analyze_arm(insns, pc, end)?;
+                                let default_arm = arm_pats.len() as u16;
+                                let mut val_to_arm = vec![default_arm; max_v as usize + 1];
+                                let mut arm_reads = Vec::with_capacity(arm_pats.len() + 1);
+                                for (ai, (v, r)) in arm_pats.into_iter().enumerate() {
+                                    // First-match-wins (§12.5).
+                                    if val_to_arm[v as usize] == default_arm {
+                                        val_to_arm[v as usize] = ai as u16;
+                                    }
+                                    arm_reads.push(r);
+                                }
+                                arm_reads.push(def_reads);
+                                Some((
+                                    sig0,
+                                    lo0,
+                                    w0,
+                                    sig1,
+                                    lo1,
+                                    val_to_arm,
+                                    default_arm,
+                                    arm_reads,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    })
+                }
+            };
+            let Some((
+                sel_sig0,
+                sel_lo0,
+                sel_w0,
+                sel_sig1,
+                sel_lo1,
+                val_to_arm,
+                default_arm,
+                arm_reads,
+            )) = parsed
+            else {
+                continue;
+            };
+            for &d in &entry.cold.write_signal_ids {
+                cand_dst_ids.insert(d);
+            }
+            cands.push(Cand {
+                eidx,
+                sel_sig0,
+                sel_lo0,
+                sel_w0,
+                sel_sig1,
+                sel_lo1,
+                val_to_arm,
+                default_arm,
+                arm_reads,
+            });
+        }
+        if cands.is_empty() {
+            return;
+        }
+
+        // Filter AST writes by candidate leaf name before resolving them.
+        let mut cand_leaves: HashSet<String> = HashSet::default();
+        for &d in &cand_dst_ids {
+            if let Some(name) = self.name_opt(d) {
+                let leaf = name.rsplit('.').next().unwrap_or(name);
+                cand_leaves.insert(leaf.to_string());
+            }
+        }
+        let mut comb_writers: HashMap<usize, u32> = HashMap::default();
+        let mut disqualified_ids: HashSet<usize> = HashSet::default();
+        let mut disqualified_leaves: HashSet<String> = HashSet::default();
+        let check_write_name = |name: &str,
+                                scope: &str,
+                                sig_map: &NameMap,
+                                cand_ids: &HashSet<usize>,
+                                cand_lvs: &HashSet<String>,
+                                bad_ids: &mut HashSet<usize>,
+                                bad_lvs: &mut HashSet<String>| {
+            let leaf = name.rsplit('.').next().unwrap_or(name);
+            if !cand_lvs.contains(leaf) {
+                return;
+            }
+            bad_lvs.insert(leaf.to_string());
+            if let Some(&id) = sig_map.get(name)
+                && cand_ids.contains(&id)
+            {
+                bad_ids.insert(id);
+            }
+            if !scope.is_empty() && !name.contains('.') {
+                let scoped = format!("{}.{}", scope, name);
+                if let Some(&id) = sig_map.get(scoped.as_str())
+                    && cand_ids.contains(&id)
+                {
+                    bad_ids.insert(id);
+                }
+            }
+        };
+
+        for entry in &self.comb_entries {
+            if entry.cold.write_signal_ids.is_empty() {
+                match &entry.item {
+                    CombItem::AlwaysBlock { stmt, .. } => {
+                        let (_, writes) = super::elaborate::stmt_write_targets(stmt);
+                        let sc = entry.cold.scope_hint.as_deref().unwrap_or("");
+                        for w in &writes {
+                            check_write_name(
+                                w,
+                                sc,
+                                &self.signal_name_to_id,
+                                &cand_dst_ids,
+                                &cand_leaves,
+                                &mut disqualified_ids,
+                                &mut disqualified_leaves,
+                            );
+                        }
+                    }
+                    CombItem::ContAssign { lhs, .. } => {
+                        let mut writes = HashSet::default();
+                        Self::collect_lhs_writes(lhs, &self.module, &mut writes);
+                        let sc = entry.cold.scope_hint.as_deref().unwrap_or("");
+                        for w in &writes {
+                            check_write_name(
+                                w,
+                                sc,
+                                &self.signal_name_to_id,
+                                &cand_dst_ids,
+                                &cand_leaves,
+                                &mut disqualified_ids,
+                                &mut disqualified_leaves,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for &w in &entry.cold.write_signal_ids {
+                if cand_dst_ids.contains(&w) {
+                    *comb_writers.entry(w).or_insert(0) += 1;
+                }
+            }
+        }
+        // Check edge blocks: use compiled bytecode directly (including dense
+        // array spans without falling back to expensive AST array expansion).
+        let mut dense_array_spans: Vec<(usize, usize)> = Vec::new();
+        for (bi, blk) in self.edge_blocks.iter().enumerate() {
+            let compiled = self.compiled_edge_blocks.get(bi).and_then(|o| o.as_ref());
+            let mut need_ast = compiled.is_none();
+            if let Some(cb) = compiled {
+                if cb.has_fallback {
+                    need_ast = true;
+                }
+                for ins in &cb.instructions {
+                    match ins {
+                        Insn::BlockingAssign(s, _, _)
+                        | Insn::BlockingAssignRange(s, _, _, _)
+                        | Insn::BlockingAssignRangeDyn(s, _, _, _)
+                        | Insn::BlockingAssignBitDyn(s, _, _)
+                        | Insn::BlockingAssignString(s, _)
+                        | Insn::NbaAssign(s, _, _)
+                        | Insn::NbaAssignConst(s, _, _)
+                        | Insn::NbaAssignRange(s, _, _, _)
+                        | Insn::NbaAssignRangeDyn(s, _, _, _)
+                        | Insn::NbaAssignBitDyn(s, _, _)
+                        | Insn::NbaAssignArrayRead(s, _, _, _) => {
+                            let su = *s as usize;
+                            if cand_dst_ids.contains(&su) {
+                                disqualified_ids.insert(su);
+                            }
+                        }
+                        Insn::BlockingAssignArray(arr, _, _, _)
+                        | Insn::BlockingAssignArrayRange(arr, _, _, _, _)
+                        | Insn::NbaAssignArray(arr, _, _, _)
+                        | Insn::NbaAssignArrayRange(arr, _, _, _, _) => match arr.as_ref() {
+                            super::bytecode::ArrayOperand::Dense {
+                                first_id, lo, hi, ..
+                            } if hi >= lo => {
+                                dense_array_spans
+                                    .push((*first_id, *first_id + (*hi - *lo) as usize + 1));
+                            }
+                            _ => {
+                                need_ast = true;
+                            }
+                        },
+                        Insn::StmtFallback(..)
+                        | Insn::CallMethod(..)
+                        | Insn::CallScopedMethod(..)
+                        | Insn::CallFreeFunction(..)
+                        | Insn::CallStaticScoped(..)
+                        | Insn::CallCollMethod(..) => {
+                            need_ast = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if need_ast {
+                let (_, writes) = super::elaborate::stmt_write_targets(&blk.stmt);
+                for w in &writes {
+                    check_write_name(
+                        w,
+                        &blk.scope,
+                        &self.signal_name_to_id,
+                        &cand_dst_ids,
+                        &cand_leaves,
+                        &mut disqualified_ids,
+                        &mut disqualified_leaves,
+                    );
+                }
+            }
+        }
+        if !dense_array_spans.is_empty() {
+            dense_array_spans.sort_unstable();
+            dense_array_spans.dedup();
+            for &d in &cand_dst_ids {
+                let idx = dense_array_spans.partition_point(|&(lo, _)| lo <= d);
+                if idx > 0 && d < dense_array_spans[idx - 1].1 {
+                    disqualified_ids.insert(d);
+                }
+            }
+        }
+        for ib in self
+            .module
+            .initial_blocks
+            .iter()
+            .chain(self.module.final_blocks.iter())
+            .chain(self.module.static_init_blocks.iter())
+        {
+            let (_, writes) = super::elaborate::stmt_write_targets(&ib.stmt);
+            for w in &writes {
+                check_write_name(
+                    w,
+                    &ib.scope,
+                    &self.signal_name_to_id,
+                    &cand_dst_ids,
+                    &cand_leaves,
+                    &mut disqualified_ids,
+                    &mut disqualified_leaves,
+                );
+            }
+        }
+        for ab in &self.module.always_blocks {
+            let (_, writes) = super::elaborate::stmt_write_targets(&ab.stmt);
+            for w in &writes {
+                check_write_name(
+                    w,
+                    &ab.scope,
+                    &self.signal_name_to_id,
+                    &cand_dst_ids,
+                    &cand_leaves,
+                    &mut disqualified_ids,
+                    &mut disqualified_leaves,
+                );
+            }
+        }
+        for p in &self.module.pending_initial {
+            let (_, writes) = super::elaborate::stmt_write_targets(&p.source);
+            for w in &writes {
+                check_write_name(
+                    w,
+                    "",
+                    &self.signal_name_to_id,
+                    &cand_dst_ids,
+                    &cand_leaves,
+                    &mut disqualified_ids,
+                    &mut disqualified_leaves,
+                );
+            }
+        }
+        for p in &self.module.pending_always {
+            let (_, writes) = super::elaborate::stmt_write_targets(&p.source);
+            for w in &writes {
+                check_write_name(
+                    w,
+                    "",
+                    &self.signal_name_to_id,
+                    &cand_dst_ids,
+                    &cand_leaves,
+                    &mut disqualified_ids,
+                    &mut disqualified_leaves,
+                );
+            }
+        }
+        let mut seen_routine_items: HashSet<usize> = HashSet::default();
+        for t in self.module.tasks.values() {
+            let ptr = std::sync::Arc::as_ptr(t.items.as_arc()) as usize;
+            if !seen_routine_items.insert(ptr) {
+                continue;
+            }
+            for st in &t.items {
+                let (_, writes) = super::elaborate::stmt_write_targets(st);
+                for w in &writes {
+                    check_write_name(
+                        w,
+                        "",
+                        &self.signal_name_to_id,
+                        &cand_dst_ids,
+                        &cand_leaves,
+                        &mut disqualified_ids,
+                        &mut disqualified_leaves,
+                    );
+                }
+            }
+        }
+        for f in self.module.functions.values() {
+            let ptr = std::sync::Arc::as_ptr(f.items.as_arc()) as usize;
+            if !seen_routine_items.insert(ptr) {
+                continue;
+            }
+            for st in &f.items {
+                let (_, writes) = super::elaborate::stmt_write_targets(st);
+                for w in &writes {
+                    check_write_name(
+                        w,
+                        "",
+                        &self.signal_name_to_id,
+                        &cand_dst_ids,
+                        &cand_leaves,
+                        &mut disqualified_ids,
+                        &mut disqualified_leaves,
+                    );
+                }
+            }
+        }
+
+        // Phase 3: build `CaseCtl` slots for verified candidates.
+        let offs = &self.comb_dep_offsets;
+        let fanout = |s: u32| -> u32 {
+            let s = s as usize;
+            if s < nsig { offs[s + 1] - offs[s] } else { 0 }
+        };
+        let mut hot_ok: HashMap<u32, bool> = HashMap::default();
+        let mut picked: Vec<(usize, Vec<u32>, CaseCtl)> = Vec::new();
+
+        for cand in cands {
+            let eidx = cand.eidx;
+            let entry = &self.comb_entries[eidx];
+            let mut dsts_ok = true;
+            for &dst in &entry.cold.write_signal_ids {
+                if comb_writers.get(&dst).copied().unwrap_or(0) != 1
+                    || disqualified_ids.contains(&dst)
+                {
+                    dsts_ok = false;
+                    break;
+                }
+                if let Some(name) = self.name_opt(dst) {
+                    let leaf = name.rsplit('.').next().unwrap_or(name);
+                    if disqualified_leaves.contains(leaf) {
+                        dsts_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !dsts_ok {
+                continue;
+            }
+            let sel_sigs: &[u32] = if cand.sel_sig1 == u32::MAX {
+                &[cand.sel_sig0]
+            } else {
+                &[cand.sel_sig0, cand.sel_sig1]
+            };
+            if sel_sigs.iter().any(|&s| {
+                self.is_clock_tree_signal
+                    .get(s as usize)
+                    .copied()
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
+            let e = eidx as u32;
+            let edge_range = |sig: u32| -> (usize, usize) {
+                let s = sig as usize;
+                if s >= nsig {
+                    return (0, 0);
+                }
+                let (lo, hi) = (offs[s] as usize, offs[s + 1] as usize);
+                let deps = &self.comb_dep_entries[lo..hi];
+                let k = lo + deps.partition_point(|&d| d < e);
+                let mut k2 = k;
+                while k2 < hi && self.comb_dep_entries[k2] == e {
+                    k2 += 1;
+                }
+                (k, k2)
+            };
+            let mut sels_ok = true;
+            for &s in sel_sigs {
+                let (lo, hi) = edge_range(s);
+                if lo == hi || self.comb_dep_edges[lo..hi].iter().any(|d| d.mask == 0) {
+                    sels_ok = false;
+                    break;
+                }
+            }
+            if !sels_ok {
+                continue;
+            }
+
+            // Collect non-selector reads that are absent from at least one arm.
+            let mut maskable: Vec<(u32, u32, u32, u32, u64)> = Vec::new(); // (fo, sig, pos, npos, smask)
+            for &r in &entry.cold.read_signal_ids {
+                let r32 = r as u32;
+                if sel_sigs.contains(&r32) {
+                    continue;
+                }
+                if cand.arm_reads.iter().all(|ar| ar.contains(&r32)) {
+                    continue;
+                }
+                let ok = *hot_ok.entry(r32).or_insert_with(|| {
+                    let s = r32 as usize;
+                    s < nsig
+                        && self.comb_dep_edges[offs[s] as usize..offs[s + 1] as usize]
+                            .iter()
+                            .all(|d| d.mask != 0)
+                });
+                if !ok {
+                    continue;
+                }
+                let (k0, k1) = edge_range(r32);
+                if k0 == k1 {
+                    continue;
+                }
+                let sm = self.comb_dep_edges[k0].mask;
+                if sm == 0 || self.comb_dep_edges[k0..k1].iter().any(|d| d.mask != sm) {
+                    continue;
+                }
+                maskable.push((fanout(r32), r32, k0 as u32, (k1 - k0) as u32, sm));
+            }
+            if maskable.is_empty() {
+                continue;
+            }
+            // Keep highest-fanout edges if > 64 (sound: remaining edges stay active).
+            maskable.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            if maskable[0].0 < CASE_CTL_MIN_FANOUT {
+                continue;
+            }
+            maskable.truncate(64);
+
+            // Compute per-arm maskable-edge bitsets.
+            let mut per_arm_mask: Vec<u64> = Vec::with_capacity(cand.arm_reads.len());
+            for ar in &cand.arm_reads {
+                let mut m = 0u64;
+                for (bit_i, &(_, sig, _, _, _)) in maskable.iter().enumerate() {
+                    if !ar.contains(&sig) {
+                        m |= 1u64 << bit_i;
+                    }
+                }
+                per_arm_mask.push(m);
+            }
+            if per_arm_mask.iter().all(|&m| m == 0) {
+                continue;
+            }
+            let arm_masks: Box<[u64]> = cand
+                .val_to_arm
+                .iter()
+                .map(|&ai| per_arm_mask[ai as usize])
+                .collect();
+            let default_mask = per_arm_mask[cand.default_arm as usize];
+
+            if self.ctl_sig.len() < nsig {
+                self.ctl_sig.resize(nsig, false);
+            }
+            let mut edges: Vec<(u32, u32, u64)> = Vec::with_capacity(maskable.len());
+            for (_, sig, pos, npos, sm) in maskable {
+                self.ctl_sig[sig as usize] = true;
+                edges.push((pos, npos, sm));
+            }
+            let dsts_u32: Vec<u32> = entry
+                .cold
+                .write_signal_ids
+                .iter()
+                .map(|&d| d as u32)
+                .collect();
+            picked.push((
+                eidx,
+                dsts_u32,
+                CaseCtl {
+                    sel_sig0: cand.sel_sig0,
+                    sel_lo0: cand.sel_lo0,
+                    sel_w0: cand.sel_w0,
+                    sel_sig1: cand.sel_sig1,
+                    sel_lo1: cand.sel_lo1,
+                    arm_masks,
+                    default_mask,
+                    edges: edges.into_boxed_slice(),
+                    cur_masked: 0,
+                },
+            ));
+        }
+
+        if picked.is_empty() {
+            return;
+        }
+        self.case_ctl_by_entry.resize(n_entries, u32::MAX);
+        for (eidx, dsts, c) in picked {
+            let slot = self.case_ctl.len() as u32;
+            self.case_ctl_by_entry[eidx] = slot;
+            for d in dsts {
+                self.case_ctl_dsts.push((d, slot));
+            }
+            self.case_ctl.push(c);
+        }
+        self.case_ctl_dsts.sort_unstable();
+        sim_dbg_eprintln!(
+            "[CASE-CTL] {} combinational always blocks dynamically mask inactive-arm inputs",
+            self.case_ctl.len()
+        );
+    }
+
+    pub(super) fn case_ctl_rearm(&mut self, slot: u32) {
+        let Some(c) = self.case_ctl.get_mut(slot as usize) else {
+            return;
+        };
+        let mut m = c.cur_masked;
+        if m == 0 {
+            return;
+        }
+        c.cur_masked = 0;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let (pos, npos, smask) = c.edges[i];
+            let (lo, hi) = (pos as usize, (pos + npos) as usize);
+            if let Some(es) = self.comb_dep_edges.get_mut(lo..hi) {
+                for e in es {
+                    e.mask = smask;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn case_ctl_update(&mut self, eidx: usize, dep_edges: &mut [DepEdge]) {
+        let Some(&slot) = self.case_ctl_by_entry.get(eidx) else {
+            return;
+        };
+        if slot == u32::MAX {
+            return;
+        }
+        let want_mask = if self.proc_depth != 0
+            || self.in_pre_process_settle
+            || self.warn_x
+            || !self.forced_signals.is_empty()
+        {
+            0u64
+        } else {
+            let c = unsafe { self.case_ctl.get_unchecked(slot as usize) };
+            let read = |sig: u32, lo: u32, width: u16| {
+                let tbl = unsafe { self.signal_table.get_unchecked(sig as usize) };
+                if lo == 0 && u32::from(width) == tbl.width {
+                    tbl.raw_bits()
+                } else if tbl.width <= 64 {
+                    Self::raw_bits_slice(tbl, lo as u16, width)
+                } else {
+                    // §11.5.1: a narrow part-select can start beyond bit 65535.
+                    tbl.slice_bits_swar(lo as usize, usize::from(width))
+                }
+            };
+            let (v, x) = if c.sel_sig1 == u32::MAX {
+                read(c.sel_sig0, c.sel_lo0, c.sel_w0)
+            } else {
+                let (v1, x1) = read(c.sel_sig0, c.sel_lo0, 1);
+                let (v0, x0) = read(c.sel_sig1, c.sel_lo1, 1);
+                (((v1 & 1) << 1) | (v0 & 1), (x1 | x0) & 1)
+            };
+            if x != 0 {
+                0u64
+            } else {
+                let vu = v as usize;
+                if vu < c.arm_masks.len() {
+                    unsafe { *c.arm_masks.get_unchecked(vu) }
+                } else {
+                    c.default_mask
+                }
+            }
+        };
+        let c = unsafe { self.case_ctl.get_unchecked_mut(slot as usize) };
+        let mut diff = want_mask ^ c.cur_masked;
+        if diff == 0 {
+            return;
+        }
+        c.cur_masked = want_mask;
+        while diff != 0 {
+            let i = diff.trailing_zeros() as usize;
+            diff &= diff - 1;
+            let (pos, npos, smask) = unsafe { *c.edges.get_unchecked(i) };
+            let m = if (want_mask >> i) & 1 != 0 { 0 } else { smask };
+            let (lo, hi) = (pos as usize, (pos + npos) as usize);
+            if let Some(es) = dep_edges.get_mut(lo..hi) {
+                for e in es {
+                    e.mask = m;
+                }
+            }
+        }
+    }
+
     /// Register dynamic controlling-value edge masking (`TsCtl`) for a
     /// specialized two-state arena entry (`TS_AND_EQ`, `TS_AND_BIT`,
-    /// `TS_AND2`, `TS_OR2`) once its static edge masks are in `comb_dep_edges`.
+    /// `TS_AND2`, `TS_OR2`, `TS_MUX_STREAM`, `TS_WMUX_STREAM`, `TS_REPL_MASK`)
+    /// once its static edge masks are in `comb_dep_edges`.
     /// Returns true if a slot was registered (caller sorts `ts_ctl_dsts`).
     pub(super) fn ts_ctl_try_register(&mut self, eidx: usize) -> bool {
         use super::bytecode::TsInsn::*;
         const TS_CTL_MIN_FANOUT: u32 = 16;
+        const TS_MUX_MIN_FANOUT: u32 = 4;
         if !self.ctl_on
             || !self.sdf_delays.is_empty()
             || self.comb_dep_edges.len() != self.comb_dep_entries.len()
@@ -2735,7 +3791,14 @@ impl Simulator {
         let kind = h.kind();
         if !matches!(
             kind,
-            Self::TS_AND_EQ | Self::TS_AND_BIT | Self::TS_AND2 | Self::TS_OR2
+            Self::TS_AND_EQ
+                | Self::TS_AND_BIT
+                | Self::TS_AND2
+                | Self::TS_OR2
+                | Self::TS_MUX_STREAM
+                | Self::TS_WMUX_STREAM
+                | Self::TS_REPL_MASK
+                | Self::TS_WREPL_MASK
         ) {
             return false;
         }
@@ -2759,80 +3822,173 @@ impl Simulator {
             if s < nsig { offs[s + 1] - offs[s] } else { 0 }
         };
         let insns = &self.ts_arena[h.off as usize..h.off as usize + h.len()];
-        let (dst, en, data0, data1_opt, ctl_is_sig2): (u32, u32, u32, Option<u32>, bool) =
-            match kind {
-                Self::TS_AND_EQ => match insns {
-                    [
-                        LoadSigSigRange {
-                            sig: en, sig2: s1, ..
-                        },
-                        SigRangeEq { sig: s2, .. },
-                        LogAndStore { sig: dst, .. },
-                    ]
-                    | [
-                        LoadSig { sig: en, .. },
-                        SigRangeW { sig: s1, .. },
-                        SigRangeEq { sig: s2, .. },
-                        LogAndStore { sig: dst, .. },
-                    ]
-                    | [
-                        LoadSigSigRange {
-                            sig: en, sig2: s1, ..
-                        },
-                        SigRangeW { sig: s2, .. },
-                        Eq { .. },
-                        LogAndStore { sig: dst, .. },
-                    ]
-                    | [
-                        LoadSig { sig: en, .. },
-                        SigRangeW { sig: s1, .. },
-                        SigRangeW { sig: s2, .. },
-                        Eq { .. },
-                        LogAndStore { sig: dst, .. },
-                    ] => {
-                        let d1 = if s1 == s2 { None } else { Some(*s2) };
-                        (*dst, *en, *s1, d1, false)
-                    }
-                    _ => return false,
-                },
-                Self::TS_AND_BIT => match insns {
-                    [
-                        LoadSigSigRange {
-                            sig: en, sig2: s1, ..
-                        },
-                        Bit { .. },
-                        LogAndStore { sig: dst, .. },
-                    ]
-                    | [
-                        LoadSig { sig: en, .. },
-                        SigRangeW { sig: s1, .. },
-                        Bit { .. },
-                        LogAndStore { sig: dst, .. },
-                    ]
-                    | [
-                        LoadSig { sig: en, .. },
-                        SigBit { sig: s1, .. } | SigBitW { sig: s1, .. },
-                        LogAndStore { sig: dst, .. },
-                    ] => (*dst, *en, *s1, None, false),
-                    _ => return false,
-                },
-                Self::TS_AND2 | Self::TS_OR2 => match insns {
-                    [
-                        LoadSig2 { sig1, sig2, .. },
-                        LogAndStore { sig: dst, .. } | LogOrStore { sig: dst, .. },
-                    ] => {
-                        if fanout(*sig1) >= fanout(*sig2) {
-                            (*dst, *sig2, *sig1, None, true)
-                        } else {
-                            (*dst, *sig1, *sig2, None, false)
-                        }
-                    }
-                    _ => return false,
-                },
+        let (dst, en, data0, data1_opt, ctl_is_sig2, min_fo): (
+            u32,
+            u32,
+            u32,
+            Option<u32>,
+            bool,
+            u32,
+        ) = match kind {
+            Self::TS_AND_EQ => match insns {
+                [
+                    LoadSigSigRange {
+                        sig: en, sig2: s1, ..
+                    },
+                    SigRangeEq { sig: s2, .. },
+                    LogAndStore { sig: dst, .. },
+                ]
+                | [
+                    LoadSig { sig: en, .. },
+                    SigRangeW { sig: s1, .. },
+                    SigRangeEq { sig: s2, .. },
+                    LogAndStore { sig: dst, .. },
+                ]
+                | [
+                    LoadSigSigRange {
+                        sig: en, sig2: s1, ..
+                    },
+                    SigRangeW { sig: s2, .. },
+                    Eq { .. },
+                    LogAndStore { sig: dst, .. },
+                ]
+                | [
+                    LoadSig { sig: en, .. },
+                    SigRangeW { sig: s1, .. },
+                    SigRangeW { sig: s2, .. },
+                    Eq { .. },
+                    LogAndStore { sig: dst, .. },
+                ] => {
+                    let d1 = if s1 == s2 { None } else { Some(*s2) };
+                    (*dst, *en, *s1, d1, false, TS_CTL_MIN_FANOUT)
+                }
                 _ => return false,
-            };
+            },
+            Self::TS_AND_BIT => match insns {
+                [
+                    LoadSigSigRange {
+                        sig: en, sig2: s1, ..
+                    },
+                    Bit { .. },
+                    LogAndStore { sig: dst, .. },
+                ]
+                | [
+                    LoadSig { sig: en, .. },
+                    SigRangeW { sig: s1, .. },
+                    Bit { .. },
+                    LogAndStore { sig: dst, .. },
+                ]
+                | [
+                    LoadSig { sig: en, .. },
+                    SigBit { sig: s1, .. } | SigBitW { sig: s1, .. },
+                    LogAndStore { sig: dst, .. },
+                ] => (*dst, *en, *s1, None, false, TS_CTL_MIN_FANOUT),
+                _ => return false,
+            },
+            Self::TS_AND2 | Self::TS_OR2 => match insns {
+                [
+                    LoadSig2 { sig1, sig2, .. },
+                    LogAndStore { sig: dst, .. } | LogOrStore { sig: dst, .. },
+                ] => {
+                    if fanout(*sig1) >= fanout(*sig2) {
+                        (*dst, *sig2, *sig1, None, true, TS_CTL_MIN_FANOUT)
+                    } else {
+                        (*dst, *sig1, *sig2, None, false, TS_CTL_MIN_FANOUT)
+                    }
+                }
+                _ => return false,
+            },
+            Self::TS_MUX_STREAM => match insns {
+                [
+                    LoadSigSigRange {
+                        sig: sel,
+                        sig2: yes,
+                        ..
+                    },
+                    LoadSig { sig: no, .. }
+                    | SigRange { sig: no, .. }
+                    | SigRangeW { sig: no, .. },
+                    Sel { .. },
+                    Store { sig: dst, .. }
+                    | RangeStore { sig: dst, .. }
+                    | RangeStoreW { sig: dst, .. },
+                ]
+                | [
+                    LoadSig { sig: sel, .. },
+                    LoadSig { sig: yes, .. }
+                    | SigRange { sig: yes, .. }
+                    | SigRangeW { sig: yes, .. },
+                    LoadSig { sig: no, .. }
+                    | SigRange { sig: no, .. }
+                    | SigRangeW { sig: no, .. },
+                    Sel { .. },
+                    Store { sig: dst, .. }
+                    | RangeStore { sig: dst, .. }
+                    | RangeStoreW { sig: dst, .. },
+                ] => {
+                    if yes == no {
+                        return false;
+                    }
+                    (*dst, *sel, *yes, Some(*no), false, TS_MUX_MIN_FANOUT)
+                }
+                _ => return false,
+            },
+            Self::TS_WMUX_STREAM => match insns {
+                [
+                    LoadSig { sig: sel, .. },
+                    WLoadSig { sig: yes, .. } | WSigRange { sig: yes, .. },
+                    WLoadSig { sig: no, .. } | WSigRange { sig: no, .. },
+                    WSel { .. },
+                    WStore { sig: dst, .. } | WRangeStore { sig: dst, .. },
+                ] => {
+                    if yes == no {
+                        return false;
+                    }
+                    (*dst, *sel, *yes, Some(*no), false, TS_MUX_MIN_FANOUT)
+                }
+                _ => return false,
+            },
+            Self::TS_REPL_MASK => match insns {
+                [
+                    LoadSigRepl { sig: en, .. },
+                    SigRangeAnd { sig: src, .. },
+                    Store { sig: dst, .. }
+                    | RangeStore { sig: dst, .. }
+                    | RangeStoreW { sig: dst, .. },
+                ]
+                | [
+                    LoadSigRepl { sig: en, .. },
+                    LoadSig { sig: src, .. }
+                    | SigRange { sig: src, .. }
+                    | SigRangeW { sig: src, .. },
+                    And { .. },
+                    Store { sig: dst, .. }
+                    | RangeStore { sig: dst, .. }
+                    | RangeStoreW { sig: dst, .. },
+                ] => (*dst, *en, *src, None, false, TS_MUX_MIN_FANOUT),
+                _ => return false,
+            },
+            Self::TS_WREPL_MASK => match insns {
+                [
+                    LoadSig { sig: en, .. },
+                    WRepl { .. },
+                    WLoadSig { sig: src, .. } | WSigRange { sig: src, .. },
+                    WAnd { .. },
+                    WStore { sig: dst, .. } | WRangeStore { sig: dst, .. },
+                ]
+                | [
+                    WLoadSig { sig: src, .. } | WSigRange { sig: src, .. },
+                    LoadSig { sig: en, .. },
+                    WRepl { .. },
+                    WAnd { .. },
+                    WStore { sig: dst, .. } | WRangeStore { sig: dst, .. },
+                ] => (*dst, *en, *src, None, false, TS_MUX_MIN_FANOUT),
+                _ => return false,
+            },
+            _ => return false,
+        };
         let max_fo = fanout(data0).max(data1_opt.map_or(0, fanout));
-        if max_fo < TS_CTL_MIN_FANOUT {
+        if max_fo < min_fo {
             return false;
         }
         // Distinctness & declared-net check (mirrors `ctl_build`).
@@ -2926,7 +4082,7 @@ impl Simulator {
             pos1,
             npos1,
             smask1,
-            masked: false,
+            mask_state: 0,
             ctl_is_sig2,
         });
         if self.ts_ctl_by_entry.len() <= eidx {
@@ -2975,21 +4131,39 @@ impl Simulator {
                             let off = self.ts_arena.len() as u32;
                             self.ts_arena.extend(ts.insns.iter().cloned());
                             let base_kind = Self::ts_kind_of(&ts);
-                            let kind = if !cfg!(feature = "opcode-census") && base_kind == 1 {
-                                if Self::is_slice_transfer(&ts.insns) {
-                                    Self::TS_SLICE_TRANSFER
-                                } else if Self::is_and_eq_stream(&ts.insns) {
-                                    Self::TS_AND_EQ
-                                } else if Self::is_and_bit_stream(&ts.insns) {
-                                    Self::TS_AND_BIT
-                                } else if Self::is_and2_stream(&ts.insns) {
-                                    Self::TS_AND2
-                                } else if Self::is_or2_stream(&ts.insns) {
-                                    Self::TS_OR2
-                                } else if Self::is_eq_store_stream(&ts.insns) {
-                                    Self::TS_EQ_STORE
-                                } else if self.ts_mux_stream_on && Self::is_mux_stream(&ts.insns) {
-                                    Self::TS_MUX_STREAM
+                            let kind = if !cfg!(feature = "opcode-census") {
+                                if base_kind == 1 {
+                                    if Self::is_slice_transfer(&ts.insns) {
+                                        Self::TS_SLICE_TRANSFER
+                                    } else if Self::is_and_eq_stream(&ts.insns) {
+                                        Self::TS_AND_EQ
+                                    } else if Self::is_and_bit_stream(&ts.insns) {
+                                        Self::TS_AND_BIT
+                                    } else if Self::is_and2_stream(&ts.insns) {
+                                        Self::TS_AND2
+                                    } else if Self::is_or2_stream(&ts.insns) {
+                                        Self::TS_OR2
+                                    } else if Self::is_eq_store_stream(&ts.insns) {
+                                        Self::TS_EQ_STORE
+                                    } else if Self::is_repl_mask_stream(&ts.insns) {
+                                        Self::TS_REPL_MASK
+                                    } else if Self::is_and_redor_stream(&ts.insns) {
+                                        Self::TS_AND_REDOR
+                                    } else if self.ts_mux_stream_on && Self::is_mux_stream(&ts.insns)
+                                    {
+                                        Self::TS_MUX_STREAM
+                                    } else {
+                                        base_kind
+                                    }
+                                } else if base_kind == 3 || base_kind == 4 {
+                                    if Self::is_wrepl_mask_stream(&ts.insns) {
+                                        Self::TS_WREPL_MASK
+                                    } else if self.ts_mux_stream_on && Self::is_wmux_stream(&ts.insns)
+                                    {
+                                        Self::TS_WMUX_STREAM
+                                    } else {
+                                        base_kind
+                                    }
                                 } else {
                                     base_kind
                                 }
@@ -3006,6 +4180,8 @@ impl Simulator {
                                 self.ts_hdr_tsx.resize(eidx + 1, 0);
                             }
                             self.ts_hdr_tsx[eidx] = ts.tsx as u8;
+                        } else {
+                            self.ts_has_overflow = true;
                         }
                         self.bit_sens_pending.push(eidx as u32);
                         TsSlot::Yes(std::sync::Arc::new(ts))

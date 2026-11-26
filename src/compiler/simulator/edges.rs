@@ -3058,18 +3058,37 @@ impl Simulator {
             }
 
             // Separate into parallel-eligible and sequential blocks
+            const PAR_CAL_TICKS: u32 = 64;
+            let use_partition =
+                self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
+            // The serial executor preserves block order and avoids chunk allocation.
+            let parallel_disabled = parallel_disabled_by_env()
+                || (parallel_serialize_enabled()
+                    && !use_partition
+                    && !env_is_one_cached!("XEZIM_FORCE_PARALLEL"));
             let mut parallel_blocks = std::mem::take(&mut self.edge_parallel_work);
             let mut sequential_blocks = std::mem::take(&mut self.edge_sequential_work);
             parallel_blocks.clear();
             sequential_blocks.clear();
             let mut parallel_insn_count = 0usize;
-            for &bi in &triggered {
-                if bi < self.edge_block_parallel.len() && self.edge_block_parallel[bi] {
-                    parallel_insn_count +=
-                        self.edge_block_insn_len.get(bi).copied().unwrap_or(0) as usize;
-                    parallel_blocks.push(bi);
-                } else {
-                    sequential_blocks.push(bi);
+            if parallel_disabled {
+                let par_len = self.edge_block_parallel.len();
+                for &bi in &triggered {
+                    if bi < par_len && self.edge_block_parallel[bi] {
+                        parallel_blocks.push(bi);
+                    } else {
+                        sequential_blocks.push(bi);
+                    }
+                }
+            } else {
+                for &bi in &triggered {
+                    if bi < self.edge_block_parallel.len() && self.edge_block_parallel[bi] {
+                        parallel_insn_count +=
+                            self.edge_block_insn_len.get(bi).copied().unwrap_or(0) as usize;
+                        parallel_blocks.push(bi);
+                    } else {
+                        sequential_blocks.push(bi);
+                    }
                 }
             }
 
@@ -3088,20 +3107,6 @@ impl Simulator {
             // XEZIM_NO_PARALLEL=1 forces the regular sequential executor;
             // XEZIM_FORCE_PARALLEL=1 forces eligible isolated dispatch without
             // waiting for calibration. Its chunks run serially by default.
-            const PAR_CAL_TICKS: u32 = 64;
-            let use_partition =
-                self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
-            // When isolated chunks execute serially (the default) with no
-            // partition loaded, the regular sequential `exec_bytecode` path
-            // runs the same blocks in the same order while keeping the
-            // two-state / x-plane edge executor active and avoiding per-tick
-            // chunk/NBA Vec allocations. Only calibrate/dispatch isolated
-            // chunks when actual worker threads or an explicit partition/force
-            // override is enabled.
-            let parallel_disabled = parallel_disabled_by_env()
-                || (parallel_serialize_enabled()
-                    && !use_partition
-                    && !env_is_one_cached!("XEZIM_FORCE_PARALLEL"));
             let qualifies = parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000;
             let use_parallel = if parallel_disabled {
                 false

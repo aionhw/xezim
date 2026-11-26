@@ -543,11 +543,7 @@ impl Simulator {
     pub(super) fn note_edge_write(&mut self, id: usize) {
         // Parked-waiter index — see the write_sig! twin. The in-place write
         // paths end here without the old value, so every write is noted.
-        if id < self.event_waiters.watch.len()
-            && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
-        {
-            self.event_waiters.note_write(id);
-        }
+        self.event_waiters.check_and_note_write(id);
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
         if self.in_edge_block || self.in_edge_cont {
             if let Some(&p) = self.sig_to_edge_pos.get(id) {
@@ -611,9 +607,17 @@ impl Simulator {
         masks: &[u64],
         changed: u64,
     ) {
-        for (&bi, &mask) in blocks.iter().zip(masks) {
-            if mask & changed != 0 {
-                armed[bi as usize] |= EDGE_ARMED;
+        if blocks.len() == 1 {
+            if unsafe { *masks.get_unchecked(0) } & changed != 0 {
+                let bi = unsafe { *blocks.get_unchecked(0) } as usize;
+                unsafe { *armed.get_unchecked_mut(bi) |= EDGE_ARMED };
+            }
+            return;
+        }
+        for i in 0..blocks.len() {
+            if unsafe { *masks.get_unchecked(i) } & changed != 0 {
+                let bi = unsafe { *blocks.get_unchecked(i) } as usize;
+                unsafe { *armed.get_unchecked_mut(bi) |= EDGE_ARMED };
             }
         }
     }
@@ -1162,18 +1166,12 @@ impl Simulator {
             return;
         }
         if self.fast_quiet_obs && self.active_force_exprs.is_empty() && !self.dump_dirty_active {
-            // Fast path latched during clean combinational settle: no value
-            // trace, VCD dump, force expr, inline mirror, commit plan, or
-            // edge-exec/dirty-edge hooks are active.
+            // During clean settle, check quiet bits and the compact waiter list.
             if (unsafe { *self.quiet_bits.get_unchecked(id >> 6) } >> (id & 63)) & 1 != 0 {
                 return;
             }
             arm_edge_readers!(self, id, changed);
-            if id < self.event_waiters.watch.len()
-                && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
-            {
-                self.event_waiters.note_write(id);
-            }
+            self.event_waiters.check_and_note_write(id);
             return;
         }
         let (edge_sidecar, armed_sidecar) = if self.signal_commit_plan.is_empty() {
@@ -3091,8 +3089,11 @@ impl Simulator {
     /// in-place mutation that bypassed `write_sig!` (raw-bit fast paths,
     /// set_bit/splice paths, UDP bit writes, direct table stores). Cheap:
     /// two u64 stores + one byte.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn sync_mirror(&mut self, id: usize) {
+        if self.signal_inline_bits.is_empty() {
+            return;
+        }
         if let Some(slot) = self.signal_inline_bits.get_mut(id) {
             let (v, x) = self.signal_table[id].raw_bits();
             *slot = [v, x];
@@ -3148,9 +3149,9 @@ impl Simulator {
     /// `LoadSignalRange` — whole-value loads stay gated to <= 64 bits.
     #[inline]
     pub(crate) fn jit_load_signal_slice(&self, id: usize, lo: u32, w: u32) -> u64 {
-        if id >= self.signal_table.len() {
-            return 0;
-        }
-        Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).0
+        self.signal_table
+            .get(id)
+            .filter(|v| lo < v.width)
+            .map_or(0, |v| v.slice_bits_swar(lo as usize, w as usize).0)
     }
 }

@@ -1596,6 +1596,11 @@ impl Simulator {
                 self.ts_ctl_rearm(s);
             }
         }
+        if !self.case_ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.case_ctl_rearm_pending) {
+                self.case_ctl_rearm(s);
+            }
+        }
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
@@ -1653,7 +1658,8 @@ impl Simulator {
             && self.trace_always.is_none()
             && !self.profile_report
             && !self.trace_comb_paths
-            && self.proc_depth == 0;
+            && self.proc_depth == 0
+            && !self.proc_settle_defer;
         let mut gate_queue = std::mem::take(&mut self.gate_queue);
         let mut gate_queued = std::mem::take(&mut self.gate_queued);
 
@@ -1728,6 +1734,14 @@ impl Simulator {
                                 }
                                 // the eager clock-tree pass already evaluated these
                                 if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                if lane_on && dep_edges[lo + j].gate_slot != 0 {
+                                    let gate = (dep_edges[lo + j].gate_slot - 1) as usize;
+                                    if !gate_queued[gate] {
+                                        gate_queued[gate] = true;
+                                        gate_queue.push(gate as u32);
+                                    }
                                     continue;
                                 }
                                 if !triggered[eidx] {
@@ -1811,7 +1825,7 @@ impl Simulator {
             self.comb_time0_fired = true;
         }
 
-        if next_list.is_empty() {
+        if next_list.is_empty() && gate_queue.is_empty() {
             self.settle_entries_view = (std::ptr::null(), 0);
             self.comb_entries = entries;
             self.comb_dep_offsets = dep_offsets;
@@ -1867,17 +1881,6 @@ impl Simulator {
             self.prof_cur = s.cur.clone();
             self.prof_sampler = Some(s);
         }
-        // Settle-worklist prefetch distance (entries ahead of the cursor).
-        // Latched once per settle: it is a process-wide env knob.
-        let prefetch_dist: usize = {
-            static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            *D.get_or_init(|| {
-                std::env::var("XEZIM_PREFETCH_DIST")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8)
-            })
-        };
         static PREFETCH_MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let prefetch_mode = *PREFETCH_MODE.get_or_init(|| {
             std::env::var("XEZIM_PREFETCH_MODE")
@@ -1885,9 +1888,21 @@ impl Simulator {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
+        // Settle-worklist prefetch distance (entries ahead of the cursor).
+        // Default 0 in mode 0: two-state arena entries never load `entries[]`,
+        // so prefetching `entries[nxt]` pollutes L1 with dead 64B lines.
+        let prefetch_dist: usize = {
+            static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *D.get_or_init(|| {
+                std::env::var("XEZIM_PREFETCH_DIST")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if prefetch_mode == 0 { 0 } else { 8 })
+            })
+        };
         static INJECT_PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let inject_prefetch = *INJECT_PREFETCH
-            .get_or_init(|| std::env::var("XEZIM_INJECT_PREFETCH").ok().as_deref() != Some("0"));
+            .get_or_init(|| std::env::var("XEZIM_INJECT_PREFETCH").ok().as_deref() == Some("1"));
         let mon_on = self.activity_mon;
         let trace_on = self.trace_always.is_some();
         // Any per-evaluation diagnostic hook armed. All are construction-time
@@ -1968,6 +1983,12 @@ impl Simulator {
         let has_obs = self.comb_has_observer;
         let has_mux_guard = !self.mux_guard_by_entry.is_empty();
         let has_clock_tree = !tree_sig.is_empty();
+        // Hoist observer and deferral checks out of the clean settle loop.
+        let fast_no_guard = !self.proc_settle_defer
+            && !has_obs
+            && !self.in_pre_process_settle
+            && !has_mux_guard
+            && !diag_on;
         // Latch clean-settle fast path for `after_signal_write_inner`: avoids
         // checking 8 global observer flags on every signal write (~1.7B/run).
         self.fast_quiet_obs = self.signal_commit_plan.is_empty()
@@ -2077,8 +2098,14 @@ impl Simulator {
                                 // re-triggered into a second pass. Appending
                                 // it to the pass list ran it last and cost
                                 // 15% more entry evaluations on c906.
-                                inject_bits[__dep >> 6] |= 1u64 << (__dep & 63);
-                                inject_sum[__dep >> 12] |= 1u64 << ((__dep >> 6) & 63);
+                                // SAFETY: `inject_bits` is sized to `num_entries.div_ceil(64)`
+                                // and `inject_sum` to `words.div_ceil(64)`; `__dep < num_entries`.
+                                unsafe {
+                                    *inject_bits.get_unchecked_mut(__dep >> 6) |=
+                                        1u64 << (__dep & 63);
+                                    *inject_sum.get_unchecked_mut(__dep >> 12) |=
+                                        1u64 << ((__dep >> 6) & 63);
+                                }
                                 if __dep < next_inject {
                                     next_inject = __dep;
                                 }
@@ -2135,10 +2162,13 @@ impl Simulator {
                 {
                     let e = next_inject;
                     let word_index = e >> 6;
-                    let remaining = inject_bits[word_index] & !(1u64 << (e & 63));
-                    inject_bits[word_index] = remaining;
+                    let remaining = unsafe { *inject_bits.get_unchecked(word_index) }
+                        & !(1u64 << (e & 63));
+                    unsafe { *inject_bits.get_unchecked_mut(word_index) = remaining };
                     if remaining == 0 {
-                        inject_sum[e >> 12] &= !(1u64 << ((e >> 6) & 63));
+                        unsafe {
+                            *inject_sum.get_unchecked_mut(e >> 12) &= !(1u64 << ((e >> 6) & 63));
+                        }
                     }
                     next_inject = if pop_word {
                         // e is the smallest pending index. The word we
@@ -2195,7 +2225,7 @@ impl Simulator {
                 // around. BOTH indices are bounds-checked here, which keeps
                 // the address inside the allocation on every path.
                 #[cfg(target_arch = "x86_64")]
-                {
+                if prefetch_dist != 0 {
                     let d = cur_pos + prefetch_dist;
                     if prefetch_mode != 0 {
                         // Two-state entries never touch `entries[]` any more:
@@ -2315,95 +2345,64 @@ impl Simulator {
                 // later this pass (or next), the entry is re-triggered by
                 // the worklist propagation below.
                 triggered[eidx] = false;
-                // #35 §5.5/§10.3: while a PROCESS's post-write settle runs,
-                // cont-assign re-evaluation is a SEPARATE active-region event
-                // the process must not observe before yielding — defer these
-                // entries to the next full settle. UDP/gate entries (a
-                // synthesized netlist's cells) stay eager, which is the
-                // reference-measured split (c1b lazy vs dep eager).
-                // #t0-comb-defer: the optimizer lowers `assign p = a` (and
-                // port connects) to gate-shaped entries, which the variant
-                // list above missed — they evaluated eagerly during the
-                // writer's own settle, firing the t=0 edge before a
-                // source-later blocking-body `always` armed.
-                // `gate_entry_is_assign_origin` recovers the assign origin
-                // from `signal_gate_driven` so those entries defer too while
-                // true gate primitives stay eager.
-                // §4.5, §9.2.2.2: a level-sensitive `always` (always_comb,
-                // always @*, always @(a or b)) is a process of its own, not a
-                // cell: the writer's change only schedules it, and it runs
-                // once the writer suspends, after the continuous assignments
-                // it reads have been updated (the settle walks entries in
-                // dependency order). Run inline, it saw each blocking write
-                // separately and before the assignments, so an immediate
-                // assertion in it failed on values that never coexist.
-                if self.proc_settle_defer
-                    && (matches!(
-                        entries[eidx].item,
-                        CombItem::ContAssign { .. }
-                            | CombItem::CompiledContAssign { .. }
-                            | CombItem::DirectCopy { .. }
-                            | CombItem::FastDirectCopy { .. }
-                            | CombItem::FastDirectFanout { .. }
-                            | CombItem::FusedBufFanout { .. }
-                            | CombItem::FusedAndFanout { .. }
-                            | CombItem::AlwaysBlock { .. }
-                            | CombItem::CompiledAlwaysBlock { .. }
-                    ) || self.gate_entry_is_assign_origin(&entries[eidx]))
-                {
-                    // An `always` entry lists the signals that changed in this
-                    // settle, each once: re-dirtied at the yield, they wake
-                    // exactly the blocks they woke here. Its other reads did
-                    // not change, and would also wake blocks sensitive to them
-                    // alone. With nothing changed (an entry woken by an
-                    // unresolved read, which every settle re-seeds) or at the
-                    // time-0 seeding, it lists its reads as before.
-                    if matches!(
-                        entries[eidx].item,
-                        CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
-                    ) && !t0_seeded
-                        && !defer_changed.is_empty()
+                if !fast_no_guard {
+                    if self.proc_settle_defer
+                        && (matches!(
+                            entries[eidx].item,
+                            CombItem::ContAssign { .. }
+                                | CombItem::CompiledContAssign { .. }
+                                | CombItem::DirectCopy { .. }
+                                | CombItem::FastDirectCopy { .. }
+                                | CombItem::FastDirectFanout { .. }
+                                | CombItem::FusedBufFanout { .. }
+                                | CombItem::FusedAndFanout { .. }
+                                | CombItem::AlwaysBlock { .. }
+                                | CombItem::CompiledAlwaysBlock { .. }
+                        ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                     {
-                        if defer_listed < defer_changed.len() {
-                            self.defer_proc_reads(&defer_changed[defer_listed..], false);
-                            defer_listed = defer_changed.len();
+                        if matches!(
+                            entries[eidx].item,
+                            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+                        ) && !t0_seeded
+                            && !defer_changed.is_empty()
+                        {
+                            if defer_listed < defer_changed.len() {
+                                self.defer_proc_reads(&defer_changed[defer_listed..], false);
+                                defer_listed = defer_changed.len();
+                            }
+                            continue;
                         }
+                        let reads = &entries[eidx].cold.read_signal_ids;
+                        self.defer_proc_reads(
+                            reads,
+                            entries[eidx].has_unresolved_reads && reads.is_empty(),
+                        );
                         continue;
                     }
-                    // An entry with no resolvable read (one reading only
-                    // memory cells without element names) has no id to
-                    // re-dirty: an out-of-range marker still makes the next
-                    // full settle run, which seeds every unresolved entry.
-                    let reads = &entries[eidx].cold.read_signal_ids;
-                    self.defer_proc_reads(
-                        reads,
-                        entries[eidx].has_unresolved_reads && reads.is_empty(),
-                    );
-                    continue;
-                }
-                if has_obs && !obs_pass && observer.get(eidx).copied().unwrap_or(false) {
-                    triggered[eidx] = true;
-                    held_obs.push(eidx);
-                    continue;
+                    if has_obs && !obs_pass && observer.get(eidx).copied().unwrap_or(false) {
+                        triggered[eidx] = true;
+                        held_obs.push(eidx);
+                        continue;
+                    }
+                    if self.in_pre_process_settle && entries[eidx].defer_at_time0 {
+                        self.t0_deferred_ran.insert(eidx);
+                    }
+                    if has_mux_guard
+                        && let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
+                        && self.mux_body_unchanged(slot.get() - 1)
+                    {
+                        mux_skipped += 1;
+                        continue;
+                    }
                 }
                 evaluated_any = true;
-                if self.in_pre_process_settle && entries[eidx].defer_at_time0 {
-                    self.t0_deferred_ran.insert(eidx);
-                }
-                if has_mux_guard
-                    && let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
-                    && self.mux_body_unchanged(slot.get() - 1)
-                {
-                    mux_skipped += 1;
-                    continue;
-                }
                 let dirty_before = self.dirty_list.len();
 
                 n_evals += 1;
                 if _iteration > 0 {
                     n_repass += 1;
                 }
-                if diag_on {
+                if !fast_no_guard && diag_on {
                     if self.trace_comb_paths {
                         if eidx >= self.comb_eval_counts.len() {
                             self.comb_eval_counts.resize(eidx + 1, [0; 2]);
@@ -2565,11 +2564,18 @@ impl Simulator {
                         if ok {
                             ts_fast = true;
                             n_dc += 1;
+                            if matches!(arena_hdr.kind(), 2..=4) && !self.case_ctl.is_empty() {
+                                self.case_ctl_update(eidx, &mut dep_edges);
+                            }
                             if self.trace_comb_paths {
                                 self.note_comb_path(eidx, 0);
                             }
+                        } else {
+                            self.ts_ctl_set_masked(eidx, &mut dep_edges, false);
                         }
-                    } else if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
+                    } else if self.ts_has_overflow
+                        && let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx)
+                    {
                         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
                         if !ts_keep_recs {
                             self.ts_rec_n = 0;
@@ -2591,7 +2597,9 @@ impl Simulator {
                     }
                 }
                 if !ts_fast {
-                    self.ts_ctl_set_masked(eidx, &mut dep_edges, false);
+                    if self.proc_depth != 0 && !self.ts_ctl.is_empty() {
+                        self.ts_ctl_set_masked(eidx, &mut dep_edges, false);
+                    }
                     if !self.ts_sleep.is_empty() {
                         if let Some(c) = self.ts_asleep_comb.get_mut(eidx) {
                             if *c != 0 {
@@ -2923,6 +2931,9 @@ impl Simulator {
                             if let Some(saved_ts) = saved_ts {
                                 self.timescale_scope_override = saved_ts;
                             }
+                            if !self.case_ctl.is_empty() {
+                                self.case_ctl_update(eidx, &mut dep_edges);
+                            }
                         }
                         // The three fused arms are the settle loop's highest-volume
                         // shapes on RTL netlists (c906: 57.8% / 5.8% / 0.02% of all
@@ -3192,7 +3203,7 @@ impl Simulator {
             self.dirty_any = false;
             // Prepare cur_list for next pass reuse (it'll be swapped in).
             cur_list.clear();
-            if next_list.is_empty() {
+            if next_list.is_empty() && gate_queue.is_empty() {
                 converged = true;
                 break;
             }

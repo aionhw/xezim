@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Preserve full packed offsets in native slice reads and case-arm masking,
+  and restore dynamic dependency masks with their controller state
+  (§11.5.1, §12.5, Annex D.9).
+- Validate drive and charge strength syntax and retain gate, pull, and UDP
+  strengths through elaboration. Resolve wired nets and supply drivers using
+  their declared strengths (§6.7, §6.6.3, §6.6.6, §28.12, Clause 29, #1638).
+- Detect overlapping drivers on unresolved net bits and reject connections
+  to bidirectional switches (§6.6.2, #1638).
+- Diagnose more procedural net writes without mistaking a block-local variable
+  for an outer net. Check variable declaration initializers against continuous
+  drivers (§6.5, §10.4, #1638).
+
 - Packed-struct input ports preserve their member layout when connected to
   packed vector elements (§7.2.1, §23.3.3, #1645).
 - Nonblocking assignments between overlapping unpacked array slices sample
@@ -188,6 +200,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+- Dispatch lowered clocked blocks through the two-state arena after native
+  dispatch, and update the live event-waiter index as signals enter or leave it.
 - Class instantiation and startup skip redundant property-initializer sorting,
   duplicate parameter-map cloning, and unused static collection copies; packed
   property width lookups hit the cache without cloning parameter maps or values.
