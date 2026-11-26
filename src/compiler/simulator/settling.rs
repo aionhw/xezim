@@ -1983,9 +1983,7 @@ impl Simulator {
         let has_obs = self.comb_has_observer;
         let has_mux_guard = !self.mux_guard_by_entry.is_empty();
         let has_clock_tree = !tree_sig.is_empty();
-        // Fast guard check hoisted out of the per-eval loop: true on >99.9% of
-        // comb evaluations during clean settle so the inner loop pays one test
-        // instead of five separate checks before reaching `ts_hdr[eidx]`.
+        // Hoist observer and deferral checks out of the clean settle loop.
         let fast_no_guard = !self.proc_settle_defer
             && !has_obs
             && !self.in_pre_process_settle

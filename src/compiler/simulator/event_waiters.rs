@@ -41,6 +41,8 @@ const QUEUED_SNAP: u8 = 8;
 struct SigWatchers {
     /// Parked waiters among `seqs`.
     live: u32,
+    /// Position in `EventWaiters::live_signals` while `live > 0`.
+    live_pos: usize,
     /// Their sequence numbers, with those of waiters that left since
     /// (dropped when the list is next purged).
     seqs: Vec<u64>,
@@ -101,11 +103,9 @@ pub(super) struct EventWaiters {
     hook_stamp: u64,
     /// Scratch for the drain's candidates.
     pub(super) cand_buf: Vec<u64>,
-    /// Compact L1-resident list of currently indexed signal IDs (those with
-    /// `sigs[id].live > 0`) when there are at most 16 of them; `u8::MAX` means
-    /// more than 16 and callers fall back to probing `watch[id]`.
-    watch_small: [u32; 16],
-    watch_small_len: u8,
+    /// Signal IDs with live indexed waiters, kept dense on insertion/removal.
+    /// With at most 16 IDs, this is a compact filter before probing `watch`.
+    live_signals: Vec<u32>,
 }
 
 impl EventWaiters {
@@ -156,43 +156,11 @@ impl EventWaiters {
         self.hooked[id >> 6] |= 1u64 << (id & 63);
     }
 
-    /// Rebuild the L1-resident small watched-signal list from `self.sigs`.
-    fn refresh_watch_small(&mut self) {
-        let mut n = 0usize;
-        for (&id, s) in &self.sigs {
-            if s.live > 0 {
-                if n >= self.watch_small.len() {
-                    self.watch_small_len = u8::MAX;
-                    return;
-                }
-                self.watch_small[n] = id as u32;
-                n += 1;
-            }
-        }
-        self.watch_small_len = n as u8;
-    }
-
-    /// Check if `id` is watched by an indexed waiter and record the write if
-    /// so. When <= 16 signals are watched (typical SoC testbenches), avoids
-    /// probing the multi-MB `watch` table on every non-quiet write.
+    /// Use the compact list to filter writes when at most 16 signals are watched.
     #[inline(always)]
     pub(super) fn check_and_note_write(&mut self, id: usize) {
-        let n = self.watch_small_len;
-        if n == 0 {
+        if self.live_signals.len() <= 16 && !self.live_signals.contains(&(id as u32)) {
             return;
-        }
-        if n <= 16 {
-            let id32 = id as u32;
-            let mut hit = false;
-            for i in 0..n as usize {
-                if unsafe { *self.watch_small.get_unchecked(i) } == id32 {
-                    hit = true;
-                    break;
-                }
-            }
-            if !hit {
-                return;
-            }
         }
         if id < self.watch.len() && self.watch[id] & WATCH_ANY != 0 {
             self.note_write(id);
@@ -245,6 +213,10 @@ impl EventWaiters {
                 let entries = &self.entries;
                 s.seqs.retain(|q| entries.contains_key(q));
             }
+            if s.live == 0 {
+                s.live_pos = self.live_signals.len();
+                self.live_signals.push(id as u32);
+            }
             s.live += 1;
             s.seqs.push(seq);
             let f = &mut self.watch[id];
@@ -258,7 +230,6 @@ impl EventWaiters {
                 *f |= WATCH_DRAIN;
             }
         }
-        self.refresh_watch_small();
     }
 
     /// Waiter `seq` left the list.
@@ -267,22 +238,23 @@ impl EventWaiters {
             self.cons.remove(&seq);
             return;
         }
-        let mut dropped = false;
         for id in Self::term_ids(w) {
             let Some(s) = self.sigs.get_mut(&id) else {
                 continue;
             };
-            s.live = s.live.saturating_sub(1);
+            debug_assert_ne!(s.live, 0);
+            s.live -= 1;
             if s.live == 0 {
                 s.seqs.clear();
+                let pos = s.live_pos;
+                self.live_signals.swap_remove(pos);
+                if let Some(&moved) = self.live_signals.get(pos) {
+                    self.sigs.get_mut(&(moved as usize)).unwrap().live_pos = pos;
+                }
                 if let Some(f) = self.watch.get_mut(id) {
                     *f &= !WATCH_ANY;
                 }
-                dropped = true;
             }
-        }
-        if dropped {
-            self.refresh_watch_small();
         }
     }
 

@@ -3061,12 +3061,7 @@ impl Simulator {
             const PAR_CAL_TICKS: u32 = 64;
             let use_partition =
                 self.edge_block_partition_count > 0 && !self.edge_block_partition.is_empty();
-            // When isolated chunks execute serially (the default) with no
-            // partition loaded, the regular sequential path runs the same
-            // blocks in the same order while keeping the two-state / x-plane
-            // edge executor active and avoiding per-tick chunk/NBA Vec
-            // allocations. Only calibrate/dispatch isolated chunks when actual
-            // worker threads or an explicit partition/force override is enabled.
+            // The serial executor preserves block order and avoids chunk allocation.
             let parallel_disabled = parallel_disabled_by_env()
                 || (parallel_serialize_enabled()
                     && !use_partition
@@ -3336,48 +3331,28 @@ impl Simulator {
             } else {
                 // Sequential: either the tick is too small to be worth threading,
                 // or calibration found threading to be a net loss on this machine.
-                let fast_edge_arena = !self.edge_block_stats_enabled
-                    && !self.profile_report
-                    && self.jit_fns.is_empty();
-                if fast_edge_arena {
-                    for &bi in &parallel_blocks {
-                        let h = self.ts_edge_hdr.get(bi).copied().unwrap_or_default();
-                        if h.kind() != 0 && self.ts_guard_and_exec_edge_arena(bi, h) {
-                            continue;
-                        }
-                        self.exec_bytecode(bi);
+                for &bi in &parallel_blocks {
+                    let t = if self.edge_block_stats_enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    if self.profile_report {
+                        self.prof_cur.store(
+                            crate::compiler::prof_sampler::KIND_EDGE | bi as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
-                } else {
-                    for &bi in &parallel_blocks {
-                        let t = if self.edge_block_stats_enabled {
-                            Some(std::time::Instant::now())
-                        } else {
-                            None
-                        };
-                        if self.profile_report {
-                            self.prof_cur.store(
-                                crate::compiler::prof_sampler::KIND_EDGE | bi as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        let h = if self.jit_fns.is_empty() {
-                            self.ts_edge_hdr.get(bi).copied().unwrap_or_default()
-                        } else {
-                            TsHdr::default()
-                        };
-                        if h.kind() == 0 || !self.ts_guard_and_exec_edge_arena(bi, h) {
-                            self.exec_bytecode(bi);
-                        }
-                        if self.profile_report {
-                            self.prof_cur.store(
-                                crate::compiler::prof_sampler::KIND_OTHER,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        if let Some(t) = t {
-                            if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
-                                *slot += t.elapsed().as_nanos() as u64;
-                            }
+                    self.exec_bytecode(bi);
+                    if self.profile_report {
+                        self.prof_cur.store(
+                            crate::compiler::prof_sampler::KIND_OTHER,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    if let Some(t) = t {
+                        if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
+                            *slot += t.elapsed().as_nanos() as u64;
                         }
                     }
                 }
@@ -3507,14 +3482,7 @@ impl Simulator {
                         self.restore_process_context(ctx);
                     }
                 } else {
-                    let h = if self.jit_fns.is_empty() {
-                        self.ts_edge_hdr.get(bi).copied().unwrap_or_default()
-                    } else {
-                        TsHdr::default()
-                    };
-                    if h.kind() == 0 || !self.ts_guard_and_exec_edge_arena(bi, h) {
-                        self.exec_bytecode(bi);
-                    }
+                    self.exec_bytecode(bi);
                 }
                 if self.profile_report {
                     self.prof_cur.store(

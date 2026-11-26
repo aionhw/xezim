@@ -2005,7 +2005,13 @@ impl Simulator {
                 }
             }
         }
-        // P5: X-free edge bodies run on u64 words. NBA queue semantics are
+        // Try the two-state arena after tracing, scope setup, and native dispatch.
+        if let Some(h) = self.ts_edge_hdr.get(block_idx).copied()
+            && h.kind() != 0
+        {
+            return self.ts_guard_and_exec_edge_arena(block_idx, h);
+        }
+        // X-free edge bodies run on u64 words. NBA queue semantics are
         // preserved by StoreNba; blocking stores record §9.2 edge writes
         // through after_signal_write. The resolved slot is checked FIRST so
         // non-lowerable blocks pay one enum test; only the initial lowering

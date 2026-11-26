@@ -1166,12 +1166,7 @@ impl Simulator {
             return;
         }
         if self.fast_quiet_obs && self.active_force_exprs.is_empty() && !self.dump_dirty_active {
-            // Fast path latched during clean combinational settle: no value
-            // trace, VCD dump, force expr, inline mirror, commit plan, or
-            // edge-exec/dirty-edge hooks are active. Keeps the 1-bit/signal
-            // `quiet_bits` working set L2-resident and checks the L1-resident
-            // `event_waiters` small list instead of probing the multi-MB watch
-            // table on armed edge inputs.
+            // During clean settle, check quiet bits and the compact waiter list.
             if (unsafe { *self.quiet_bits.get_unchecked(id >> 6) } >> (id & 63)) & 1 != 0 {
                 return;
             }
@@ -3154,9 +3149,9 @@ impl Simulator {
     /// `LoadSignalRange` — whole-value loads stay gated to <= 64 bits.
     #[inline]
     pub(crate) fn jit_load_signal_slice(&self, id: usize, lo: u32, w: u32) -> u64 {
-        if id >= self.signal_table.len() {
-            return 0;
-        }
-        Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).0
+        self.signal_table
+            .get(id)
+            .filter(|v| lo < v.width)
+            .map_or(0, |v| v.slice_bits_swar(lo as usize, w as usize).0)
     }
 }

@@ -11,10 +11,10 @@ pub(super) struct CaseComparison {
 impl Simulator {
     #[inline]
     pub(crate) fn jit_load_signal_slice_xz(&self, id: usize, lo: u32, w: u32) -> u64 {
-        if id >= self.signal_table.len() {
-            return 0;
-        }
-        Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).1
+        self.signal_table
+            .get(id)
+            .filter(|v| lo < v.width)
+            .map_or(0, |v| v.slice_bits_swar(lo as usize, w as usize).1)
     }
 
     /// JIT bridge: Path B X/Z pre-check. Returns true if ANY signal in

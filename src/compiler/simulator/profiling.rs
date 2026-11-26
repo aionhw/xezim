@@ -2759,13 +2759,8 @@ impl Simulator {
         }
     }
 
-    /// Build dynamic per-arm edge masks (`CaseCtl`) for single-writer
-    /// combinational `CompiledAlwaysBlock` entries dispatched by `CaseJump`,
-    /// `CmpBranchConst(CaseEq)` chains, or `BranchIfSignalFalse`.
-    ///
-    /// Candidate-first design: parses the small set of matching always blocks
-    /// first, then verifies exclusive-writer status ONLY for those candidate
-    /// destination signals (avoiding full-design HashMap/AST expansion).
+    /// Build per-arm masks for supported combinational branches.
+    /// Check exclusive ownership only for candidate destinations.
     pub(super) fn build_case_ctl(&mut self) {
         use super::bytecode::{BinOpConstKind, Insn};
         const CASE_CTL_MIN_FANOUT: u32 = 4;
@@ -2784,10 +2779,10 @@ impl Simulator {
         struct Cand {
             eidx: usize,
             sel_sig0: u32,
-            sel_lo0: u16,
+            sel_lo0: u32,
             sel_w0: u16,
             sel_sig1: u32,
-            sel_lo1: u16,
+            sel_lo1: u32,
             /// Maps selector value `v` to arm index into `arm_reads`.
             val_to_arm: Vec<u16>,
             default_arm: u16,
@@ -2797,7 +2792,7 @@ impl Simulator {
         let mut cands: Vec<Cand> = Vec::new();
         let mut cand_dst_ids: HashSet<usize> = HashSet::default();
 
-        let bit_load = |ins: &Insn, widths: &[u32], reals: &[bool]| -> Option<(u16, u32, u16)> {
+        let bit_load = |ins: &Insn, widths: &[u32], reals: &[bool]| -> Option<(u16, u32, u32)> {
             match *ins {
                 Insn::LoadSignal(r, s) => {
                     let su = s as usize;
@@ -2816,7 +2811,7 @@ impl Simulator {
                         && bit < widths.get(su).copied().unwrap_or(0)
                         && !reals.get(su).copied().unwrap_or(true)
                     {
-                        Some((r, s, bit as u16))
+                        Some((r, s, bit))
                     } else {
                         None
                     }
@@ -2825,10 +2820,8 @@ impl Simulator {
             }
         };
 
-        // Analyze one isolated arm slice `insns[lo..hi]` (`hi <= insns.len()`):
-        // must be acyclic, never branch outside `lo..hi` except `Jump(end)`,
-        // never fall through into another arm, and contain no dynamic array
-        // reads or calls. Returns the union of signal IDs read by the arm.
+        // Collect reads for a forward-only arm with internal branches or jumps
+        // to the common end. Reject calls, dynamic array reads, and fallthrough.
         let analyze_arm = |insns: &[Insn], lo: usize, hi: usize| -> Option<HashSet<u32>> {
             let end = insns.len();
             if lo > hi || hi > end {
@@ -2951,11 +2944,11 @@ impl Simulator {
                     } else {
                         let lo_w = if *bit == u32::MAX {
                             (self.signal_widths.get(s).copied().unwrap_or(0) == 1)
-                                .then_some((0u16, 1u16))
+                                .then_some((0u32, 1u16))
                         } else if *bit < 64
                             && (*bit) < self.signal_widths.get(s).copied().unwrap_or(0)
                         {
-                            Some((*bit as u16, 1u16))
+                            Some((*bit, 1u16))
                         } else {
                             None
                         };
@@ -2967,7 +2960,7 @@ impl Simulator {
                                 lo,
                                 w,
                                 u32::MAX,
-                                0u16,
+                                0u32,
                                 vec![1u16, 0u16],
                                 1u16,
                                 vec![then_r, else_r],
@@ -2999,10 +2992,10 @@ impl Simulator {
                                 Some((
                                     *r1,
                                     *sig,
-                                    *lo as u16,
+                                    *lo,
                                     (*hi - *lo + 1) as u16,
                                     u32::MAX,
-                                    0u16,
+                                    0u32,
                                     2usize,
                                 ))
                             } else {
@@ -3043,17 +3036,17 @@ impl Simulator {
                                     Some((
                                         *r1,
                                         sig,
-                                        *lo as u16,
+                                        *lo,
                                         (*hi - *lo + 1) as u16,
                                         u32::MAX,
-                                        0u16,
+                                        0u32,
                                         3usize,
                                     ))
                                 } else if sw > 0
                                     && sw <= 64
                                     && !self.signal_signed.get(s).copied().unwrap_or(true)
                                 {
-                                    Some((*re, sig, 0u16, sw as u16, u32::MAX, 0u16, 2usize))
+                                    Some((*re, sig, 0, sw as u16, u32::MAX, 0, 2usize))
                                 } else {
                                     None
                                 }
@@ -3068,7 +3061,7 @@ impl Simulator {
                                 && !self.signal_real.get(s).copied().unwrap_or(true)
                                 && !self.signal_signed.get(s).copied().unwrap_or(true)
                             {
-                                Some((*r, *sig, 0u16, w as u16, u32::MAX, 0u16, 1usize))
+                                Some((*r, *sig, 0, w as u16, u32::MAX, 0, 1usize))
                             } else {
                                 None
                             }
@@ -3084,10 +3077,10 @@ impl Simulator {
                                 Some((
                                     *r,
                                     *sig,
-                                    *lo as u16,
+                                    *lo,
                                     (*hi - *lo + 1) as u16,
                                     u32::MAX,
-                                    0u16,
+                                    0u32,
                                     1usize,
                                 ))
                             } else {
@@ -3241,9 +3234,7 @@ impl Simulator {
             return;
         }
 
-        // Phase 2: verify exclusive-writer status ONLY for `cand_dst_ids`.
-        // Build candidate leaf names once so AST checks filter in O(1) without
-        // allocating Strings for non-candidate signals.
+        // Filter AST writes by candidate leaf name before resolving them.
         let mut cand_leaves: HashSet<String> = HashSet::default();
         for &d in &cand_dst_ids {
             if let Some(name) = self.name_opt(d) {
@@ -3727,26 +3718,22 @@ impl Simulator {
             0u64
         } else {
             let c = unsafe { self.case_ctl.get_unchecked(slot as usize) };
-            let (v, x) = if c.sel_sig1 == u32::MAX {
-                let tbl = unsafe { self.signal_table.get_unchecked(c.sel_sig0 as usize) };
-                if c.sel_lo0 == 0 && (c.sel_w0 as u32) == tbl.width && tbl.width <= 64 {
+            let read = |sig: u32, lo: u32, width: u16| {
+                let tbl = unsafe { self.signal_table.get_unchecked(sig as usize) };
+                if lo == 0 && u32::from(width) == tbl.width {
                     tbl.raw_bits()
+                } else if tbl.width <= 64 {
+                    Self::raw_bits_slice(tbl, lo as u16, width)
                 } else {
-                    Self::raw_bits_slice(tbl, c.sel_lo0, c.sel_w0)
+                    // §11.5.1: a narrow part-select can start beyond bit 65535.
+                    tbl.slice_bits_swar(lo as usize, usize::from(width))
                 }
+            };
+            let (v, x) = if c.sel_sig1 == u32::MAX {
+                read(c.sel_sig0, c.sel_lo0, c.sel_w0)
             } else {
-                let t1 = unsafe { self.signal_table.get_unchecked(c.sel_sig0 as usize) };
-                let (v1, x1) = if c.sel_lo0 == 0 && t1.width <= 64 {
-                    t1.raw_bits()
-                } else {
-                    Self::raw_bits_slice(t1, c.sel_lo0, 1)
-                };
-                let t0 = unsafe { self.signal_table.get_unchecked(c.sel_sig1 as usize) };
-                let (v0, x0) = if c.sel_lo1 == 0 && t0.width <= 64 {
-                    t0.raw_bits()
-                } else {
-                    Self::raw_bits_slice(t0, c.sel_lo1, 1)
-                };
+                let (v1, x1) = read(c.sel_sig0, c.sel_lo0, 1);
+                let (v0, x0) = read(c.sel_sig1, c.sel_lo1, 1);
                 (((v1 & 1) << 1) | (v0 & 1), (x1 | x0) & 1)
             };
             if x != 0 {

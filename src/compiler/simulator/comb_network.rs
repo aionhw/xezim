@@ -203,22 +203,18 @@ pub(super) struct TsCtl {
     pub(super) ctl_is_sig2: bool,
 }
 
-/// Dynamic per-arm edge mask for single-writer combinational `always` blocks
-/// dispatched by a `case` or `if` selector (`CaseJump`, `CmpBranchConst`
-/// chain, or `BranchIfSignalFalse`). For each selector value `v`, bit `i` of
-/// `arm_masks[v]` (or `default_mask` when `v >= arm_masks.len()`) is `1` iff
-/// edge `i` is NOT read by the arm taken for `v` and can carry `mask = 0`
-/// while the selector stays steady.
+/// Per-arm dependency masks for a single-writer combinational `case` or `if`.
+/// Each set bit identifies an edge unused by the selected arm.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct CaseCtl {
     /// Primary selector signal (`sel_lo0..sel_lo0+sel_w0`).
     pub(super) sel_sig0: u32,
-    pub(super) sel_lo0: u16,
+    pub(super) sel_lo0: u32,
     pub(super) sel_w0: u16,
     /// Optional second 1-bit selector signal for `{sel_sig0[sel_lo0], sel_sig1[sel_lo1]}`
     /// concats (`u32::MAX` for a single-signal selector).
     pub(super) sel_sig1: u32,
-    pub(super) sel_lo1: u16,
+    pub(super) sel_lo1: u32,
     /// Per-selector-value maskable-edge bitset (up to 64 maskable edges).
     pub(super) arm_masks: Box<[u64]>,
     /// Maskable-edge bitset for selector values `>= arm_masks.len()`.

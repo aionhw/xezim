@@ -882,10 +882,7 @@ impl Simulator {
         }
     }
 
-    /// Short-circuiting narrow mux executor with dynamic arm-masking (`TsCtl`).
-    /// IEEE 1800 §11.4.11: when `sel === 1'b1` (or `1'b0`), the unselected arm
-    /// cannot affect the output even if it holds X/Z, so it is neither loaded
-    /// nor woken while `sel` stays steady.
+    /// IEEE 1800 §11.4.11: a known selector permits loading only the active arm.
     #[inline(always)]
     fn exec_mux_stream(
         &mut self,
@@ -1081,9 +1078,7 @@ impl Simulator {
         true
     }
 
-    /// `dst[..] = {N{en}} & src[..]` (gated bus/vector masks: ~1.1% of
-    /// contassign evals on C910). Short-circuits on `en === 0` without
-    /// loading `src` and dynamically masks `src`'s edge via `TsCtl`.
+    /// A zero enable short-circuits `{N{en}} & src` and masks the source edge.
     pub(super) fn is_repl_mask_stream(insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
         let dst_w = |st: &super::bytecode::TsInsn| -> Option<u32> {
@@ -1210,10 +1205,7 @@ impl Simulator {
         true
     }
 
-    /// Wide `{N{en}} & src[..]` (65..=512-bit gated vector masks, e.g.
-    /// `x_rel_preg_expand[95:0] = {96{rel_retire_vld}} & rel_preg_expand[95:0]`).
-    /// Short-circuits on `en === 0` without loading the wide source and
-    /// dynamically masks `src`'s dependency edges via `TsCtl`.
+    /// Wide replication mask with the same zero-enable shortcut.
     pub(super) fn is_wrepl_mask_stream(insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
         match insns {
@@ -1374,8 +1366,7 @@ impl Simulator {
         true
     }
 
-    /// `dst = |(a[..] & b[..])` (~1.5% of contassign evals on C910).
-    /// Short-circuits on `a === 0` without loading `b`.
+    /// A zero first operand short-circuits `|(a & b)`.
     pub(super) fn is_and_redor_stream(insns: &[super::bytecode::TsInsn]) -> bool {
         use super::bytecode::TsInsn::*;
         matches!(
@@ -2157,10 +2148,7 @@ impl Simulator {
         true
     }
 
-    /// Arena-backed two-state executor for edge blocks (`ts_edge_hdr` +
-    /// `ts_edge_arena`), eliminating per-fire `Arc` and `Vec` pointer chases.
-    /// On bail, handles sleep/abort bookkeeping and falls back directly to the
-    /// 4-state bytecode interpreter without re-entering `ts_edge`.
+    /// Run an edge block from the arena and fall back to four-state bytecode.
     pub(super) fn ts_guard_and_exec_edge_arena(&mut self, block_idx: usize, h: TsHdr) -> bool {
         self.ts_exec_aborted = false;
         self.ts_last_xbail = false;

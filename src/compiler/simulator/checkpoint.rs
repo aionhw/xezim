@@ -52,7 +52,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
 // Per-frame VifAliasFrame, prop_vif_bindings, pending_vif_return, and LoopVarSnapshot replace flat vif keys.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x27";
+// Dynamic dependency masks, their controller tables and wide case-selector offsets.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x28";
 
 #[derive(Default)]
 struct Session {
@@ -1032,6 +1033,11 @@ impl Simulator {
         self.lazy_initial.clear();
         // #1149: the listed-once bits of the restored deferred reads.
         self.rebuild_deferred_proc_seen();
+        // A run that disables dynamic masking must remove the saved masks
+        // and restore the fused gate entries before rebuilding its routes.
+        if !self.ctl_on {
+            self.ctl_revert();
+        }
         // Rebuild the derived edge routes and gate queues together after restore.
         self.gate_lane_valid = false;
         self.build_mux_guards();
@@ -1248,6 +1254,10 @@ checkpoint_state!(
     await_waiters,
     bit_sens_pending,
     block_scope_saves,
+    case_ctl,
+    case_ctl_by_entry,
+    case_ctl_dsts,
+    case_ctl_rearm_pending,
     cg_event_waiters,
     cg_heap,
     cg_instance_event_waiters,
@@ -1324,6 +1334,10 @@ checkpoint_state!(
     condition_waiters,
     constraint_mode_disabled,
     cross_block_wakeup_count,
+    ctl_dsts,
+    ctl_gates,
+    ctl_rearm_pending,
+    ctl_sig,
     current_auto_task,
     current_pid,
     current_scope,
@@ -1700,6 +1714,10 @@ checkpoint_state!(
     ts_asleep_edge,
     ts_comb,
     ts_comb_xb,
+    ts_ctl,
+    ts_ctl_by_entry,
+    ts_ctl_dsts,
+    ts_ctl_rearm_pending,
     ts_cur_eidx,
     ts_edge,
     ts_edge_abortn,

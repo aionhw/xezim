@@ -3902,15 +3902,12 @@ pub struct Simulator {
     /// dense per-entry header. `kind == 0` means "no arena stream".
     ts_arena: Vec<super::bytecode::TsInsn>,
     ts_hdr: Vec<TsHdr>,
-    /// True if any lowered comb `TwoStateBlock` exceeded `ts_arena`/`TsHdr`
-    /// limits and lives only in `comb_plan`. When false, `ts_hdr.kind() == 0`
-    /// skips probing `comb_plan` on every non-TS entry (e.g. `FusedGate`).
+    /// Whether any two-state comb block exceeds the arena limits and uses `comb_plan`.
     #[serde(skip)]
     ts_has_overflow: bool,
     /// Same, for edge blocks (indexed like `compiled_edge_blocks`).
     ts_edge: Vec<TsSlot>,
-    /// Contiguous edge two-state code arena + dense 8-byte header table,
-    /// mirroring `ts_arena`/`ts_hdr` to avoid per-fire `Arc` + `Vec` chases.
+    /// Two-state edge instructions indexed by `ts_edge_hdr`.
     ts_edge_arena: Vec<super::bytecode::TsInsn>,
     ts_edge_hdr: Vec<TsHdr>,
     ts_edge_hdr_tsx: Vec<u8>,
