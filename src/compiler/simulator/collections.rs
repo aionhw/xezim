@@ -2521,29 +2521,6 @@ impl Simulator {
 
     /// IEEE 1800-2017 Table 28-1 wired-net resolution for one bit: `z` yields
     /// to a driven value, equal values pass, everything else is `x`.
-    /// §6.6.2 one-bit wired-AND (`is_and`) / wired-OR resolution. A `z`
-    /// driver contributes nothing, so the other side passes through. The
-    /// CONTROLLING value dominates even against `x` — 0 wins for AND, 1 for
-    /// OR — which is what makes a wired-AND bus with one asserting driver
-    /// resolve cleanly.
-    pub(super) fn wired_logic_bit(a: LogicBit, b: LogicBit, is_and: bool) -> LogicBit {
-        let ctrl = if is_and {
-            LogicBit::Zero
-        } else {
-            LogicBit::One
-        };
-        if a == ctrl || b == ctrl {
-            return ctrl;
-        }
-        match (a, b) {
-            (LogicBit::Z, x) => x,
-            (x, LogicBit::Z) => x,
-            (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
-            (x, y) if x == y => x,
-            _ => LogicBit::X,
-        }
-    }
-
     pub(super) fn wire_resolve_bit(a: LogicBit, b: LogicBit) -> LogicBit {
         match (a, b) {
             (LogicBit::Z, x) => x,

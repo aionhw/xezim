@@ -17,6 +17,7 @@ use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
     ParameterKind, TypedefDeclaration,
 };
+use xezim_core::ast::module::ModuleDeclaration;
 use xezim_core::ast::expr::{
     AssignmentPatternItem, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind,
 };
@@ -47,6 +48,25 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     let gen_sel = GenerateSelection::new(elab);
     let views = &gen_sel.views;
     let elaborated = elaborated_definitions(defs, elab);
+    let mut modules_by_name: HashMap<&str, &ModuleDeclaration> = HashMap::default();
+    let mut unit_typedefs: HashMap<&str, &DataType> = HashMap::default();
+    let mut udp_names: HashSet<&str> = HashSet::default();
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => {
+                modules_by_name.entry(m.name.name.as_str()).or_insert(m);
+            }
+            SourceDefinition::Typedef(t) => {
+                unit_typedefs
+                    .entry(t.name.name.as_str())
+                    .or_insert(&t.data_type);
+            }
+            SourceDefinition::Udp(u) => {
+                udp_names.insert(u.name.name.as_str());
+            }
+            _ => {}
+        }
+    }
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -73,7 +93,15 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
-                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                    &unit,
+                    &modules_by_name,
+                    &unit_typedefs,
+                    &udp_names,
+                    elab,
+                    &global,
+                    &pkg_decls,
+                    &pkg_names,
+                    &mut errs,
                 );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
@@ -112,7 +140,15 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
-                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                    &unit,
+                    &modules_by_name,
+                    &unit_typedefs,
+                    &udp_names,
+                    elab,
+                    &global,
+                    &pkg_decls,
+                    &pkg_names,
+                    &mut errs,
                 );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
@@ -150,7 +186,15 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
-                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                    &unit,
+                    &modules_by_name,
+                    &unit_typedefs,
+                    &udp_names,
+                    elab,
+                    &global,
+                    &pkg_decls,
+                    &pkg_names,
+                    &mut errs,
                 );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
@@ -203,8 +247,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Udp(_) => {}
         }
     }
-    check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
-    check_undeclared_type_names(defs, elab, &pkg_names, &mut errs);
+    let declared = design_declared_names(defs);
+    check_class_and_package_undeclared_with_declared(defs, elab, &pkg_names, &declared, &mut errs);
+    check_undeclared_type_names(defs, elab, &pkg_names, declared, &mut errs);
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     check_forward_typedefs(defs, elab, &mut errs);
@@ -233,7 +278,9 @@ struct Unit<'a> {
 /// the top unit only, whose names the elaboration holds.
 fn check_unit<'a>(
     u: &Unit<'a>,
-    defs: &[&SourceDefinition],
+    modules_by_name: &HashMap<&str, &'a ModuleDeclaration>,
+    unit_typedefs: &HashMap<&str, &'a DataType>,
+    udp_names: &HashSet<&str>,
     elab: &ElaboratedModule,
     global: &HashMap<&'a str, &'a ClassDeclaration>,
     pkg_decls: &HashMap<String, HashSet<String>>,
@@ -242,19 +289,19 @@ fn check_unit<'a>(
 ) {
     let is_top = ConstScope::of(elab, u.name).top;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
-    check_pattern_counts(defs, u.items, elab, is_top, errs);
+    check_pattern_counts(unit_typedefs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
     check_select_depth(u.items, errs);
     if u.elaborated {
-        check_port_actuals(defs, u.items, errs);
+        check_port_actuals(modules_by_name, u.items, errs);
     }
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.name, u.ports, u.params, u.items, pkg_decls, errs);
-    check_imported_hier_refs(defs, u.items, pkg_decls, errs);
+    check_imported_hier_refs(modules_by_name, u.items, pkg_decls, errs);
     let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
-    check_udp_instance_delays(defs, u.items, errs);
+    check_udp_instance_delays(udp_names, u.items, errs);
     check_member_access_roots(u.items, errs);
     check_event_arguments(u.items, elab, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
@@ -883,6 +930,28 @@ impl InstanceViews {
                 }
                 pos = dot;
             }
+        }
+        // Multiple instances with identical parameter bindings fold identically,
+        // so walking each unique parameter view once suffices.
+        for views in by_def.values_mut() {
+            if views.len() <= 1 {
+                continue;
+            }
+            let mut had_empty = false;
+            let mut seen: HashSet<Vec<(String, Value)>> = HashSet::default();
+            views.retain(|map| {
+                if map.is_empty() {
+                    if had_empty {
+                        return false;
+                    }
+                    had_empty = true;
+                    return true;
+                }
+                let mut entries: Vec<(String, Value)> =
+                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                seen.insert(entries)
+            });
         }
         InstanceViews { by_def, scoped }
     }
@@ -3468,42 +3537,41 @@ fn check_nonansi_ports_declared(
 /// byte z;} s = '{1, 2};` are errors). Module-level declarations only; a
 /// pattern with a replication or a non-ordered item is left alone.
 fn check_pattern_counts(
-    defs: &[&SourceDefinition],
+    unit_typedefs: &HashMap<&str, &DataType>,
     items: &[ModuleItem],
     elab: &ElaboratedModule,
     is_top: bool,
     errs: &mut Vec<String>,
 ) {
-    let typedef = |n: &str| -> Option<DataType> {
-        items
-            .iter()
-            .find_map(|it| match it {
-                ModuleItem::TypedefDeclaration(t) if t.name.name == n => Some(t.data_type.clone()),
-                _ => None,
-            })
-            .or_else(|| {
-                defs.iter().find_map(|d| match d {
-                    SourceDefinition::Typedef(t) if t.name.name == n => Some(t.data_type.clone()),
-                    _ => None,
-                })
-            })
-    };
+    let mut local_typedefs: Option<HashMap<&str, &DataType>> = None;
     for it in items {
         let ModuleItem::DataDeclaration(d) = it else {
             continue;
         };
-        let dt = match &d.data_type {
+        let dt: &DataType = match &d.data_type {
             DataType::TypeReference {
                 name, dimensions, ..
             } if name.scopes.is_empty() && dimensions.is_empty() => {
-                match typedef(&name.name.name) {
+                let locals = local_typedefs.get_or_insert_with(|| {
+                    let mut m = HashMap::default();
+                    for item in items {
+                        if let ModuleItem::TypedefDeclaration(t) = item {
+                            m.entry(t.name.name.as_str()).or_insert(&t.data_type);
+                        }
+                    }
+                    m
+                });
+                match locals
+                    .get(name.name.name.as_str())
+                    .or_else(|| unit_typedefs.get(name.name.name.as_str()))
+                {
                     Some(t) => t,
                     None => continue,
                 }
             }
-            dt => dt.clone(),
+            dt => dt,
         };
-        let want: Option<i64> = match &dt {
+        let want: Option<i64> = match dt {
             DataType::Struct(su)
                 if matches!(su.kind, xezim_core::ast::types::StructUnionKind::Struct)
                     && su.dimensions.is_empty() =>
@@ -3761,10 +3829,10 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
 /// Port directions of a module, by position and by name. `None` where the
 /// direction is not written (an interface port, an ANSI first port without
 /// one).
-fn port_directions(
-    ports: &PortList,
-    items: &[ModuleItem],
-) -> (Vec<Option<PortDirection>>, HashMap<String, PortDirection>) {
+fn port_directions<'a>(
+    ports: &'a PortList,
+    items: &'a [ModuleItem],
+) -> (Vec<Option<PortDirection>>, HashMap<&'a str, PortDirection>) {
     let mut by_name = HashMap::new();
     match ports {
         PortList::Ansi(ps) => {
@@ -3772,7 +3840,7 @@ fn port_directions(
                 if let Some(d) = p.direction
                     && !matches!(p.data_type, Some(DataType::Interface { .. }))
                 {
-                    by_name.insert(p.name.name.clone(), d);
+                    by_name.insert(p.name.name.as_str(), d);
                 }
             }
         }
@@ -3780,19 +3848,24 @@ fn port_directions(
             for it in items {
                 if let ModuleItem::PortDeclaration(d) = it {
                     for v in &d.declarators {
-                        by_name.insert(v.name.name.clone(), d.direction);
+                        by_name.insert(v.name.name.as_str(), d.direction);
                     }
                 }
             }
         }
         PortList::Empty => {}
     }
-    let names: Vec<&str> = match ports {
-        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.as_str()).collect(),
-        PortList::NonAnsi(ns) => ns.iter().map(|n| n.name.as_str()).collect(),
+    let by_pos = match ports {
+        PortList::Ansi(ps) => ps
+            .iter()
+            .map(|p| by_name.get(p.name.name.as_str()).copied())
+            .collect(),
+        PortList::NonAnsi(ns) => ns
+            .iter()
+            .map(|n| by_name.get(n.name.as_str()).copied())
+            .collect(),
         PortList::Empty => Vec::new(),
     };
-    let by_pos = names.iter().map(|n| by_name.get(*n).copied()).collect();
     (by_pos, by_name)
 }
 
@@ -3800,7 +3873,11 @@ fn port_directions(
 /// driven — a net or variable, a select of one or a concatenation of those,
 /// not a literal or an operator expression — and an inout port to a net,
 /// never a variable.
-fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &mut Vec<String>) {
+fn check_port_actuals<'a>(
+    modules_by_name: &HashMap<&str, &'a ModuleDeclaration>,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
     use xezim_core::ast::decl::PortConnection;
     fn assignable(e: &Expression) -> bool {
         match &e.kind {
@@ -3836,19 +3913,19 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
             _ => {}
         }
     }
+    #[allow(clippy::type_complexity)]
+    let mut dir_cache: HashMap<&'a str, (Vec<Option<PortDirection>>, HashMap<&'a str, PortDirection>)> =
+        HashMap::default();
     for it in items {
         let ModuleItem::ModuleInstantiation(mi) = it else {
             continue;
         };
-        let Some((tp, titems)) = defs.iter().find_map(|d| match d {
-            SourceDefinition::Module(m) if m.name.name == mi.module_name.name => {
-                Some((&m.ports, &m.items))
-            }
-            _ => None,
-        }) else {
+        let Some(&m) = modules_by_name.get(mi.module_name.name.as_str()) else {
             continue;
         };
-        let (by_pos, by_name) = port_directions(tp, titems);
+        let (by_pos, by_name) = dir_cache
+            .entry(m.name.name.as_str())
+            .or_insert_with(|| port_directions(&m.ports, &m.items));
         for inst in &mi.instances {
             for (i, c) in inst.connections.iter().enumerate() {
                 let (dir, bad, port) = match c {
@@ -3869,7 +3946,7 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
                         expr: Some(e),
                         ..
                     } => {
-                        let dir = by_name.get(&name.name).copied();
+                        let dir = by_name.get(name.name.as_str()).copied();
                         let bad = match dir {
                             Some(PortDirection::Output) => !assignable(e),
                             Some(PortDirection::Inout) => {
@@ -3881,7 +3958,7 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
                         (dir, bad, name.name.clone())
                     }
                     PortConnection::NamedIdent { name, actual, .. } => {
-                        let dir = by_name.get(&name.name).copied();
+                        let dir = by_name.get(name.name.as_str()).copied();
                         let bad = matches!(dir, Some(PortDirection::Inout))
                             && vars.contains(actual.name.as_str())
                             && !ports.contains(actual.name.as_str());
@@ -4776,12 +4853,22 @@ pub fn check_class_and_package_undeclared(
     pkg_names: &HashSet<String>,
     errs: &mut Vec<String>,
 ) {
-    use xezim_core::ast::decl::PackageItem;
     let declared = design_declared_names(defs);
+    check_class_and_package_undeclared_with_declared(defs, elab, pkg_names, &declared, errs);
+}
+
+fn check_class_and_package_undeclared_with_declared(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_names: &HashSet<String>,
+    declared: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::decl::PackageItem;
     let mut f = UndeclaredFinder {
         elab,
         pkg_names,
-        declared: &declared,
+        declared,
         seen: HashSet::new(),
         errs: Vec::new(),
     };
@@ -5220,8 +5307,8 @@ fn check_wildcard_import_conflicts(
 /// §26.3: a name a module only imports is not one of its members, so a
 /// hierarchical reference cannot reach it through an instance (`m.x` where
 /// module M does `import P::x;`).
-fn check_imported_hier_refs(
-    defs: &[&SourceDefinition],
+fn check_imported_hier_refs<'a>(
+    modules_by_name: &HashMap<&str, &'a ModuleDeclaration>,
     items: &[ModuleItem],
     pkgs: &HashMap<String, HashSet<String>>,
     errs: &mut Vec<String>,
@@ -5238,6 +5325,11 @@ fn check_imported_hier_refs(
         return;
     }
     let mut hits: Vec<(String, String)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut mod_cache: HashMap<
+        &'a str,
+        Option<(HashSet<&'a str>, Vec<&'a str>, HashSet<&'a str>)>,
+    > = HashMap::default();
     module_exprs(items, &mut |e| {
         for_each_expr(e, &mut |x| {
             let (inst, member) = match &x.kind {
@@ -5255,15 +5347,11 @@ fn check_imported_hier_refs(
             let Some(&module) = inst_of.get(inst) else {
                 return;
             };
-            let Some(m) = defs.iter().find_map(|d| match d {
-                SourceDefinition::Module(m) if m.name.name == module => Some(m),
-                _ => None,
-            }) else {
+            let Some(&m) = modules_by_name.get(module) else {
                 return;
             };
-            let own = module_own_names(&m.ports, &m.params, &m.items);
-            if own.contains(member)
-                || m.items.iter().any(|it| {
+            let info = mod_cache.entry(m.name.name.as_str()).or_insert_with(|| {
+                let has_gen = m.items.iter().any(|it| {
                     matches!(
                         it,
                         ModuleItem::GenerateRegion(_)
@@ -5271,11 +5359,21 @@ fn check_imported_hier_refs(
                             | ModuleItem::GenerateFor(_)
                             | ModuleItem::GenerateCase(_)
                     )
-                })
-            {
+                });
+                if has_gen {
+                    None
+                } else {
+                    let own = module_own_names(&m.ports, &m.params, &m.items);
+                    let (wild, explicit) = module_imports(&m.items);
+                    Some((own, wild, explicit))
+                }
+            });
+            let Some((own, wild, explicit)) = info else {
+                return;
+            };
+            if own.contains(member) {
                 return;
             }
-            let (wild, explicit) = module_imports(&m.items);
             let imported = explicit.contains(member)
                 || wild
                     .iter()
@@ -7073,7 +7171,7 @@ fn check_unspecialized_class_scopes(defs: &[&SourceDefinition], errs: &mut Vec<S
 
 /// §29.8: a UDP instance takes at most two delays (rise and fall).
 fn check_udp_instance_delays(
-    defs: &[&SourceDefinition],
+    udp_names: &HashSet<&str>,
     items: &[ModuleItem],
     errs: &mut Vec<String>,
 ) {
@@ -7081,9 +7179,7 @@ fn check_udp_instance_delays(
         let ModuleItem::ModuleInstantiation(mi) = it else {
             continue;
         };
-        let is_udp = defs
-            .iter()
-            .any(|d| matches!(d, SourceDefinition::Udp(u) if u.name.name == mi.module_name.name));
+        let is_udp = udp_names.contains(mi.module_name.name.as_str());
         let n = mi.params.as_ref().map_or(0, |p| p.len());
         if is_udp && n > 2 {
             errs.push(format!(
@@ -8180,12 +8276,13 @@ fn check_undeclared_type_names(
     defs: &[&SourceDefinition],
     elab: &ElaboratedModule,
     pkg_names: &HashSet<String>,
+    declared: HashSet<String>,
     errs: &mut Vec<String>,
 ) {
     let mut f = UndeclaredTypeFinder {
         elab,
         pkg_names,
-        declared: design_declared_names(defs),
+        declared,
         collecting: true,
         owner: String::new(),
         seen: HashSet::new(),
@@ -8790,5 +8887,115 @@ mod instance_view_tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (0..25).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn identical_param_instances_deduplicate_views() {
+        let src = String::from(
+            "module leaf #(parameter int N = 1) (); localparam int M = N * 2; endmodule\n\
+             module bare (); endmodule\n\
+             module top;\n\
+               leaf #(.N(4)) a0();\n\
+               leaf #(.N(4)) a1();\n\
+               leaf #(.N(4)) a2();\n\
+               leaf #(.N(9)) b0();\n\
+               bare c0();\n\
+               bare c1();\n\
+             endmodule\n",
+        );
+        let (_, elab) = xezim_core::parse_and_elaborate_multi(
+            &[src],
+            Some("top"),
+            &[],
+            &["dedup.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate");
+        let views = InstanceViews::build(&elab);
+        let mut leaf_ns: Vec<i64> = views
+            .of("leaf")
+            .iter()
+            .map(|v| v["N"].to_i64().unwrap())
+            .collect();
+        leaf_ns.sort_unstable();
+        assert_eq!(leaf_ns, vec![4, 9]);
+        assert_eq!(views.of("bare").len(), 1);
+    }
+
+    #[test]
+    fn lint_and_type_checks_after_dedup_and_package_fast_paths() {
+        let clean_src = String::from(
+            "package p_base;\n\
+               typedef logic [7:0] b8_t;\n\
+               localparam int K = 3;\n\
+             endpackage\n\
+             package p_ext;\n\
+               import p_base::*;\n\
+               class helper;\n\
+                 static function int f(b8_t v); return int'(v) + K; endfunction\n\
+               endclass\n\
+             endpackage\n\
+             module sub #(parameter int W = 4) (input logic [W-1:0] i, output logic [W-1:0] o);\n\
+               if (W > 4) begin : g_hi\n\
+                 assign o = i;\n\
+               end else begin : g_lo\n\
+                 assign o = ~i;\n\
+               end\n\
+             endmodule\n\
+             module top;\n\
+               import p_ext::*;\n\
+               logic [3:0] a, b, c;\n\
+               logic [7:0] d, e;\n\
+               sub #(.W(4)) u0(.i(a), .o(b));\n\
+               sub #(.W(4)) u1(.i(a), .o(c));\n\
+               sub #(.W(8)) u2(.i(d), .o(e));\n\
+               int r;\n\
+               initial r = helper::f(8'd2);\n\
+             endmodule\n",
+        );
+        let (clean_defs, clean_elab) = xezim_core::parse_and_elaborate_multi(
+            &[clean_src],
+            Some("top"),
+            &[],
+            &["clean.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate clean");
+        let clean_refs: Vec<&SourceDefinition> = clean_defs.values().collect();
+        assert!(lint_should_fail(&clean_refs, &clean_elab).is_empty());
+        assert!(crate::type_lint::check(&clean_refs, &clean_elab).is_empty());
+
+        let bad_src = String::from(
+            "package p_imp;\n\
+               localparam int SECRET = 9;\n\
+             endpackage\n\
+             module m_imp;\n\
+               import p_imp::*;\n\
+               int own = 1;\n\
+             endmodule\n\
+             module m_out(output logic o);\n\
+               assign o = 1'b1;\n\
+             endmodule\n\
+             module top;\n\
+               bit [1:0][3:0] bad_pat = '{4'h1};\n\
+               m_imp u_imp();\n\
+               m_out u_out(.o(1'b0));\n\
+               int x;\n\
+               initial x = u_imp.SECRET;\n\
+             endmodule\n",
+        );
+        let (bad_defs, bad_elab) = xezim_core::parse_and_elaborate_multi(
+            &[bad_src],
+            Some("top"),
+            &[],
+            &["bad.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate bad");
+        let bad_refs: Vec<&SourceDefinition> = bad_defs.values().collect();
+        let bad_errs = lint_should_fail(&bad_refs, &bad_elab);
+        assert!(bad_errs.iter().any(|e| e.contains("assignment pattern")), "{bad_errs:?}");
+        assert!(bad_errs.iter().any(|e| e.contains("cannot be connected")), "{bad_errs:?}");
+        assert!(bad_errs.iter().any(|e| e.contains("only imported")), "{bad_errs:?}");
     }
 }

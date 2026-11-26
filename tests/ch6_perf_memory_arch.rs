@@ -224,3 +224,173 @@ endmodule
         vec!["BYTECODE:1:00000000000000000000000000000000000000000000000001:ff:55:11"]
     );
 }
+
+#[test]
+fn multi_driver_nets_tranif_packages_and_compiled_cast_parity() {
+    let src = r#"
+package m8_pkg_base;
+  typedef logic [15:0] u16_t;
+  localparam int BASE_C = 11;
+endpackage
+
+package m8_pkg_ext;
+  import m8_pkg_base::*;
+  class box_base #(int W = 8);
+    int tag;
+    function new(int t = 0);
+      tag = t;
+    endfunction
+    virtual function int compute(int x);
+      int a, b;
+      a = x + W;
+      b = a * 2;
+      return b + tag;
+    endfunction
+  endclass
+
+  class box_sub #(int W = 8) extends box_base #(W);
+    int extra;
+    function new(int t = 0, int e = 0);
+      super.new(t);
+      extra = e;
+    endfunction
+    function int try_cast_sum(box_base #(W) h);
+      box_sub #(W) s;
+      if ($cast(s, h)) return s.extra + compute(3);
+      return -1;
+    endfunction
+  endclass
+
+  class cast_checker;
+    static function int check_spec_casts(box_base #(8) h);
+      box_sub #(8) s8;
+      box_sub #(16) s16;
+      int ok1, ok2;
+      ok1 = $cast(s8, h);
+      ok2 = $cast(s16, h);
+      if (ok1 && !ok2) return s8.try_cast_sum(h);
+      return -2;
+    endfunction
+  endclass
+
+  function automatic int pkg_helper(u16_t x);
+    return int'(x) + BASE_C;
+  endfunction
+endpackage
+
+module m8_leaf #(parameter int W = 8, parameter logic [7:0] K = 8'h5A) (
+  input  logic [W-1:0] d_in,
+  output logic [W-1:0] d_out
+);
+  bit [1:0][3:0] pair_v;
+  initial pair_v = '{4'hA, 4'h5};
+  if (W > 8) begin : g_wide
+    assign d_out = d_in ^ {{(W-8){1'b0}}, K};
+  end else begin : g_narrow
+    assign d_out = d_in ^ K[W-1:0];
+  end
+  function automatic int read_pair();
+    return {pair_v[1], pair_v[0]};
+  endfunction
+endmodule
+
+module top;
+  import m8_pkg_base::*;
+  import m8_pkg_ext::*;
+
+  logic [7:0]  in0, out0, out1;
+  logic [15:0] in2, out2, out3;
+  m8_leaf #(.W(8),  .K(8'h5A)) u0(.d_in(in0), .d_out(out0));
+  m8_leaf #(.W(8),  .K(8'h5A)) u1(.d_in(in0), .d_out(out1));
+  m8_leaf #(.W(16), .K(8'hA5)) u2(.d_in(in2), .d_out(out2));
+  m8_leaf #(.W(16), .K(8'hA5)) u3(.d_in(in2), .d_out(out3));
+
+  wire [159:0] w160;
+  assign w160 = {{32{1'bz}}, 32'h1234_5678, {96{1'bz}}};
+  assign w160 = {32'h8765_4321, {96{1'bz}}, 32'hCAFE_BABE};
+  assign w160 = {{96{1'bz}}, 32'hDEAD_BEEF, {32{1'bz}}};
+  assign w160 = {{152{1'bz}}, 8'h2F};
+
+  wand [127:0] wd128;
+  assign wd128 = {{32{1'bz}}, 32'hFFFF_0000, 32'hAAAA_5555, 32'h0000_FFFF};
+  assign wd128 = {{32{1'bz}}, 32'hFFFF_FFFF, 32'h0000_0000, {32{1'bz}}};
+  assign wd128 = {32'h1234_5678, {32{1'bx}}, {32{1'bz}}, {32{1'b1}}};
+  assign wd128 = {32'hFFFF_FFFF, {96{1'bz}}};
+
+  wor [127:0] wo128;
+  assign wo128 = {{32{1'bz}}, 32'hFFFF_0000, 32'hAAAA_5555, 32'h0000_0000};
+  assign wo128 = {{32{1'bz}}, 32'h0000_0000, 32'hFFFF_FFFF, {32{1'bz}}};
+  assign wo128 = {32'h1234_5678, {32{1'bx}}, {32{1'bz}}, {32{1'b0}}};
+  assign wo128 = {32'h0000_FFFF, {96{1'bz}}};
+
+  tri0 [79:0] t0_80;
+  assign t0_80 = {16'hA5A5, {64{1'bz}}};
+  tri1 [79:0] t1_80;
+  assign t1_80 = {{64{1'bz}}, 16'h5A5A};
+
+  logic ta_drv, tb_drv, t_ctl;
+  wire ta0, ta1, ta2, ta3;
+  wire tb0, tb1, tb2, tb3;
+  assign ta3 = ta_drv ? 1'b1 : 1'bz;
+  assign ta2 = ta_drv ? 1'b0 : 1'bz;
+  assign ta1 = ta_drv ? 1'bx : 1'bz;
+  assign ta0 = ta_drv ? 1'bz : 1'bz;
+  assign tb3 = tb_drv ? 1'b1 : 1'bz;
+  assign tb2 = tb_drv ? 1'b1 : 1'bz;
+  assign tb1 = tb_drv ? 1'b0 : 1'bz;
+  assign tb0 = tb_drv ? 1'bz : 1'bz;
+  tranif1 sw0(ta0, tb0, t_ctl);
+  tranif1 sw1(ta1, tb1, t_ctl);
+  tranif1 sw2(ta2, tb2, t_ctl);
+  tranif1 sw3(ta3, tb3, t_ctl);
+
+  initial begin
+    box_sub #(8) sub_h;
+    box_base #(8) base_h;
+    int acc, cast_res;
+
+    in0 = 8'hFF;
+    in2 = 16'h0F0F;
+    ta_drv = 1'b1; tb_drv = 1'b1; t_ctl = 1'b1;
+    #1;
+    $display("W160:%040h", w160);
+    $display("WD128:%032h", wd128);
+    $display("WO128:%032h", wo128);
+    $display("TRI:%020h:%020h", t0_80, t1_80);
+    $display("INST:%02h:%02h:%04h:%04h:%02h:%0d", out0, out1, out2, out3, u0.read_pair(), pkg_helper(16'd5));
+    $display("TRAN_ON:%b%b%b%b:%b%b%b%b", ta3, ta2, ta1, ta0, tb3, tb2, tb1, tb0);
+
+    t_ctl = 1'b0;
+    #1;
+    $display("TRAN_OFF:%b%b%b%b:%b%b%b%b", ta3, ta2, ta1, ta0, tb3, tb2, tb1, tb0);
+
+    t_ctl = 1'bx;
+    #1;
+    $display("TRAN_X:%b%b%b%b:%b%b%b%b", ta3, ta2, ta1, ta0, tb3, tb2, tb1, tb0);
+
+    sub_h = new(5, 42);
+    base_h = sub_h;
+    acc = 0;
+    for (int k = 0; k < 5; k++) begin
+      acc += sub_h.compute(k);
+    end
+    cast_res = cast_checker::check_spec_casts(base_h);
+    $display("CLS:%0d:%0d", acc, cast_res);
+  end
+endmodule
+"#;
+    assert_eq!(
+        sim_lines(src),
+        vec![
+            "W160:8765432112345678zzzzzzzzdeadbeefcafebaXX",
+            "WD128:12345678xxxx0000000000000000ffff",
+            "WO128:1234ffffffffxxxxffffffff00000000",
+            "TRI:a5a50000000000000000:ffffffffffffffff5a5a",
+            "INST:a5:a5:0faa:0faa:a5:16",
+            "TRAN_ON:1xxz:1xxz",
+            "TRAN_OFF:10xz:110z",
+            "TRAN_X:1xxz:1xxz",
+            "CLS:125:69",
+        ]
+    );
+}

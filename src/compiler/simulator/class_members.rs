@@ -4373,11 +4373,11 @@ impl Simulator {
             &cd.param_order
         };
         let is_type_param = |n: &str| cd.type_param_names.iter().any(|t| t == n);
-        let value_positions: Vec<(usize, String)> = order
+        let value_positions: Vec<(usize, &str)> = order
             .iter()
             .enumerate()
             .filter(|(_, n)| !is_type_param(n))
-            .map(|(i, n)| (i, n.clone()))
+            .map(|(i, n)| (i, n.as_str()))
             .collect();
         if value_positions.is_empty() {
             return true;
@@ -4385,37 +4385,30 @@ impl Simulator {
         // Dest specialization args: prefer the resolved name's `#(...)`
         // (type-param-dest case), else the dest var's declared type_args
         // (direct-decl case).
-        let dest_args_text = match spec_args_from_name {
-            Some(a) => Some(a.to_string()),
-            None => {
-                if let ExprKind::Ident(h) = &dest.kind {
-                    if h.path.len() == 1 {
-                        let dvar = &h.path[0].name.name;
-                        self.var_type_args.get(dvar).and_then(|ta| {
-                            let frags: Vec<String> = ta
-                                .iter()
-                                .filter_map(|e| self.expr_to_spec_fragment(e))
-                                .collect();
-                            if frags.is_empty() {
-                                None
-                            } else {
-                                Some(frags.join(","))
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let dest_args: Vec<String> = match dest_args_text {
-            Some(t) => Self::split_spec_args(&t)
+        let dest_args: Vec<String> = match spec_args_from_name {
+            Some(a) => Self::split_spec_args(a)
                 .into_iter()
                 .map(|s| s.trim().to_string())
                 .collect(),
-            None => return true, // can't determine dest specialization → permissive
+            None => {
+                let ExprKind::Ident(h) = &dest.kind else {
+                    return true;
+                };
+                if h.path.len() != 1 {
+                    return true;
+                }
+                let Some(ta) = self.var_type_args.get(&h.path[0].name.name) else {
+                    return true;
+                };
+                let args: Vec<String> = ta
+                    .iter()
+                    .filter_map(|e| self.expr_to_spec_fragment(e).map(|s| s.trim().to_string()))
+                    .collect();
+                if args.is_empty() {
+                    return true;
+                }
+                args
+            }
         };
         let src_inst = match self.heap.get(src_handle).and_then(|o| o.as_ref()) {
             Some(i) => i,
@@ -4426,7 +4419,7 @@ impl Simulator {
                 Some(s) => s.as_str(),
                 None => continue,
             };
-            let sval = match src_inst.properties.get(vp) {
+            let sval = match src_inst.properties.get(*vp) {
                 Some(v) => v,
                 None => continue,
             };

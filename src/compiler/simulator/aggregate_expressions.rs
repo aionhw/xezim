@@ -4571,27 +4571,23 @@ impl Simulator {
                     return Value::new(1);
                 }
                 let is_and = name == "$__wand";
-                let a = self.eval_expr(&args[0]);
-                let b = self.eval_expr(&args[1]);
-                let w = a.width.max(b.width).max(1);
-                let mut out = Value::zero(w);
-                for i in 0..w as usize {
-                    out.set_bit(i, Self::wired_logic_bit(a.get_bit(i), b.get_bit(i), is_and));
+                let mut acc = self.eval_expr(&args[0]);
+                for arg in &args[1..] {
+                    let rhs = self.eval_expr(arg);
+                    acc = acc.wired_logic(&rhs, is_and);
                 }
-                out
+                acc
             }
             "$__wres" => {
                 if args.len() < 2 {
                     return Value::new(1);
                 }
-                let a = self.eval_expr(&args[0]);
-                let b = self.eval_expr(&args[1]);
-                let w = a.width.max(b.width).max(1);
-                let mut out = Value::zero(w);
-                for i in 0..w as usize {
-                    out.set_bit(i, Self::wire_resolve_bit(a.get_bit(i), b.get_bit(i)));
+                let mut acc = self.eval_expr(&args[0]);
+                for arg in &args[1..] {
+                    let rhs = self.eval_expr(arg);
+                    acc = acc.wire_resolve(&rhs);
                 }
-                out
+                acc
             }
             // `$__wres_tri(acc, ctl1, data1, ctl2, data2, ...)` — resolve the
             // tristate primitives driving a net (`bufif*`/`notif*`/MOS, each
@@ -4702,13 +4698,7 @@ impl Simulator {
                 }
                 let st = self.eval_expr(&args[0]);
                 let wk = self.eval_expr(&args[1]);
-                let w = st.width.max(wk.width).max(1);
-                let mut out = Value::zero(w);
-                for i in 0..w as usize {
-                    let sb = st.get_bit(i);
-                    out.set_bit(i, if sb == LogicBit::Z { wk.get_bit(i) } else { sb });
-                }
-                out
+                st.wire_resolve_pull(&wk)
             }
             // `$__tranif(own_self, own_other, ctl, active)` — the value of
             // THIS terminal of a bidirectional switch.
@@ -4728,30 +4718,23 @@ impl Simulator {
                     (LogicBit::Zero, true) | (LogicBit::One, false) => Some(false),
                     _ => None, // x/z control
                 };
-                let mut out = Value::zero(w);
-                for i in 0..w as usize {
-                    let (m, o) = (me.get_bit(i), other.get_bit(i));
-                    let bit = match conducting {
-                        Some(true) => Self::wire_resolve_bit(m, o),
-                        Some(false) => m,
-                        // An unknown control isolates or connects: a bit
-                        // that agrees either way passes, one that differs
-                        // is unknown.
-                        None => {
-                            if m == o {
-                                m
-                            } else if m == LogicBit::Z {
-                                // z here means "whatever the other side is,
-                                // if connected" -> unknown.
-                                LogicBit::X
-                            } else {
-                                LogicBit::X
-                            }
+                match conducting {
+                    Some(true) => me.wire_resolve(&other),
+                    Some(false) => {
+                        if me.width == w && !me.is_real && !me.is_fill && !me.is_signed {
+                            me
+                        } else {
+                            let mut m = me;
+                            m.is_signed = false;
+                            let mut resized = m.resize(w);
+                            resized.is_signed = false;
+                            resized
                         }
-                    };
-                    out.set_bit(i, bit);
+                    }
+                    // An unknown control isolates or connects: a bit that agrees
+                    // either way passes, one that differs is unknown.
+                    None => me.tranif_uncertain(&other),
                 }
-                out
             }
             "$signed" => {
                 let mut v = args

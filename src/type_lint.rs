@@ -379,6 +379,9 @@ struct Ck<'a> {
     /// The concatenation being walked as an unpacked array concatenation
     /// (§10.10): the right-hand side of an assignment to an unpacked array.
     unpacked_concat: Option<Span>,
+    /// Packages a check actually read (`self.env.packages`), so Phase 1 can skip
+    /// re-running packages that never depend on other packages.
+    read_packages: std::cell::Cell<bool>,
     errs: Vec<String>,
 }
 
@@ -404,6 +407,7 @@ impl<'a> Ck<'a> {
             gen_reach: None,
             body_depth: usize::MAX,
             unpacked_concat: None,
+            read_packages: std::cell::Cell::new(false),
             errs: Vec::new(),
         }
     }
@@ -800,6 +804,7 @@ impl<'a> Ck<'a> {
     }
 
     fn declare_import(&mut self, imp: &ImportDeclaration) {
+        self.read_packages.set(true);
         let packages = self.env.packages;
         for it in &imp.items {
             let Some(p) = packages.get(&it.package.name) else {
@@ -1161,7 +1166,10 @@ impl<'a> Ck<'a> {
                 // SourceDefinition omits compilation-unit imports. A type
                 // provided by a package may be visible through one, so its
                 // visibility is uncertain here; only reject unknown names.
-                && !self.env.packages.values().any(|p| p.types.contains_key(n))
+                && !{
+                    self.read_packages.set(true);
+                    self.env.packages.values().any(|p| p.types.contains_key(n))
+                }
                 && self.seen.insert(actual.span.start as usize)
             {
                 self.report(
@@ -1508,6 +1516,10 @@ impl<'a> Ck<'a> {
             return self.lookup_type(leaf);
         }
         if scopes.len() == 1
+            && {
+                self.read_packages.set(true);
+                true
+            }
             && let Some(p) = self.env.packages.get(&scopes[0])
         {
             return p.types.get(leaf).cloned();
@@ -1976,6 +1988,7 @@ impl<'a> Ck<'a> {
                         if !self.check_package_member(pkg, &member.name, member.span) {
                             return;
                         }
+                        self.read_packages.set(true);
                         let scope = self.env.packages.get(pkg);
                         match scope.and_then(|p| p.subs.get(&member.name)) {
                             Some(Some(sig)) => {
@@ -3267,7 +3280,8 @@ pub(crate) fn check_with_selection(
         ck.pop()
     };
     let mut packages: HashMap<String, Scope> = HashMap::default();
-    for _pass in 0..2 {
+    let mut need_second_pass: HashSet<&str> = HashSet::default();
+    {
         let mut next: HashMap<String, Scope> = HashMap::default();
         for d in defs {
             if let SourceDefinition::Package(p) = d {
@@ -3281,15 +3295,51 @@ pub(crate) fn check_with_selection(
                 let mut ck = Ck::new(env, elab, &p.name.name);
                 ck.push();
                 declare_package_items(&mut ck, &p.items);
+                if ck.read_packages.get() {
+                    need_second_pass.insert(p.name.name.as_str());
+                }
                 next.insert(p.name.name.clone(), ck.pop());
             }
         }
         packages = next;
     }
+    if !need_second_pass.is_empty() {
+        let mut updated: Vec<(String, Scope)> = Vec::with_capacity(need_second_pass.len());
+        for d in defs {
+            if let SourceDefinition::Package(p) = d
+                && need_second_pass.contains(p.name.name.as_str())
+            {
+                let env = Env {
+                    class_names: &class_names,
+                    packages: &packages,
+                    unit: Some(&unit),
+                    classes: &no_classes,
+                    pkg_members: &pkg_members,
+                };
+                let mut ck = Ck::new(env, elab, &p.name.name);
+                ck.push();
+                declare_package_items(&mut ck, &p.items);
+                updated.push((p.name.name.clone(), ck.pop()));
+            }
+        }
+        for (name, scope) in updated {
+            packages.insert(name, scope);
+        }
+    }
 
     // Phase 2: class declarations, resolved in the scope that declares them.
     let mut classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::default();
-    {
+    if !class_names.is_empty() {
+        fn items_have_class(items: &[ModuleItem]) -> bool {
+            items.iter().any(|it| match it {
+                ModuleItem::ClassDeclaration(_) => true,
+                ModuleItem::GenerateRegion(g) => items_have_class(&g.items),
+                ModuleItem::GenerateIf(g) => g.branches.iter().any(|(_, i)| items_have_class(i)),
+                ModuleItem::GenerateFor(g) => items_have_class(&g.items),
+                ModuleItem::GenerateCase(g) => g.arms.iter().any(|a| items_have_class(&a.items)),
+                _ => false,
+            })
+        }
         let env = || Env {
             class_names: &class_names,
             packages: &packages,
@@ -3301,6 +3351,9 @@ pub(crate) fn check_with_selection(
         for d in defs {
             match d {
                 SourceDefinition::Module(m) => {
+                    if !items_have_class(&m.items) {
+                        continue;
+                    }
                     let mut ck = Ck::new(env(), elab, &m.name.name);
                     ck.push();
                     for p in &m.params {
@@ -3310,6 +3363,9 @@ pub(crate) fn check_with_selection(
                     class_infos_items(&mut ck, &m.items, &mut found);
                 }
                 SourceDefinition::Interface(m) => {
+                    if !items_have_class(&m.items) {
+                        continue;
+                    }
                     let mut ck = Ck::new(env(), elab, &m.name.name);
                     ck.push();
                     for p in &m.params {
@@ -3319,6 +3375,9 @@ pub(crate) fn check_with_selection(
                     class_infos_items(&mut ck, &m.items, &mut found);
                 }
                 SourceDefinition::Program(m) => {
+                    if !items_have_class(&m.items) {
+                        continue;
+                    }
                     let mut ck = Ck::new(env(), elab, &m.name.name);
                     ck.push();
                     for p in &m.params {
@@ -3328,9 +3387,17 @@ pub(crate) fn check_with_selection(
                     class_infos_items(&mut ck, &m.items, &mut found);
                 }
                 SourceDefinition::Package(p) => {
+                    if !p.items.iter().any(|it| matches!(it, PackageItem::Class(_))) {
+                        continue;
+                    }
                     let mut ck = Ck::new(env(), elab, &p.name.name);
-                    ck.push();
-                    declare_package_items(&mut ck, &p.items);
+                    let has_imports = p.items.iter().any(|it| matches!(it, PackageItem::Import(_)));
+                    if !has_imports && let Some(ps) = packages.get(&p.name.name) {
+                        ck.stack.push(Layer::Shared(ps));
+                    } else {
+                        ck.push();
+                        declare_package_items(&mut ck, &p.items);
+                    }
                     for it in &p.items {
                         if let PackageItem::Class(c) = it {
                             let first = found.len();

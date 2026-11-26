@@ -436,6 +436,10 @@ pub(super) struct PreboundCompiledMethod {
     pub writeback_formals: std::rc::Rc<Vec<String>>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
 /// register ids of its seeded `this` / result cells. One entry per compiled
 /// (class, method, width-signature); shared across all calls to that method
@@ -445,6 +449,10 @@ pub struct CompiledMethodEntry {
     pub block: std::rc::Rc<CompiledBlock>,
     pub this_reg: crate::compiler::bytecode::RegId,
     pub result_reg: crate::compiler::bytecode::RegId,
+    /// Whether top-level VarDecl/ParamDecl metadata in the AST body must be
+    /// recorded on entry (needed only when `$cast` or an AST fallback runs).
+    #[serde(default = "default_true")]
+    pub needs_decl_meta: bool,
 }
 
 /// Result of probing / populating the compiled-class-method cache for a

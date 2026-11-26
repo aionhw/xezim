@@ -2328,10 +2328,12 @@ impl Simulator {
                             this_reg,
                             result_reg,
                         }) => {
+                            let needs_decl_meta = Self::method_needs_decl_meta(&block, body);
                             let entry = super::bytecode::CompiledMethodEntry {
                                 block: std::rc::Rc::new(block),
                                 this_reg,
                                 result_reg,
+                                needs_decl_meta,
                             };
                             let rc = std::rc::Rc::new(entry);
                             self.compiled_method_block_cache.insert(
@@ -3547,10 +3549,12 @@ impl Simulator {
                         .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     return None;
                 };
+                let needs_decl_meta = Self::method_needs_decl_meta(&block, body);
                 let entry = super::bytecode::CompiledMethodEntry {
                     block: std::rc::Rc::new(block),
                     this_reg,
                     result_reg,
+                    needs_decl_meta,
                 };
                 let rc = std::rc::Rc::new(entry);
                 self.compiled_method_block_cache.insert(
@@ -3675,24 +3679,30 @@ impl Simulator {
         // the binding loop above. Nested-block decls are NOT pre-recorded
         // (the interpreter records them only when the block runs); the
         // compiler declines a `$cast` with such a destination instead.
-        for st in body {
-            if let crate::ast::stmt::StatementKind::VarDecl {
-                data_type,
-                declarators,
-                ..
-            }
-            | crate::ast::stmt::StatementKind::ParamDecl {
-                data_type,
-                declarators,
-                ..
-            } = &st.kind
-            {
-                let cn = self
-                    .derive_var_decl_class_name(data_type)
-                    .or_else(|| self.resolve_type_param_class_for(handle, cname, data_type));
-                for d in declarators {
-                    if d.dimensions.is_empty() {
-                        self.record_var_decl_type_metadata(data_type, &d.name.name, cn.as_deref());
+        if entry.needs_decl_meta {
+            for st in body {
+                if let crate::ast::stmt::StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                }
+                | crate::ast::stmt::StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } = &st.kind
+                {
+                    let cn = self
+                        .derive_var_decl_class_name(data_type)
+                        .or_else(|| self.resolve_type_param_class_for(handle, cname, data_type));
+                    for d in declarators {
+                        if d.dimensions.is_empty() {
+                            self.record_var_decl_type_metadata(
+                                data_type,
+                                &d.name.name,
+                                cn.as_deref(),
+                            );
+                        }
                     }
                 }
             }
@@ -5733,6 +5743,26 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn method_needs_decl_meta(
+        block: &super::bytecode::CompiledBlock,
+        body: &[crate::ast::stmt::Statement],
+    ) -> bool {
+        use super::bytecode::Insn;
+        use crate::ast::stmt::StatementKind;
+        block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Insn::Cast(..) | Insn::StmtFallback(..) | Insn::EvalExprFallback(..)
+            )
+        }) && body.iter().any(|st| {
+            matches!(
+                st.kind,
+                StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+            )
+        })
     }
 
     /// Find an enum value name with the receiver's own storage names as extra list

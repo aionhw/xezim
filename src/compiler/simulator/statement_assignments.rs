@@ -1975,7 +1975,7 @@ impl Simulator {
             }
         }
         // §15.5.5: a class-member event takes the other event's object.
-        if self.bind_instance_event_assign(lvalue, rvalue) {
+        if self.any_events_possible() && self.bind_instance_event_assign(lvalue, rvalue) {
             return;
         }
         // §15.5.5: handle assignment on frame-local / formal / ref / module
@@ -2027,7 +2027,7 @@ impl Simulator {
         }
         // §15.5.5: `event_var = other_event / null / q[i]` re-binds
         // the HANDLE, it does not copy a value.
-        if self.try_event_handle_assign(lvalue, rvalue) {
+        if self.any_events_possible() && self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
         let sized_new = Self::sized_new_parts(rvalue);
