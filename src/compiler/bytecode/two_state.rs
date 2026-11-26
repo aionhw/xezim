@@ -3495,6 +3495,7 @@ pub fn lower_two_state(
             Insn::DropXz(_) => {}
             // Nor reals: real signals and real constants gate above.
             Insn::RealToInt(_) => {}
+            Insn::StoreLocalSlice(..) => gate!("four-state local slice store"),
             // A copy with the Resize arm's narrow rules folded in.
             Insn::MoveResize(d, s, w) => {
                 let cur = rw[*s as usize]?;

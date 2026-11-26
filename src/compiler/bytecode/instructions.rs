@@ -396,6 +396,8 @@ pub enum Insn {
     /// a 64-bit integral type: real storage is 64 bits wide, so that
     /// `Resize` alone would keep the real and its IEEE 754 bits.
     RealToInt(RegId),
+    /// Copy an assigned field into an integral local, preserving both bit planes.
+    StoreLocalSlice(RegId, RegId, RegId, u32), // (local, base, value, width)
     /// §11.4.3 `**` with a non-constant base: left operand pre-resized to the
     /// operation width by the compiler; result width = left's width.
     Pow(RegId, RegId, RegId),
@@ -1048,6 +1050,11 @@ impl Insn {
                 *b += rb;
                 *c += rb;
             }
+            StoreLocalSlice(dst, base, src, _) => {
+                *dst += rb;
+                *base += rb;
+                *src += rb;
+            }
             NbaAssignBitDyn(_, a, b) => {
                 *a += rb;
                 *b += rb;
@@ -1150,6 +1157,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::SetSigned(..) => "SetSigned",
         Insn::DropXz(..) => "DropXz",
         Insn::RealToInt(..) => "RealToInt",
+        Insn::StoreLocalSlice(..) => "StoreLocalSlice",
         Insn::ClearSigned(..) => "ClearSigned",
         Insn::Pow(..) => "Pow",
         Insn::LoadClassMember(..) => "LoadCls",

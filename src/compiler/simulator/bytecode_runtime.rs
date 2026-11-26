@@ -4,6 +4,38 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Write the in-range portion of a packed field without evaluating an SV
+/// bitwise operator. Z stays distinct from X in both source and untouched bits.
+fn store_local_slice(regs: &mut [Value], dst: usize, base: usize, src: usize, width: u32) {
+    let index = &regs[base];
+    if (64..index.width as usize)
+        .step_by(64)
+        .any(|bit| index.slice_bits_swar(bit, 64).0 != 0)
+    {
+        return;
+    }
+    let Some(offset) = index.to_index() else {
+        return;
+    };
+    if offset >= i64::from(regs[dst].width)
+        || offset <= -i64::from(width)
+        || (offset < 0 && !index.is_signed)
+    {
+        return;
+    }
+    let mut value = regs[src].resize_for_assign(width);
+    if value.is_real {
+        real_to_int_reg(&mut value);
+    }
+    let from = if offset < 0 { (-offset) as usize } else { 0 };
+    regs[dst].copy_bits_from(
+        offset.max(0) as usize,
+        &value,
+        from,
+        width as usize - from,
+    );
+}
+
 impl Simulator {
     /// Execute bytecode instructions in isolation (no &mut self).
     /// Returns NBA entries produced. Used for parallel edge block execution.
@@ -764,6 +796,9 @@ impl Simulator {
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
                 Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
+                Insn::StoreLocalSlice(dst, base, src, width) => {
+                    store_local_slice(vm_regs, *dst as usize, *base as usize, *src as usize, *width);
+                }
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -1313,6 +1348,9 @@ impl Simulator {
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
                 Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
+                Insn::StoreLocalSlice(dst, base, src, width) => {
+                    store_local_slice(vm_regs, *dst as usize, *base as usize, *src as usize, *width);
+                }
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -4888,6 +4926,9 @@ impl Simulator {
                 }
                 Insn::DropXz(reg) => drop_xz(&mut self.vm_regs[*reg as usize]),
                 Insn::RealToInt(reg) => real_to_int_reg(&mut self.vm_regs[*reg as usize]),
+                Insn::StoreLocalSlice(dst, base, src, width) => {
+                    store_local_slice(&mut self.vm_regs, *dst as usize, *base as usize, *src as usize, *width);
+                }
                 Insn::Pow(d, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);

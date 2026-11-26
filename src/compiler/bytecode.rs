@@ -21311,17 +21311,10 @@ impl<'a> BytecodeCompiler<'a> {
         )
     }
 
-    /// §11.5.1/§11.5.2 bit or part-select STORE into a register-backed
-    /// integral local — `v[6:4] = c[3:1]`, `cur[b*8 +: 8] = d`, `x[i] = b` —
-    /// as a mask splice on the register: `x = (x & ~(m << lo)) | ((v & m) << lo)`.
-    /// 4-state exact: the constant mask passes untouched bits through and
-    /// lands x/z of `v` as x/z. None when `lhs` is not such a store (the
-    /// caller's other paths decide); Some(false) on a compile failure.
-    ///
-    /// Only locals whose declared range is `[N-1:0]` qualify (`LocalKind::Int`
-    /// records exactly those), so an index is a bit offset. A constant select
-    /// writes exactly its in-range bits; a dynamic one needs an unsigned
-    /// index, and one with an x/z bit writes nothing.
+    /// §11.5.1/§11.5.2: a bit or part-select store into a register-backed
+    /// local. Four-state locals copy the field directly, because SV bitwise
+    /// operations turn Z into X. Two-state locals discard X/Z on assignment.
+    /// The declared range is `[N-1:0]`, so its labels are physical offsets.
     fn compile_local_select_store(&mut self, lhs: &Expression, val_reg: RegId) -> Option<bool> {
         // (base ident, lsb expression or constant range, field width)
         enum Sel<'e> {
@@ -21390,6 +21383,33 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let fw = fw as u32;
+        if matches!(
+            self.local_kinds.get(&yreg),
+            Some(LocalKind::Int { two_state: false, .. })
+        ) {
+            let base = if let Some(lo) = lo_const {
+                if lo >= i64::from(yw) || lo <= -i64::from(fw) {
+                    return Some(true);
+                }
+                let base = self.alloc_reg();
+                let mut offset = Value::from_u64(lo as u64, 64);
+                offset.is_signed = true;
+                self.emit(Insn::LoadConst(base, Box::new(offset)));
+                base
+            } else {
+                let expr = lo_expr?;
+                if self.expr_signedness(expr)? && fw != 1 {
+                    return None;
+                }
+                let Some(base) = self.compile_expr(expr, 0) else {
+                    return Some(false);
+                };
+                base
+            };
+            self.emit(Insn::StoreLocalSlice(yreg, base, val_reg, fw));
+            self.emit_local_fit(yreg);
+            return Some(true);
+        }
         let ones = |w: u32| -> Value {
             if w >= 64 {
                 Value::from_u64(u64::MAX, 64)
@@ -24534,6 +24554,11 @@ impl<'a> BytecodeCompiler<'a> {
                 f(*h);
             }
             Insn::LoadSignalRangeDyn(_, _, lo, _) => f(*lo),
+            Insn::StoreLocalSlice(dst, base, src, _) => {
+                f(*dst);
+                f(*base);
+                f(*src);
+            }
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -25101,7 +25126,8 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::SetSigned(a)
             | Insn::ClearSigned(a)
             | Insn::DropXz(a)
-            | Insn::RealToInt(a) => Some(*a),
+            | Insn::RealToInt(a)
+            | Insn::StoreLocalSlice(a, ..) => Some(*a),
             _ => None,
         }
     }
@@ -25139,6 +25165,13 @@ impl<'a> BytecodeCompiler<'a> {
             }
         };
         match insn {
+            Insn::StoreLocalSlice(dst, base, src, _) => {
+                if *dst == from {
+                    return false;
+                }
+                sub(base);
+                sub(src);
+            }
             Insn::Pow(_, l, r)
             | Insn::Add(_, l, r)
             | Insn::Sub(_, l, r)
@@ -25954,6 +25987,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::ClearSigned(d)
                 | Insn::DropXz(d)
                 | Insn::RealToInt(d)
+                | Insn::StoreLocalSlice(d, ..)
                 | Insn::LoadSignalRange(d, _, _, _)
                 | Insn::LoadSignalBit(d, _, _)
                 | Insn::BinOpConst(d, _, _, _) => Some(Some(*d)),
@@ -26745,7 +26779,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::SetSigned(_) | Insn::ClearSigned(_) | Insn::DropXz(_) => {}
                 // A real becomes a 64-bit integer (its width already); any
                 // other value is untouched, so the fact still holds.
-                Insn::RealToInt(_) => {}
+                Insn::RealToInt(_) | Insn::StoreLocalSlice(..) => {}
 
                 // Result width is the (runtime) left operand's width — not
                 // statically tracked here.
@@ -27021,7 +27055,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::SetSigned(r) => set_to = Some((*r, false)),
                 // X/Z to 0 keeps the flag; a real rounds to an unsigned
                 // integer, anything else is untouched.
-                Insn::DropXz(_) | Insn::RealToInt(_) => {}
+                Insn::DropXz(_) | Insn::RealToInt(_) | Insn::StoreLocalSlice(..) => {}
                 // -- no register writes: state flows through --
                 Insn::Jump(_)
                 | Insn::BranchIfFalse(_, _)

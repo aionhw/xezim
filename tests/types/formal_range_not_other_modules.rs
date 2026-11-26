@@ -127,3 +127,48 @@ endmodule
     assert_eq!(u(&sim, "g"), 0x2c, "continuous assign");
     assert_eq!(u(&sim, "gd"), 0x2c, "initial block");
 }
+
+/// §11.5: writing a packed local slice copies X and Z as distinct states,
+/// including the Z bits outside that slice.
+#[test]
+fn compiled_local_select_stores_preserve_high_impedance() {
+    use xezim_core::value::LogicBit;
+
+    let src = r#"
+module t;
+  function automatic logic decode(bit [3:0] code);
+    case (code)
+      0: return 1'b0;
+      1: return 1'b1;
+      4: return 1'bz;
+      default: return 1'bx;
+    endcase
+  endfunction
+  function automatic logic [68:0] patch(bit [275:0] data);
+    logic [68:0] v;
+    for (int i = 0; i < 69; i++) v[i] = decode(data[4*i +: 4]);
+    v[5:3] = 3'b1xz;
+    return v;
+  endfunction
+  bit [275:0] n;
+  logic [68:0] out;
+  initial begin
+    n = {69{4'h4}};
+    n[4*66 +: 4] = 0;
+    out = patch(n);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    let out = sim.get_signal("out").expect("output missing");
+    for bit in 0..69 {
+        let expected = match bit {
+            4 => LogicBit::X,
+            5 => LogicBit::One,
+            66 => LogicBit::Zero,
+            _ => LogicBit::Z,
+        };
+        assert_eq!(out.get_bit(bit), expected, "bit {bit}");
+    }
+}
