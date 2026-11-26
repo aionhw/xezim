@@ -1,0 +1,7 @@
+T|rd1 n_two=1 at 0
+T|rd2 n_two=1 at 0
+T|rd1 4 5 1 0 1 0 1 p=4
+T|rd2 4 5 1 0 1 0 1 p=5
+T|rd1 n_two=x at 2
+T|rd2 n_two=x at 2
+T|top 10 5 x 1 0

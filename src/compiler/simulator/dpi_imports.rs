@@ -106,10 +106,19 @@ impl Simulator {
     /// formals keep the caller value untouched (mirrors the direct integral
     /// formal handling that a raw `TypeReference` port bypassed).
     pub(super) fn scalar_formal_integral(&self, dt: &DataType) -> Option<(u32, bool)> {
+        self.scalar_integral_in(dt, &self.module.typedef_types, &self.module.typedefs)
+    }
+
+    pub(super) fn scalar_integral_in(
+        &self,
+        dt: &DataType,
+        types: &HashMap<String, DataType>,
+        widths: &super::elaborate::TypedefTable,
+    ) -> Option<(u32, bool)> {
         use crate::ast::types::DataType as DT;
         // Enum and real stay out: enum formals were never width-adapted and a
         // real typedef must round (not resize) — keep the prior behavior.
-        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let resolved = super::elaborate::resolve_typedef_chain(dt, types);
         let is_resolved_int =
             matches!(&resolved, DT::IntegerVector { .. } | DT::IntegerAtom { .. })
                 || matches!(
@@ -123,19 +132,18 @@ impl Simulator {
         // on every alias in the chain, not just its terminal element type.
         let named_width = matches!(dt, DT::TypeReference { name, dimensions, .. }
             if !dimensions.is_empty()
-                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs)
+                || super::elaborate::lookup_scoped_type(name, widths)
                     .is_some_and(|width| *width > 0));
         let width_type = if named_width { dt } else { resolved };
         let pw = super::elaborate::resolve_type_width(
             width_type,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(widths),
         );
         if pw == 0 {
             return None;
         }
-        let signed =
-            super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+        let signed = super::elaborate::is_type_signed_resolved(&resolved, types);
         Some((pw, signed))
     }
 
@@ -186,7 +194,7 @@ impl Simulator {
             {
                 value = value.to_two_state();
             }
-        } else if super::elaborate::is_type_real(dt) && !value.is_real {
+        } else if self.dt_is_real(dt) && !value.is_real {
             value = Value::from_f64(value.to_f64());
         }
         value
@@ -209,7 +217,7 @@ impl Simulator {
             let mut by_w: HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>> = HashMap::default();
             for td in self.module.typedef_types.values() {
                 let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                if let Some(fields) = self.struct_field_layout(&resolved) {
                     let total: u32 = fields.iter().map(|f| f.2).sum();
                     by_w.entry(total).or_default().push(fields);
                 }
@@ -228,7 +236,10 @@ impl Simulator {
             })
     }
 
-    pub(super) fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
+    pub(super) fn struct_field_layout(
+        &self,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32, bool)>> {
         let su = match dt {
             DataType::Struct(su) if !su.packed => su,
             _ => return None,
@@ -237,7 +248,7 @@ impl Simulator {
         let mut offset: u32 = 0;
         for m in su.members.iter().rev() {
             let fw = resolve_type_width(&m.data_type, None, None);
-            let fr = super::elaborate::is_type_real(&m.data_type);
+            let fr = self.dt_is_real(&m.data_type);
             for d in &m.declarators {
                 fields.push((d.name.name.clone(), offset, fw, fr));
                 offset += fw;
@@ -571,6 +582,15 @@ impl Simulator {
     /// packed array, which §35.5.5 does not allow as a result; it stays
     /// unresolved and the prototype is reported unsupported.
     pub(super) fn dpi_resolve_typedef(&self, dt: &DataType) -> DataType {
+        Self::dpi_resolve_typedef_in(dt, &self.module.typedef_types)
+    }
+
+    /// `dpi_resolve_typedef` over a given typedef table (the bytecode
+    /// compiler resolves an import's formals with the same rule).
+    pub(crate) fn dpi_resolve_typedef_in(
+        dt: &DataType,
+        typedef_types: &HashMap<String, DataType>,
+    ) -> DataType {
         let mut cur = dt.clone();
         for _ in 0..16 {
             let DataType::TypeReference {
@@ -584,7 +604,7 @@ impl Simulator {
             }
             // §26.3: a package-qualified result type (`pkg::color_e`) names
             // the package's typedef.
-            match super::elaborate::lookup_scoped_type(name, &self.module.typedef_types) {
+            match super::elaborate::lookup_scoped_type(name, typedef_types) {
                 Some(t) => cur = t.clone(),
                 None => break,
             }
@@ -707,20 +727,28 @@ impl Simulator {
             DpiRetKind::String => Type::pointer(),
         };
         let cif = Cif::new(arg_types, ret_type);
-        for lib in &self.dpi_libraries {
-            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
-            if let Ok(s) = sym {
-                self.dpi_bindings.insert(
-                    sv_name.to_string(),
-                    DpiBinding {
-                        ret,
-                        arg_kinds: arg_kinds.clone(),
-                        cif: cif.clone(),
-                        fn_ptr: CodePtr::from_ptr(*s),
-                    },
-                );
-                return;
-            }
+        let fn_ptr = self
+            .dpi_libraries
+            .iter()
+            .find_map(|lib| unsafe { lib.get::<*mut c_void>(&cname) }.ok().map(|s| *s))
+            // §35.5.1: an import names a C function wherever it is defined.
+            // One that no --dpi-lib library defines is looked up among the
+            // libraries the process already has loaded (the C library, the
+            // xezim executable), so
+            // `import "DPI-C" function string getenv(input string name);`
+            // needs no library of its own. A name found nowhere stays
+            // unbound and keeps its "no implementation" diagnostic.
+            .or_else(|| loaded_c_symbol(&cname));
+        if let Some(p) = fn_ptr {
+            self.dpi_bindings.insert(
+                sv_name.to_string(),
+                DpiBinding {
+                    ret,
+                    arg_kinds,
+                    cif,
+                    fn_ptr: CodePtr::from_ptr(p),
+                },
+            );
         }
     }
 
@@ -752,6 +780,13 @@ impl Simulator {
     }
 
     pub(super) fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
+        let fitted;
+        let v = if v.width < width || v.is_fill {
+            fitted = v.resize_for_assign(width);
+            &fitted
+        } else {
+            v
+        };
         let nwords = width.div_ceil(32).max(1) as usize;
         let mut aval = vec![0u32; nwords];
         let mut bval = vec![0u32; nwords];
@@ -1221,19 +1256,74 @@ impl Simulator {
     /// §35.5.6 / §13.5: an actual bound to an integral DPI formal converts as
     /// an assignment to the formal would, so a real rounds (§6.12.2) instead
     /// of passing its f64 bit pattern (`c_add(2.6, 3.4)` handed C 0s).
-    pub(super) fn dpi_int_actual(&mut self, e: &Expression) -> Value {
-        self.dpi_int_actual_w(e, 64)
+    pub(super) fn dpi_int_actual(
+        &mut self,
+        port: Option<&crate::ast::decl::FunctionPort>,
+        e: &Expression,
+    ) -> Value {
+        self.dpi_int_actual_w(port, e, 64)
     }
 
     /// `dpi_int_actual` for a packed-vector formal of `width` bits: a real
     /// fills all of them (`1.0e30` into a `bit [127:0]`).
-    pub(super) fn dpi_int_actual_w(&mut self, e: &Expression, width: u32) -> Value {
-        let v = self.eval_expr(e);
+    ///
+    /// §13.5, §35.5.6: an INPUT actual is assigned to its formal on entry,
+    /// so it is context-determined by the formal's width (§11.6.1, §11.8.1)
+    /// as an ordinary call's is (`actual_context_width`). Evaluated
+    /// self-determined and widened afterwards, `f(a | (b << 1))` over one-bit
+    /// `a`, `b` passed 0 and `f(x + y)` over 8-bit operands lost the carry.
+    pub(super) fn dpi_int_actual_w(
+        &mut self,
+        port: Option<&crate::ast::decl::FunctionPort>,
+        e: &Expression,
+        width: u32,
+    ) -> Value {
+        let v = match port.and_then(|p| self.dpi_formal_ctx_width(p)) {
+            Some(w) => self.eval_expr_ctx(e, w),
+            None => self.eval_expr(e),
+        };
         if v.is_real {
             Self::real_to_int(v.to_f64(), width.max(64))
         } else {
             v
         }
+    }
+
+    /// The width an import's input actual is evaluated at: the formal's,
+    /// spelled out (`actual_context_width`) or through a typedef of a
+    /// fixed-width integral type (`input my_int_t v`), resolved as the
+    /// import's C signature resolves it (`dpi_resolve_typedef`).
+    pub(super) fn dpi_formal_ctx_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        if let Some(w) = self.actual_context_width(port) {
+            return Some(w);
+        }
+        let dt = Self::dpi_typedef_ctx_type(port, &self.module.typedef_types)?;
+        let w = super::elaborate::resolve_type_width(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w > 0).then_some(w)
+    }
+
+    /// The fixed-width integral type an import's typedef'd input formal
+    /// (`input my_int_t v`) names, or None (see `dpi_formal_ctx_width`).
+    pub(crate) fn dpi_typedef_ctx_type(
+        port: &crate::ast::decl::FunctionPort,
+        typedef_types: &HashMap<String, DataType>,
+    ) -> Option<DataType> {
+        if !matches!(port.data_type, DataType::TypeReference { .. })
+            || !port.dimensions.is_empty()
+            || !matches!(port.direction, PortDirection::Input)
+        {
+            return None;
+        }
+        let dt = Self::dpi_resolve_typedef_in(&port.data_type, typedef_types);
+        (matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(&dt))
+            .then_some(dt)
     }
 
     /// §23.9 / §26.3: ordinary declarations in the calling scope hide a
@@ -1384,13 +1474,21 @@ impl Simulator {
             Vec::new();
         let mut struct_keep: Vec<CString> = Vec::new();
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
+        // The formal each input actual is assigned to (see `dpi_int_actual_w`).
+        let ports: &[crate::ast::decl::FunctionPort] = match &spec.proto {
+            crate::ast::decl::DPIProto::Function(fd) => &fd.ports,
+            crate::ast::decl::DPIProto::Task(td) => &td.ports,
+        };
+        let in_port = |i: usize| ports.get(i);
 
         for (i, kind) in arg_kinds.iter().enumerate() {
             match kind {
                 DpiArgKind::Int32In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0) as i32)
+                            .map(|e| {
+                                self.dpi_int_actual(in_port(i), e).to_i64().unwrap_or(0) as i32
+                            })
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
@@ -1399,7 +1497,7 @@ impl Simulator {
                 DpiArgKind::LogicIn => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| Self::dpi_svlogic_code(&self.dpi_int_actual(e)))
+                            .map(|e| Self::dpi_svlogic_code(&self.dpi_int_actual(in_port(i), e)))
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
@@ -1430,7 +1528,10 @@ impl Simulator {
                     // i32 pass-through would send (2 -> svBit 0, not 2).
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| (self.dpi_int_actual(e).get_bit(0) == LogicBit::One) as u8)
+                            .map(|e| {
+                                (self.dpi_int_actual(in_port(i), e).get_bit(0) == LogicBit::One)
+                                    as u8
+                            })
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
@@ -1442,7 +1543,7 @@ impl Simulator {
                     // wrongly writes an int stays inside it.
                     let bit = args
                         .get(i)
-                        .map(|e| (self.dpi_int_actual(e).get_bit(0) == LogicBit::One) as u8)
+                        .map(|e| (self.dpi_int_actual(None, e).get_bit(0) == LogicBit::One) as u8)
                         .unwrap_or(0);
                     let b = Box::new(i32::from_ne_bytes([bit, 0, 0, 0]));
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
@@ -1456,7 +1557,7 @@ impl Simulator {
                 DpiArgKind::Int64In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0))
+                            .map(|e| self.dpi_int_actual(in_port(i), e).to_i64().unwrap_or(0))
                             .unwrap_or(0),
                     );
                     i64_vals.push(v);
@@ -1570,7 +1671,7 @@ impl Simulator {
                     // of {aval, bval} u32 pairs (see dpi_value_to_logic_interleaved).
                     let vv = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(in_port(i), e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&vv, *width);
                     logic_aval.push(buf);
@@ -1581,7 +1682,7 @@ impl Simulator {
                 DpiArgKind::VecLogicOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(None, e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&init, *width);
                     logic_aval.push(buf);
@@ -1597,7 +1698,7 @@ impl Simulator {
                     // ABI differs from VecLogicIn: no bval field.
                     let vv = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(in_port(i), e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let aval = Self::dpi_value_to_bit_words(&vv, *width);
                     // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
@@ -1610,7 +1711,7 @@ impl Simulator {
                 DpiArgKind::VecBitOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(None, e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let aval = Self::dpi_value_to_bit_words(&init, *width);
                     logic_aval.push(aval);
@@ -1668,7 +1769,7 @@ impl Simulator {
                 DpiArgKind::Int32Out => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0) as i32)
+                        .map(|e| self.dpi_int_actual(None, e).to_i64().unwrap_or(0) as i32)
                         .unwrap_or(0);
                     let b = Box::new(init);
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
@@ -1682,7 +1783,7 @@ impl Simulator {
                 DpiArgKind::Int64Out => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0))
+                        .map(|e| self.dpi_int_actual(None, e).to_i64().unwrap_or(0))
                         .unwrap_or(0);
                     let b = Box::new(init);
                     let p = Box::new((&*b as *const i64 as *mut i64).cast::<c_void>());
@@ -1969,4 +2070,20 @@ impl Simulator {
         self.compile();
         self.simulate();
     }
+}
+
+/// The address of the C symbol `cname` (NUL-terminated) in the global symbol
+/// scope: the executable, the libraries it was linked with (the C library)
+/// and every library opened `RTLD_GLOBAL`. `None` when no loaded object
+/// defines it.
+#[cfg(unix)]
+fn loaded_c_symbol(cname: &[u8]) -> Option<*mut c_void> {
+    // SAFETY: `cname` is NUL-terminated, and `dlsym` only looks the name up.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
+    (!p.is_null()).then_some(p)
+}
+
+#[cfg(not(unix))]
+fn loaded_c_symbol(_cname: &[u8]) -> Option<*mut c_void> {
+    None
 }

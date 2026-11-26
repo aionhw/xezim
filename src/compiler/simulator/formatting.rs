@@ -48,11 +48,7 @@ impl Simulator {
             K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
             K::Compare | K::ICompare | K::Order => {
                 let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
-                let d = match kind {
-                    K::Compare => Self::sv_strcmp(&a, &b, false),
-                    K::ICompare => Self::sv_strcmp(&a, &b, true),
-                    _ => Self::sv_str_order(&a, &b),
-                };
+                let d = Self::sv_strcmp(&a, &b, matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
                 out.is_signed = true;
                 out
@@ -232,27 +228,6 @@ impl Simulator {
         }
     }
 
-    /// Minimal (leading-zero-trimmed) form of a binary/octal/hex string; x/z
-    /// digits stop the trim, and an all-zero value keeps one digit.
-    pub(super) fn trim_radix_zeros(s: &str) -> String {
-        let t = s.trim_start_matches('0');
-        if t.is_empty() {
-            return "0".to_string();
-        }
-        // §21.2.1.3 automatic sizing: a leading RUN of x (or z) digits
-        // collapses to one, like leading zeros — `%0h` of 8'hxx is "x",
-        // of 16'hxx3f is "x3f". Mixed-case runs (X vs x) keep the first.
-        let mut chars = t.chars();
-        if let Some(first) = chars.next() {
-            if matches!(first, 'x' | 'X' | 'z' | 'Z') {
-                let rest: &str = chars.as_str();
-                let trimmed = rest.trim_start_matches(|c: char| c.eq_ignore_ascii_case(&first));
-                return format!("{}{}", first, trimmed);
-            }
-        }
-        t.to_string()
-    }
-
     /// Full-width octal rendering from a binary string, x/z-aware: a digit is
     /// `x`/`z` when all three bits are, `X`/`Z` when only some are.
     pub(super) fn bin_to_oct_string(bin: &str) -> String {
@@ -334,30 +309,9 @@ impl Simulator {
         )
     }
 
-    /// §21.2.1.2 hex/binary/octal field padding. a reference simulator (and C) pad a bare
-    /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
-    /// for `%4h`); the leading-`0` flag both selects the minimal
-    /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
-    /// flag left-justifies with trailing spaces. Passing `full` (not a
-    /// pre-trimmed core) lets us honour the flag correctly.
+    /// §21.2.1.2–3: trim leading zero digits, preserving each x/z digit.
+    /// Explicit widths pad on the left with zeros or on the right with spaces.
     pub(super) fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool) {
-        // The reference simulator's radix-field model, re-measured
-        // byte-for-byte (commercial tools disagree here; xezim previously
-        // followed the OTHER tool's space-pad-to-natural-width model — the
-        // switch is deliberate, see tests/strings/format_sibling_fixes.rs):
-        //   * bare `%0<r>`: minimal form — leading zeros AND a leading x/z
-        //     run collapse (`%0h` of 16'hxx3f -> "x3f", of 8'hzz -> "z").
-        //   * explicit width W: the core is the value with leading ZEROS
-        //     trimmed only — an x/z run is kept (`%6h` of 8'hzz ->
-        //     "0000zz"). Never truncated below the core (`%2h` of 16'h2a5
-        //     -> "2a5"). Right-justified pads with '0' REGARDLESS of the
-        //     `0` flag (`%4h` == `%04h` of 8'h0f -> "000f"); `-` pads with
-        //     spaces on the right (`%-4h` -> "f   ", `%-08h` of 32'hFF ->
-        //     "ff      "). Zero value: `%4h` of 8'h00 -> "0000".
-        if width == 0 {
-            result.push_str(&Self::trim_radix_zeros(full));
-            return;
-        }
         let t = full.trim_start_matches('0');
         let core = if t.is_empty() { "0" } else { t };
         if core.len() >= width {
@@ -1144,11 +1098,7 @@ impl Simulator {
         }
         let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) => {
-                let mut fitted = if w != val.width {
-                    val.resize_for_assign(w)
-                } else {
-                    val.clone()
-                };
+                let mut fitted = val.resize_for_assign(w);
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
@@ -1282,10 +1232,7 @@ impl Simulator {
                     && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
                 {
                     let b = b.trim();
-                    return matches!(b, "real" | "shortreal" | "realtime")
-                        || self.module.typedef_types.get(b).is_some_and(|t| {
-                            super::elaborate::is_type_real_resolved(t, &self.module.typedef_types)
-                        });
+                    return self.concrete_type_real(b);
                 }
                 // §8.25: the state domain of a type parameter belongs to
                 // this object, including when another specialization calls it.

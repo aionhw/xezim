@@ -284,3 +284,37 @@ endmodule
 "#;
     assert_eq!(messages(src), ["A 01", "B 22", "C 23"]);
 }
+
+/// §9.2.2.2.1: a parameter-sized vector in an instance keeps its disjoint
+/// source bit sensitive after the block has written the destination bit.
+#[test]
+fn parameterized_instance_vector_keeps_disjoint_bit_sensitive() {
+    let src = r#"
+module leaf #(parameter int P = 1) (input logic r, output logic [2:0] o);
+  logic [P+1:0]           a;
+  logic [2**(P+1)-2:0]    b;
+  logic [(1<<(P+1))-2:0]  c;
+  assign a[2] = r;
+  assign b[2] = r;
+  assign c[2] = r;
+  always_comb a[0] = a[2];
+  always_comb b[0] = b[2];
+  always_comb c[0] = c[2];
+  assign o = {a[0], b[0], c[0]};
+endmodule
+module top;
+  parameter int P = 0;
+  logic r = 0;
+  wire [2:0] a, b;
+  leaf u(r, a);
+  leaf #(.P(2)) v(r, b);
+  initial begin
+    #1 r = 1;
+    #1 $display("high %b %b", a, b);
+    r = 0;
+    #1 $display("low %b %b", a, b);
+    $finish;
+  end
+endmodule"#;
+    assert_eq!(messages(src), ["high 111 111", "low 000 000"]);
+}

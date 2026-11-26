@@ -68,7 +68,7 @@ fn obsolete_checkpoint_format_is_rejected_before_decoding() {
     let path =
         std::env::temp_dir().join(format!("xezim_obsolete_format_{}.ckpt", std::process::id()));
     let mut obsolete = *MAGIC;
-    obsolete[7] = DENSE_WIDE_SNAPSHOT_VERSION - 1;
+    obsolete[7] = MAGIC[7] - 1;
     std::fs::write(&path, obsolete).unwrap();
     let error = sim.checkpoint_restore(path.to_str().unwrap()).unwrap_err();
     std::fs::remove_file(path).unwrap();

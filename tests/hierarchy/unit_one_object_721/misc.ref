@@ -1,0 +1,7 @@
+T|rd wait at 1
+T|rd q='{1, 2} n=2 aa=50 dyn=3/7 st=3,4 pk=cX ob=42 s=ab r=1.5 fx=6 p=5 hi=c
+T|rd q[0]=1
+T|rd q[1]=2
+T|rd aa has 5, sum=3
+T|rd ev at 2
+T|top q='{1, 2} o.q='{99} st.a=3 o.st.a=99 s=ab o.s=other

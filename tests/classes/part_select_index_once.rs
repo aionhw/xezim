@@ -22,9 +22,9 @@ class Writer;
     if(calls!=1 || p.slots[0].data!=64'h12345678) $fatal(1,"call repeated");
     p.slots[i++].data+=src[63:0];
     if(i!=2) $fatal(1,"compound index repeated");
-    p.slots[i++].data<=src[63:0];
+    p.slots[i++].data=src[63:0];
     #1;
-    if(i!=3 || p.slots[2].data!=64'h12345678) $fatal(1,"NBA index repeated");
+    if(i!=3 || p.slots[2].data!=64'h12345678) $fatal(1,"third element write sampled the wrong index");
     $display("T|PASS");
   endtask
 endclass

@@ -243,6 +243,8 @@ axb : cross cp_a, cp_b {
 - **Automatic bins** (a coverpoint with no `bins`): one bin per value of the sampled
   expression's width, or `option.auto_bin_max` (default 64) equal ranges when there
   are more values than that. A 4-bit coverpoint has 16 bins; an `int` has 64.
+  A coverpoint of a `real` expression has no automatic bins; its explicit bins
+  match the sampled value numerically (`bins lo = {[0.0:1.5]};`) (§19.5).
 - **Array bins** `name[]`: one bin per value, named `name[<value>]`. `name[N]`: N bins
   `name[0]` to `name[N-1]`; the listed values, in order, are split evenly among them
   and the last one also takes the remainder.
@@ -435,6 +437,13 @@ For the [assertion example](#assertion-coverage):
 | `cover property`, `cover sequence` | Matches | Always 0 |
 | `assert property`, `assume property` | Attempts that succeeded, including vacuous ones (`gnt` low, so `gnt \|-> ...` holds) | Attempts that failed |
 | Immediate `cover`, `assert`, `assume` | Evaluations where the expression was true | Evaluations where it was false |
+| Deferred `assert #0`, `assert final` (and `assume`, `cover`) | Reports that matured with the expression true | Reports that matured with it false |
+
+A deferred assertion counts a report only when it matures in the Observed
+(`#0`) or Postponed (`final`) region of its time slot (§16.4.2). A report that
+a flush point discards, because its process resumed in the same time slot,
+or that a later evaluation of the same `always_comb` supersedes, is no
+attempt.
 
 An immediate `cover`'s false evaluations therefore count in `assertion_fail_total`
 too. In the example, all 5 fails are clock edges where `req && !gnt` was false; no

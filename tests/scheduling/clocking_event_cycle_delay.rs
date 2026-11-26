@@ -80,6 +80,32 @@ endmodule
 }
 
 #[test]
+fn cycle_delay_uses_the_default_clocking_edge() {
+    // §14.11: a cycle is one occurrence of the default clocking block's
+    // clocking event, here the falling edge.
+    const SRC: &str = r#"
+`timescale 1ns/1ns
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  default clocking cbn @(negedge clk);
+  endclocking
+  initial begin
+    ##2;
+    $display("HH t=%0t", $time);
+    $finish;
+  end
+endmodule
+"#;
+    let out = output_of(&simulate(SRC, 200).expect("sim"));
+    assert!(
+        out.contains("HH t=20"),
+        "##2 must wait two negedges:\n{}",
+        out
+    );
+}
+
+#[test]
 fn cycle_delay_zero_synchronizes_to_the_clocking_event() {
     // §14.11: `##0` SYNCHRONIZES to the clocking event — it waits for the
     // edge when the process is not executing at one, and is a no-op when it
@@ -217,4 +243,36 @@ endmodule
         "runtime 2 waits two edges:\n{}",
         out
     );
+}
+
+/// IEEE 1800-2023 §14.10–11: all three forms count the declared clocking event.
+#[test]
+fn named_and_default_waits_follow_the_declared_edge() {
+    for (edge, second) in [("posedge", 15), ("negedge", 20), ("edge", 10)] {
+        let src = format!(
+            r#"
+`timescale 1ns/1ns
+interface bus(input logic clk);
+  clocking cb @({edge} clk); endclocking
+  task automatic wait_two(); repeat (2) @cb; endtask
+endinterface
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  bus b(clk);
+  default clocking cb @({edge} clk); endclocking
+  initial begin repeat (2) @cb; $display("bare=%0d", $time); end
+  initial begin repeat (2) @(cb); $display("paren=%0d", $time); end
+  initial begin ##2; $display("cycles=%0d", $time); end
+  initial begin b.wait_two(); $display("task=%0d", $time); end
+  initial #30 $finish;
+endmodule
+"#
+        );
+        let out = output_of(&simulate(&src, 100).expect("simulate"));
+        for form in ["bare", "paren", "cycles", "task"] {
+            let expected = format!("{form}={second}");
+            assert!(out.lines().any(|line| line == expected), "{edge}: {out}");
+        }
+    }
 }

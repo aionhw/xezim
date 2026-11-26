@@ -13,7 +13,7 @@ class pc;
   rand bit [31:0] addr[];
   function new(); a = new[16]; m = new[16]; addr = new[16]; endfunction
   constraint m_c { foreach (a[i]) { m[i] inside {[0:29]}; } }
-  constraint o_c { foreach (a[i]) { solve a[i] before addr[i]; solve m[i] before addr[i]; } }
+  constraint o_c { solve a, m before addr; }
   constraint up_c { foreach (a[i]) {
     if (i > 0 && a[i] == 1 && m[i] > 0) { addr[i] > addr[i-1]; }
     addr[i][31:29] == '0; } }
@@ -29,7 +29,8 @@ module t;
       if (!p.randomize()) continue;
       ok++;
       foreach (p.a[i]) begin
-        bit [31:0] mask = (1 << p.m[i]) - 1;
+        bit [31:0] mask;
+        mask = (1 << p.m[i]) - 1;
         if (p.addr[i][31:29] != 0) bad++;
         if (p.a[i] == 3 && ((p.addr[i] & mask) != mask || p.addr[i][p.m[i]])) bad++;
         if (i > 0 && p.a[i] == 1 && p.m[i] > 0 && p.addr[i] <= p.addr[i-1]) bad++;

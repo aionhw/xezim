@@ -97,7 +97,7 @@
 
 **Open**
 - Apache 2.0 licensed, developed in the open
-- More than 7,300 regression tests, including comparisons against a
+- More than 8,000 regression tests, including comparisons against a
   reference simulator
 - Built with AI assistance as part of the engineering workflow
 
@@ -107,18 +107,24 @@
 
 The [feature list](docs/features.md) has the details.
 
-## Recent updates on main
+## What's new in 0.11.7
 
-These changes are available on `main` after 0.11.6:
+- Lower elaboration memory on large designs: compilation-unit declarations,
+  prepared module bodies, declared types, constraint blocks and scope paths
+  are shared instead of copied per instance, and parser tokens take 8 bytes.
+- Faster event scheduling: a process parked on `@(...)` over signals is
+  examined only when one of them is written, and queue `pop_front`,
+  `push_front`, `insert` and `delete(i)` no longer take time proportional to
+  the queue.
+- C and C++ [DPI sources in the file list](docs/dpi-guide.md#c-and-c-sources-in-the-file-list),
+  [memory files](docs/user-guide.md#memory-files) for associative and
+  multidimensional arrays, waveform exclusion with `--wave-suppress`, VPI
+  [assertion callbacks and controls](docs/user-guide.md#vpi-assertion-integration),
+  and cocotb 2.1.
+- Many fixes for unpacked arrays and assignment patterns, `real` and
+  `shortreal` values, simulation time above 2^53 ticks, and port connections.
 
-- VPI assertion objects, callbacks and controls, with
-  [documented limits](docs/user-guide.md#vpi-assertion-integration).
-- Cocotb 2.1.0 support alongside 2.0.1, including version-specific macro values.
-- Correct dynamic-array row sizing and writes, memory-task destination lookup,
-  and time functions in top-level combinational blocks.
-- Diagnostics for undeclared type names and duplicate class definitions.
-
-See the [unreleased notes](NOTES.md#unreleased) for the complete changes.
+See the [release notes](NOTES.md) for the complete changes.
 
 ## What Xezim does
 
@@ -202,6 +208,8 @@ own workload and keep the
 [Native compilation](docs/user-guide.md#native-compilation) pays on designs
 with few, very hot blocks, so measure it on yours.
 
+### Elaboration memory
+
 Xezim 0.11.6 also shares net-initializer targets across child instances.
 On the synthetic [#721 fixture](https://github.com/aionhw/xezim/issues/721#issuecomment-6863295230)
 (32,768 instances, 32 initialized nets each), median peak RSS fell from
@@ -213,6 +221,13 @@ the original full-design OOM remains unverified. See
 [diagnosing memory growth](docs/user-guide.md#diagnosing-memory-growth) to
 investigate your own workload.
 
+Xezim 0.11.7 shares or releases much more of the elaborated design. The
+[release notes](NOTES.md) give each change with its own synthetic fixture;
+for example, 4,000 module definitions beside 200 compilation-unit
+declarations now peak at 107 MiB instead of 1,500 MiB, and 1,024 instances of
+a module whose class has 128 constraint expressions at 44 MiB instead of
+1,672 MiB.
+
 ## Conformance
 
 - **sv-tests:** Xezim 0.11.0 passes 4,722 of 4,770 tests (99.0%) of the
@@ -220,8 +235,9 @@ investigate your own workload.
 - **UVM:** the mbits-mirafra AVIP base tests for AXI4, APB, I3C, SPI and
   AXI4-Lite print the same UVM messages as a commercial reference simulator,
   and 32 of 35 UVM 1800.2-2017 example testbenches pass.
-- **Regression suite:** the default release suite passes 7,052 tests, with one
-  existing ignored test; CI also runs two JIT smoke tests. Many are
+- **Regression suite:** the default release suite of Xezim 0.11.7 passes 8,159
+  tests, with five ignored tests that pin known differences; CI also runs two
+  JIT smoke tests. Many are
   differential tests whose expected values were measured on a
   commercial reference simulator; see [CONTRIBUTING.md](CONTRIBUTING.md#test-suites).
 

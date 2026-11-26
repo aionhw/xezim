@@ -30,7 +30,9 @@ impl Simulator {
     /// A select on the leaf (`g[0].u.c[0]`, `g[0].u.c[2:1]`) stays a select
     /// of the folded name, the shape `u.c[0]` already has.
     pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
-        if let Some(flat) = self.indexed_hier_flat_name(e) {
+        // A constant unpacked select can name a stored scalar leaf. Resolve
+        // the complete path first, then peel any remaining packed selects.
+        if let Some(flat) = self.constant_selected_storage(e) {
             return Some(Self::flat_name_ident(flat, e.span));
         }
         let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
@@ -42,6 +44,74 @@ impl Simulator {
             **expr = base;
         }
         Some(out)
+    }
+
+    pub(super) fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+        fn append(
+            e: &Expression,
+            module: &ElaboratedModule,
+            name: &mut String,
+            selected: &mut bool,
+        ) -> Option<()> {
+            use std::fmt::Write;
+            let index = |name: &mut String, sel: &Expression| {
+                let i =
+                    super::elaborate::const_eval_i64_with_params(sel, Some(&module.parameters))?;
+                write!(name, "[{i}]").ok()
+            };
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    if h.root.as_deref() == Some("$root") {
+                        name.push_str("$root.");
+                    } else if h.root.is_some() {
+                        return None;
+                    }
+                    for (i, seg) in h.path.iter().enumerate() {
+                        if i != 0 {
+                            name.push('.');
+                        }
+                        name.push_str(&seg.name.name);
+                        for sel in &seg.selects {
+                            index(name, sel)?;
+                            *selected = true;
+                        }
+                    }
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    append(expr, module, name, selected)?;
+                    name.push('.');
+                    name.push_str(&member.name);
+                }
+                ExprKind::Index { expr, index: sel } => {
+                    append(expr, module, name, selected)?;
+                    index(name, sel)?;
+                    *selected = true;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut path = String::new();
+        let mut selected = false;
+        append(expr, &self.module, &mut path, &mut selected)?;
+        if !selected {
+            return None;
+        }
+        let rooted = path.strip_prefix("$root.");
+        let name = rooted.unwrap_or(&path);
+        let stored = if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
+            name
+        } else {
+            let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
+            self.signal_name_to_id.get(short)?;
+            short
+        };
+        // Ordinary arrays need their selectors for packed bounds and element
+        // types. An indexed scope or an unpacked struct member instead names
+        // a separately stored leaf, which a delayed write needs to address.
+        let (owner, _) = stored.rsplit_once('.')?;
+        (owner.contains(']') || self.module.struct_members.contains_key(owner))
+            .then(|| stored.to_string())
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
@@ -65,19 +135,6 @@ impl Simulator {
             }),
             span,
         )
-    }
-
-    /// The stored (`signal_name_to_id`) name a hierarchical path stands for
-    /// when that path enters a scope through an INDEX, or `None` for any
-    /// other shape.
-    pub(super) fn indexed_hier_flat_name(&self, e: &Expression) -> Option<String> {
-        // A plain `u.sig` already folds upstream, and a select on the LAST
-        // segment (`u.sig[2]`) is an ordinary leaf select that compiles
-        // today; only a scope ENTERED through a select needs this.
-        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
-            return None;
-        }
-        self.select_entered_stored_name(e)
     }
 
     /// #1108, §9.4.2: an element of an unpacked array in a scope entered
@@ -482,6 +539,7 @@ impl Simulator {
                 return false;
             }
         }
+        self.comb_writer_index = None;
         self.comb_entries = cache.entries;
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
@@ -658,6 +716,27 @@ impl Simulator {
         let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
+        // §10.10: the arrays an unpacked concatenation item cannot be spread
+        // from element by element (`concat_array_assign_parts`).
+        let arrays_nd_snapshot = self.module.arrays_nd.clone();
+        let other_arrays_snapshot: HashSet<String> = self
+            .module
+            .dynamic_arrays
+            .iter()
+            .chain(&self.module.queue_vars)
+            .chain(self.module.associative_arrays.keys())
+            .cloned()
+            .collect();
+        let is_other_array = |n: &str| other_arrays_snapshot.contains(n);
+        let concat_tables = crate::compiler::elaborate::UnpackedArrayTables {
+            arrays: &arrays_snapshot,
+            arrays_2d: &arrays_2d_snapshot,
+            arrays_nd: &arrays_nd_snapshot,
+            descending: &descending_snapshot,
+            decl_dims: &decl_dims_snapshot,
+            params: &params_snapshot,
+            other_array: &is_other_array,
+        };
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
         // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
         // with the port chain above unconnected). Identity port connects
@@ -682,6 +761,7 @@ impl Simulator {
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
+        let mut t0_effects = super::time0_effects::Time0Effects::default();
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         let cont_loop_t0 = std::time::Instant::now();
@@ -697,15 +777,7 @@ impl Simulator {
                     .map(|p| p.materialize(&params_snapshot)),
             )
             .flat_map(|ca| {
-                crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
-                    &ca.lhs,
-                    &ca.rhs,
-                    ca.delay,
-                    &arrays_snapshot,
-                    Some(&descending_snapshot),
-                    Some(&decl_dims_snapshot),
-                    Some(&params_snapshot),
-                )
+                self.module.whole_array_driver_parts(&ca.lhs, &ca.rhs, ca.delay, &decl_dims_snapshot)
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
                         &ca.lhs,
@@ -730,7 +802,24 @@ impl Simulator {
                     )
                 })
                 .or_else(|| {
-                    Self::row_pattern_assign_parts(&ca, &decl_dims_snapshot, &params_snapshot)
+                    Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
+                })
+                .or_else(|| {
+                    crate::compiler::elaborate::concat_array_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &concat_tables,
+                    )
+                })
+                .map(|mut parts| {
+                    if ca.delay_exprs.is_some() {
+                        for part in &mut parts {
+                            part.delay_exprs.clone_from(&ca.delay_exprs);
+                            part.origin.clone_from(&ca.origin);
+                        }
+                    }
+                    parts
                 })
                 .unwrap_or_else(|| vec![ca])
             })
@@ -840,6 +929,13 @@ impl Simulator {
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
+            // §10.3.2, §4.9.1: an assignment whose evaluation is observable
+            // waits for the time-0 start batch (see `time0_effects`).
+            let ca_time0_effects = {
+                let frame = super::time0_effects::T0Frame::expr();
+                self.t0_expr_has_effects(&ca.rhs, None, &frame, &mut t0_effects)
+                    || self.t0_expr_has_effects(&ca.lhs, None, &frame, &mut t0_effects)
+            };
             // Statement coverage counts this assignment's evaluations: keep it
             // on a form that runs a counter (compiled, or interpreted).
             let cov_counter = if self.code_cov.is_some() {
@@ -971,16 +1067,6 @@ impl Simulator {
                 self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
                     .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
             };
-            // §20.3: `$time` in the assign counts the timeunit of the module
-            // the `assign` is written in. A submodule's assign is elaborated
-            // with fully qualified names and often has NO resolution hint, so
-            // record its source instance when the hint would not name it.
-            let ts_scope = ca
-                .origin
-                .as_ref()
-                .map(|(_, sc)| sc.as_str())
-                .filter(|sc| *sc != scope_hint.as_deref().unwrap_or(""))
-                .map(str::to_string);
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
                 let width = self.signal_widths[dst_id];
@@ -996,7 +1082,10 @@ impl Simulator {
                 // on the fast path.
                 let dst_real = self.signal_real.get(dst_id).copied().unwrap_or(false);
                 let src_real = self.signal_real.get(src_id).copied().unwrap_or(false);
-                if dst_real != src_real {
+                if dst_real != src_real
+                    || (dst_real && self.shortreal_signals.contains(&dst_id)
+                        && !self.shortreal_signals.contains(&src_id))
+                {
                     None
                 } else if width == self.signal_widths[src_id] {
                     if width <= 64 && delay == 0 {
@@ -1169,6 +1258,7 @@ impl Simulator {
                 || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
                 || ca.delay_off.is_some_and(|d| d > 0)
+                || ca.delay_exprs.is_some()
                 || (select_target && select_fall.is_some_and(|d| d > 0));
             // §10.3.3 versus §28.16: use the assignment's origin, not the
             // target's gate marker. Multi-driver lowering can give a gate
@@ -1192,7 +1282,7 @@ impl Simulator {
                     })
             } else if has_transition_delay
                 && select_target
-                && (select_fall.is_some_and(|f| f != explicit_delay)
+                && (ca.delay_exprs.is_some() || select_fall.is_some_and(|f| f != explicit_delay)
                     || ca.delay_off.is_some_and(|t| t != explicit_delay))
             {
                 // §10.3.3 / §28.16: a constant select keeps a select target
@@ -1222,7 +1312,7 @@ impl Simulator {
             // the one point where both the target and the new value are
             // known. Whole-net targets only, including widened overlapping
             // selects, like the gate form (§28.16).
-            if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+            if ca.delay_exprs.is_none() && has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
@@ -1247,6 +1337,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
                     delay_target: delay_target.map(Box::new),
+                    delay_exprs: ca.delay_exprs.take(),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -1305,6 +1396,14 @@ impl Simulator {
                 // helpers) onto the slowest path. Every other compiler
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
+                // §6.12.1: which operands are real decides the conversions
+                // (an integral net driven by a real rounds it).
+                compiler.set_signal_real(&self.signal_real);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
@@ -1347,6 +1446,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1397,6 +1497,12 @@ impl Simulator {
                 // (`assign {a,b} = ({N{hit}} & f(w)) | ...`) could never
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
+                compiler.set_signal_real(&self.signal_real);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
@@ -1440,6 +1546,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1449,6 +1556,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs),
                     delay: 0,
                     delay_target: None,
+                    delay_exprs: None,
                 }
             };
 
@@ -1566,6 +1674,25 @@ impl Simulator {
                 // first value. An array of the packed arena has no per-cell
                 // ids: the read stays unresolved.
                 let mut packed_array_read = false;
+                // #1284, §10.3.2: an element read of an array stored without
+                // element names (`u.mem[5]`, one of the reads a dynamic index
+                // `u.mem[idx]` stands for) changes at run time, but no
+                // dependency edge can name its cell: the entry re-evaluates
+                // at every settle, as an always block reading one does and
+                // as a top-level read already did. The member-strip fallback
+                // below took it for a member of the instance `u` and
+                // depended on `u`, which no write dirties, so the
+                // assignment kept its first value.
+                if !found
+                    && self.read_names_unnamed_cell(
+                        r,
+                        scope_hint.as_deref(),
+                        ca_lhs_scope.unwrap_or_default(),
+                    )
+                {
+                    unresolved_count += 1;
+                    continue;
+                }
                 if !found && r.contains('.') {
                     let scopes = if read_is_rooted {
                         [None, None]
@@ -1843,17 +1970,44 @@ impl Simulator {
             if matches!(&item, CombItem::Noop) {
                 continue;
             }
+            // §20.3: the name hint can follow a hierarchical destination. Time
+            // calls belong to the module that authored the RHS. For synthesized
+            // input connections the expression belongs to the port's parent;
+            // a synthesized resolver runs in its net's own scope.
+            let rhs_time_scope = if matches!(&item, CombItem::ContAssign { .. })
+                || matches!(&item, CombItem::CompiledContAssign { compiled } if compiled.has_fallback)
+            {
+                ca.origin.map(|(_, scope)| scope).or_else(|| {
+                    let name = self.name_opt(*wids.first()?)?;
+                    let (owner, _) = name.rsplit_once('.')?;
+                    let input_port = ca.rhs_parent_scoped
+                        && matches!(
+                            self.vpi_port_directions.get(name),
+                            Some(PortDirection::Input | PortDirection::Inout)
+                        );
+                    let scope = if input_port {
+                        self.instance_by_path(owner)
+                            .map_or(owner, |inst| inst.parent.as_str())
+                    } else {
+                        owner
+                    };
+                    Some(Arc::from(scope))
+                })
+            } else {
+                None
+            };
             let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope,
                     scope_hint,
-                    ts_scope,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     span: ca_span,
                     cov,
                     deferred_epoch: Default::default(),
+                    time0_effects: ca_time0_effects,
                 }),
                 has_unresolved_reads,
                 defer_at_time0: false,
@@ -2167,6 +2321,11 @@ impl Simulator {
                     compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     compiler.set_params(&self.module.parameters);
                     compiler.set_param_leaf_idx(self.param_leaf_index());
                     compiler.set_cast_widths(&self.cast_widths);
@@ -2212,17 +2371,26 @@ impl Simulator {
                     }
                 };
                 let _is_pure_observer = wids.is_empty();
+                // §9.2.2.2: see `time0_effects`.
+                let ab_time0_effects = is_always_comb
+                    && self.t0_stmt_has_effects(
+                        &ab.stmt,
+                        scope_hint.as_deref(),
+                        &super::time0_effects::T0Frame::block(&ab.stmt),
+                        &mut t0_effects,
+                    );
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
+                        rhs_time_scope: None,
                         scope_hint,
                         // An always block's hint is its own instance scope.
-                        ts_scope: None,
                         read_signal_ids: rids,
                         write_signal_ids: wids,
                         span: ab.stmt.span,
                         cov: None,
                         deferred_epoch: Default::default(),
+                        time0_effects: ab_time0_effects,
                     }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
@@ -2902,19 +3070,19 @@ impl Simulator {
                     continue;
                 }
                 // Straight-line only: no branch targets to rebase, and no AST
-                // fallbacks (those would need per-member scope hints).
+                // fallbacks (those would need per-member scope hints). Every
+                // branch form counts, the fused compare-and-branch and the
+                // jump tables included: a member's targets are relative to
+                // its own first instruction, so a later member's branch would
+                // land in the first member's body (#1284: four inlined
+                // `if (k > N) k = N;` taps looped there for ever).
                 use super::bytecode::Insn as I;
                 if compiled.instructions.iter().any(|i| {
-                    matches!(
-                        i,
-                        I::Jump(..)
-                            | I::BranchIfFalse(..)
-                            | I::BranchUnlessZero(..)
-                            | I::BranchIfSignalFalse(..)
-                            | I::StmtFallback(..)
-                            | I::EvalExprFallback(..)
-                            | I::LoadDynElem(..)
-                    )
+                    i.is_branch()
+                        || matches!(
+                            i,
+                            I::StmtFallback(..) | I::EvalExprFallback(..) | I::LoadDynElem(..)
+                        )
                 }) {
                     continue;
                 }
@@ -2998,15 +3166,29 @@ impl Simulator {
         // pass-through chains.
         if matches!(std::env::var("XEZIM_FUSE_CHAINS").as_deref(), Ok("1")) {
             let n = entries.len();
+            // An entry with unresolved reads re-runs every settle pass; the
+            // merged entry would drop that flag for its absorbed members.
             let mergeable = |e: &CombEntry| {
-                matches!(
-                    e.item,
-                    CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. }
-                ) && !match &e.item {
-                    CombItem::CompiledContAssign { compiled }
-                    | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.has_fallback,
-                    _ => false,
+                !e.has_unresolved_reads
+                    && matches!(
+                        e.item,
+                        CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. }
+                    )
+                    && !match &e.item {
+                        CombItem::CompiledContAssign { compiled }
+                        | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.has_fallback,
+                        _ => false,
+                    }
+            };
+            // Classes never mix, as in region fusion below: a continuous
+            // assign runs at time 0 while a plain `always @(...)` waits for
+            // its first event (§9.2.2.1, §10.3.2), and the merged entry keeps
+            // only the head's kind and `defer_at_time0`.
+            let class = |e: &CombEntry| match &e.item {
+                CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                    (1u8 + u8::from(!*is_always_comb), e.defer_at_time0)
                 }
+                _ => (0u8, e.defer_at_time0),
             };
             // writer/reader maps over COMB entries only.
             let mut writer: HashMap<usize, Option<usize>> = HashMap::default();
@@ -3042,6 +3224,7 @@ impl Simulator {
                         let b = uniq[0];
                         if writer.get(&sw) == Some(&Some(i))
                             && mergeable(&entries[b])
+                            && class(&entries[b]) == class(e)
                             && !entries[b].cold.write_signal_ids.contains(&sw)
                         {
                             match link {
@@ -3158,8 +3341,17 @@ impl Simulator {
                             | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
                             _ => unreachable!(),
                         };
+                        // B's branch targets are relative to its own first
+                        // instruction: relocate them past the head's body,
+                        // or a guard or loop in B jumps back into the head
+                        // (wrong values, or a loop that never ends: #1284).
+                        let off = hc.instructions.len() as u32;
                         hc.instructions
-                            .extend(b_compiled.instructions.iter().cloned());
+                            .extend(b_compiled.instructions.iter().map(|i| {
+                                let mut i = i.clone();
+                                i.offset_branch_targets(off);
+                                i
+                            }));
                         hc.num_regs = hc.num_regs.max(b_compiled.num_regs);
                         hc.has_fallback |= b_compiled.has_fallback;
                         for r in b_reads {
@@ -5357,6 +5549,7 @@ impl Simulator {
                     .sum::<usize>()
             );
         }
+        self.comb_writer_index = None;
         self.comb_entries = entries;
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
@@ -5374,6 +5567,7 @@ impl Simulator {
     /// constant indices, as for a whole-array pattern assign, and each element
     /// assignment keeps the row's own selects.
     fn row_pattern_assign_parts(
+        module: &ElaboratedModule,
         ca: &crate::compiler::elaborate::ContinuousAssignment,
         decl_dims: &HashMap<String, Vec<(i64, i64)>>,
         params: &HashMap<String, Value>,
@@ -5413,15 +5607,7 @@ impl Simulator {
         // parts come back as `name[j]...`, and only their indices are kept.
         let row_dims: HashMap<String, Vec<(i64, i64)>> =
             std::iter::once((name.clone(), dims[k..].to_vec())).collect();
-        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
-            cur,
-            &ca.rhs,
-            ca.delay,
-            &HashMap::default(),
-            None,
-            Some(&row_dims),
-            Some(params),
-        )?;
+        let parts = module.whole_array_driver_parts(cur, &ca.rhs, ca.delay, &row_dims)?;
         Some(
             parts
                 .into_iter()

@@ -3493,6 +3493,8 @@ pub fn lower_two_state(
             }
             // Two-state registers hold no X/Z: nothing to drop.
             Insn::DropXz(_) => {}
+            // Nor reals: real signals and real constants gate above.
+            Insn::RealToInt(_) => {}
             // A copy with the Resize arm's narrow rules folded in.
             Insn::MoveResize(d, s, w) => {
                 let cur = rw[*s as usize]?;

@@ -44,7 +44,23 @@ impl Simulator {
         // §13.4/§23.6: only called declarations materialize a private body.
         // This cache has one lexical name, so memoized widths and resolved
         // signals can be enabled without contaminating shared elaboration ASTs.
-        fd.items = crate::ast::cache::with_fresh_scope_caches(|| fd.items.to_vec()).into();
+        fd.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_function_body(name, &fd) {
+                Some(mat) => mat.into_vec(),
+                None => fd.items.to_vec(),
+            };
+            if self.module.deferred_function_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -80,7 +96,23 @@ impl Simulator {
             return Some(rc.clone());
         }
         let mut td = self.module.tasks.get(name)?.clone();
-        td.items = crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec()).into();
+        td.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_task_body(name, &td) {
+                Some(mat) => mat.into_vec(),
+                None => td.items.to_vec(),
+            };
+            if self.module.deferred_task_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(td);
         self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -160,7 +192,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&fd.name.name.name, fd.span, false));
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let supplied = normalized
             .as_ref()
@@ -262,10 +294,10 @@ impl Simulator {
         // a stale same-named formal from an earlier call can't leak).
         // Only a formal whose declared type can name an interface (`virtual
         // x_if v`, or a typedef that may resolve to one) can carry a vif;
-        // an `int`/`bit`/`string` formal never had a key to set or clear, so
-        // the per-port format + resolve + hash was pure overhead on every
-        // call of every function.
-        let vif_formals: Vec<(&str, Option<&Expression>)> = fd
+        // an `int`/`bit`/`string` formal has no actual to resolve, so the
+        // per-port format + resolve + hash was pure overhead on every call
+        // of every function.
+        let mut vif_formals: Vec<(&str, Option<&Expression>)> = fd
             .ports
             .iter()
             .enumerate()
@@ -277,6 +309,14 @@ impl Simulator {
                 )
             })
             .collect();
+        // §13.5, §25.9: the keys are flat by name, so a caller's formal or
+        // local of the same name may have left one. A plain formal, or a
+        // variable the body declares, is this call's own and names no
+        // interface: it enters with no actual, which clears the key for the
+        // call and puts it back on return.
+        if !self.vif_local_names.is_empty() {
+            self.vif_own_names(&fd.ports, &fd.items, &mut vif_formals);
+        }
         let vif_saved = if vif_formals.is_empty() {
             Vec::new()
         } else {
@@ -370,6 +410,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -428,7 +469,7 @@ impl Simulator {
                 // already dropped.
                 let value = match self.formal_pattern_value(port, &args[i]) {
                     Some(v) => v,
-                    None => match self.actual_context_width(port) {
+                    None => match self.free_actual_context_width(port) {
                         Some(w) => self.eval_expr_ctx(&args[i], w),
                         None => self.eval_expr(&args[i]),
                     },
@@ -566,7 +607,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -932,8 +973,8 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            if w > 0 && w != result.width {
-                result = result.resize(w);
+            if w > 0 && (w != result.width || result.is_fill) {
+                result = result.resize_for_assign(w);
             }
             // §13.4.1, §6.18: the result has the return type's sign, through
             // a typedef too.
@@ -1057,6 +1098,29 @@ impl Simulator {
         result
     }
 
+    /// §26.3: the scope a bare-named subroutine body runs in: the package a
+    /// design unit imports it from, else the package whose qualified entry is
+    /// this very body, so one reached only from another package's code still
+    /// runs in its own package.
+    pub(super) fn subroutine_decl_scope(
+        &self,
+        name: &str,
+        span: crate::ast::Span,
+        task: bool,
+    ) -> Option<String> {
+        if let Some(scope) = self.module.func_decl_scope.get(name) {
+            return Some(scope.clone());
+        }
+        let pkg = self.module.pkg_subr_owner.get(name)?;
+        let key = format!("{pkg}::{name}");
+        let declared = if task {
+            self.module.tasks.get(&key).map(|t| t.span)
+        } else {
+            self.module.functions.get(&key).map(|f| f.span)
+        };
+        (declared == Some(span)).then(|| pkg.clone())
+    }
+
     /// Execute a module-level task call with arguments.
     pub(super) fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
         // §26.3: the package this body belongs to — see `exec_function_call`.
@@ -1065,7 +1129,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&td.name.name.name, td.span, true));
         let mut cleanup = self.bind_task_frame(td, args, None);
         self.enter_free_task_scope(td, &mut cleanup);
         self.open_decl_shadow_frame();
@@ -1680,7 +1744,7 @@ impl Simulator {
                 .unwrap_or_default()
         };
         FormalMetaParts {
-            declared_type: self.module.var_decl_types.get(name).cloned(),
+            declared_type: self.module.var_decl_types.get_shared(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -2052,12 +2116,11 @@ impl Simulator {
             }
         }
         match saved.declared_type {
-            Some(ty) => match self.module.var_decl_types.get_mut(name) {
-                Some(slot) => *slot = ty,
-                None => {
-                    self.module.var_decl_types.insert(name.to_string(), ty);
-                }
-            },
+            Some(ty) => {
+                self.module
+                    .var_decl_types
+                    .insert_shared(name.to_string(), ty);
+            }
             None => {
                 self.module.var_decl_types.remove(name);
             }
@@ -2100,6 +2163,34 @@ impl Simulator {
         );
         put(&mut self.var_class_types, name, saved.class_type);
         put(&mut self.var_typedef_types, name, saved.typedef_type);
+    }
+
+    /// §7.4.1/§13.5: a plain vector formal or return variable of a class
+    /// method binds without `register_formal_type_metadata`, so a range
+    /// other than `[w-1:0]` (`input logic [0:7] f`) was never recorded and
+    /// `f[0]` read and wrote bit 0, or another scope's range under the name
+    /// was used. Record the variable's own range, or drop that entry, behind
+    /// the method's metadata save (`meta_note`).
+    pub(super) fn note_plain_formal_range(&mut self, name: &str, dt: &DataType) {
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if dimensions.len() == 1 =>
+            {
+                super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            }
+            _ => None,
+        };
+        match dims {
+            Some(d) if self.module.packed_full_dims.get(name) != Some(&d) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.insert(name.to_string(), d);
+            }
+            None if self.module.packed_full_dims.contains_key(name) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.remove(name);
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn register_formal_type_metadata(
@@ -2510,7 +2601,7 @@ impl Simulator {
                 }
             })
             .collect();
-        let saved_vif_formals: Vec<_> = td
+        let mut saved_vif_formals: Vec<_> = td
             .ports
             .iter()
             .enumerate()
@@ -2523,6 +2614,22 @@ impl Simulator {
                 (key, prior)
             })
             .collect();
+        // §13.5, §25.9: a plain formal, or a variable the body declares, is
+        // this call's own and names no interface; a caller's same-named
+        // formal or local may have left a key under its name (the keys are
+        // flat by name). Cleared for the call; the cleanup puts back what was
+        // saved above, and saves the body's variables here.
+        if !self.vif_local_names.is_empty() {
+            let mut own: Vec<(&str, Option<&Expression>)> = Vec::new();
+            self.vif_own_names(&td.ports, &td.items, &mut own);
+            for (name, _) in own {
+                let key = format!("__vif_local__{}", name);
+                let prior = self.signals.remove(&key);
+                if !td.ports.iter().any(|p| p.name.name == name) {
+                    saved_vif_formals.push((key, prior));
+                }
+            }
+        }
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
@@ -2679,6 +2786,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -2798,7 +2906,9 @@ impl Simulator {
                         continue;
                     }
                     let val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = scope_aliases.get(i).and_then(Option::as_deref)
+                            .and_then(|key| self.ref_alias_peek(key))
+                            .unwrap_or_else(|| self.eval_expr(&args[i]));
                         self.vif_argument_value(port, &args[i], value)
                     } else {
                         Value::zero(32)
@@ -2810,9 +2920,22 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
+                        // §13.5, §11.6.1: as a function's (`exec_function_call`),
+                        // a task's input actual is context-determined by its
+                        // formal; `t(x + y)` over 8-bit operands lost the carry.
+                        // A module- or package-scope task's formal sized by a
+                        // parameter (`input [W-1:0] v`) gives its width too.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => self.eval_expr(&args[i]),
+                            None => match width {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {

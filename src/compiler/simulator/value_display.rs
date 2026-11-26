@@ -186,16 +186,60 @@ impl Simulator {
             .return_type
             .clone();
         let su = self.unpacked_struct_of(&rt)?;
-        let plain = su.members.iter().all(|m| {
-            m.declarators.iter().all(|d| d.dimensions.is_empty())
-                && !matches!(self.resolve_dt_ref(&m.data_type), DataType::Struct(_))
-        });
-        if !plain {
+        if !self.struct_members_plain(&su) {
             return None;
         }
         let v = self.eval_expr(arg);
+        self.render_p_plain_struct_value(&su, &v)
+    }
+
+    /// Whether every member of `su` is a scalar of a non-struct type.
+    fn struct_members_plain(&self, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().all(|m| {
+            m.declarators.iter().all(|d| d.dimensions.is_empty())
+                && !matches!(self.resolve_dt_ref(&m.data_type), DataType::Struct(_))
+        })
+    }
+
+    /// §21.2.1.7: `%p` of a value-parameter declared with a structure type
+    /// (`localparam s_t P = '{3, 4};`), member by member. The parameter holds
+    /// the members' packed concatenation, so it printed as one number.
+    /// `None` for any other name, or an unpacked structure with an
+    /// aggregate member.
+    pub(super) fn render_p_struct_param(&mut self, name: &str) -> Option<String> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
+            return None;
+        }
+        let dt = self.module.param_decl_types.get(name)?.clone();
+        // A packed array of structures (`ps_t [1:0] P`) is not one structure.
+        if matches!(&dt, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()) {
+            return None;
+        }
+        let v = self.module.parameters.get(name)?.clone();
+        let DataType::Struct(su) = self.resolve_dt(&dt) else {
+            return None;
+        };
+        if su.packed {
+            return Some(self.render_p_packed(&v, &su));
+        }
+        if !self.struct_members_plain(&su) {
+            return None;
+        }
+        self.render_p_plain_struct_value(&su, &v)
+    }
+
+    /// The members of the plain unpacked structure `su` held packed in `v`.
+    fn render_p_plain_struct_value(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+    ) -> Option<String> {
         let leaves: HashMap<String, Value> =
-            self.split_packed_struct("", &su, &v).into_iter().collect();
+            self.split_packed_struct("", su, v).into_iter().collect();
         let mut parts = Vec::new();
         for m in &su.members {
             for d in &m.declarators {
@@ -548,7 +592,8 @@ impl Simulator {
         if let Some(p) = td.ports.iter().find(|p| p.name.name == name) {
             return Some(p.data_type.clone());
         }
-        for st in &td.items {
+        let items = self.module.resolved_task_items(task, td);
+        for st in items.iter() {
             if let StatementKind::VarDecl {
                 data_type,
                 declarators,

@@ -298,6 +298,13 @@ fn print_usage() {
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  <file>.c/.cc/.cpp/.cxx/.C  A DPI C/C++ source, on the command line or in a -f");
+    eprintln!("                   list: compiled with $CC/$CXX (else clang/clang++, else cc/c++)");
+    eprintln!("                   with xezim's svdpi.h and vpi_user.h on the include path,");
+    eprintln!("                   linked with any listed .o/.a into one library cached under");
+    eprintln!("                   $XEZIM_CACHE_DIR, $XDG_CACHE_HOME or ~/.cache (xezim/dpi),");
+    eprintln!("                   and loaded like --dpi-lib. A listed .so/.dylib/.dll is loaded");
+    eprintln!("                   as --dpi-lib");
     eprintln!("  --show-env-avail Print every XEZIM_* environment variable with a description");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
@@ -449,6 +456,8 @@ fn print_usage() {
     eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
     eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
+    eprintln!("  -CFLAGS \"<args>\", -LDFLAGS \"<args>\"  Extra compiler / linker arguments");
+    eprintln!("                   for the DPI C/C++ sources (-ccflags, -ldflags are the same)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
     eprintln!(
@@ -1647,14 +1656,15 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
     let mut top_level_bind = false;
     // Open unit keywords, innermost last.
     let mut stack: Vec<&str> = Vec::new();
-    let mut prev: &str = "";
+    let mut prev_was_typedef = false;
     let mut i = 0usize;
     while i < toks.len() {
-        let t = &toks[i];
-        let text_s = t.text.as_str();
+        let t = toks[i];
+        let text_cow = toks.text(t);
+        let text_s = text_cow.as_ref();
         if matches!(t.kind, TK::Identifier | TK::EscapedIdentifier) {
             refs.insert(text_s.to_string());
-            prev = text_s;
+            prev_was_typedef = false;
             i += 1;
             continue;
         }
@@ -1673,10 +1683,10 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
             // interface scope for it, or the missing `endinterface` unbalances
             // everything that follows.
             let iface_class =
-                kind == "interface" && toks.get(i + 1).is_some_and(|n| n.text == "class");
+                kind == "interface" && toks.get(i + 1).is_some_and(|n| toks.text(n) == "class");
             // `typedef class C;` is a §6.18 forward declaration, not a
             // definition; the real one may live in another file entirely.
-            let fwd = kind == "class" && prev == "typedef";
+            let fwd = kind == "class" && prev_was_typedef;
             if !iface_class && !fwd {
                 let top_level = stack.iter().all(|s| *s == "package");
                 if top_level {
@@ -1684,13 +1694,13 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
                     // the name (`module automatic m`, `class static C`).
                     let mut j = i + 1;
                     while toks.get(j).is_some_and(|n| {
-                        matches!(n.text.as_str(), "static" | "automatic" | "virtual")
+                        matches!(toks.text(n).as_ref(), "static" | "automatic" | "virtual")
                     }) {
                         j += 1;
                     }
                     if let Some(n) = toks.get(j) {
                         if matches!(n.kind, TK::Identifier | TK::EscapedIdentifier) {
-                            declared.push(n.text.clone());
+                            declared.push(toks.text(n).into_owned());
                         }
                     }
                 }
@@ -1712,7 +1722,7 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
         } else if text_s == "bind" && stack.is_empty() {
             top_level_bind = true;
         }
-        prev = text_s;
+        prev_was_typedef = t.kind == TK::KwTypedef;
         i += 1;
     }
     (declared, refs, top_level_bind)
@@ -1979,13 +1989,13 @@ fn append_adopted_libs_to_merged(
         let _ = strip_duplicate_unit_typedefs(&primary, &mut seen_typedefs);
     }
     for (path, mods) in &adopted {
-        // Preprocess with the SAME context the -v/-y indexing pass used
-        // (fresh preprocessor, run include dirs, post-primary macro
-        // snapshot) so the appended text has its includes inlined and
-        // macros expanded. Raw bytes broke the standalone re-compile the
-        // moment merged.sv left the original directory: the library's
-        // relative include paths no longer resolved and its macros came
-        // out undefined.
+        // The text the -v/-y indexing pass preprocessed the file to (run
+        // include dirs, and the macros the design and the library files
+        // read before it left, §22.5.1), so the appended text has its
+        // includes inlined and macros expanded. Raw bytes broke the
+        // standalone re-compile the moment merged.sv left the original
+        // directory: the library's relative include paths no longer
+        // resolved and its macros came out undefined.
         let (text, how) = match xezim::preprocess_adopted_lib(path) {
             Some(t) => (t, "preprocessed"),
             None => match std::fs::read(path) {
@@ -2021,6 +2031,8 @@ fn append_adopted_libs_to_merged(
             how,
             mods.join(", ")
         ));
+        // Each adopted library starts its own directive context (§22.2).
+        extra.push_str("`default_nettype wire\n");
         extra.push_str(&text);
         if !extra.ends_with('\n') {
             extra.push('\n');
@@ -3561,6 +3573,21 @@ fn run_main() -> i32 {
         _ => {}
     }
 
+    // C/C++ DPI sources, object files, archives and shared libraries named
+    // among the design files, on the command line or in a `-f` list, are not
+    // HDL: they are built into (or are) DPI libraries and loaded as
+    // `--dpi-lib` is (src/dpi_sources.rs).
+    let foreign = xezim::dpi_sources::ForeignInputs::take_from(&mut source_files);
+    // A compiled artifact holds the elaborated design only, as it holds no
+    // `--dpi-lib` library: the run that loads it must name the files again.
+    if mode == Mode::Compile && _output_file.is_some() && !foreign.is_empty() {
+        eprintln!(
+            "[xezim][warning] the compiled artifact does not include the DPI C/C++ file(s) {}; \
+             name them again when running it",
+            foreign.files().collect::<Vec<_>>().join(", ")
+        );
+    }
+
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so
     // the list still appears when a file is missing or fails to parse — that
@@ -3575,6 +3602,12 @@ fn run_main() -> i32 {
                 sf,
                 if exists { "" } else { "   [NOT FOUND]" }
             );
+        }
+        if !foreign.is_empty() {
+            println!("--- DPI C/C++ file(s): {} ---", foreign.files().count());
+            for f in foreign.files() {
+                println!("  {}", f);
+            }
         }
         if !lib_files.is_empty() {
             println!("--- -v library file(s): {} ---", lib_files.len());
@@ -3715,6 +3748,37 @@ suppressed but the explicit SDF annotation still applies."
     // every simulation log identifies the exact binary that produced it.
     if mode == Mode::Simulate {
         print_simulation_banner();
+    }
+
+    // The DPI C/C++ sources: compiled and linked into one cached library,
+    // loaded after the `--dpi-lib` libraries, with the shared libraries
+    // named among the files. Only a simulation loads DPI code.
+    if mode == Mode::Simulate && !foreign.is_empty() {
+        let built = if foreign.needs_build() {
+            xezim::dpi_sources::default_cache_dir().and_then(|cache| {
+                xezim::dpi_sources::build_library(
+                    &foreign,
+                    &compat.dpi_cflags,
+                    &compat.dpi_ldflags,
+                    &cache,
+                )
+            })
+        } else {
+            Ok(None)
+        };
+        match built {
+            Ok(lib) => dpi_libs.extend(lib.map(|p| p.to_string_lossy().into_owned())),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        dpi_libs.extend(
+            foreign
+                .shared_libraries
+                .iter()
+                .map(|p| xezim::dpi_sources::loadable_path(p)),
+        );
     }
 
     if design_cache_enabled && mode == Mode::Simulate {
@@ -4088,6 +4152,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
@@ -4142,6 +4207,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
@@ -4180,6 +4246,10 @@ suppressed but the explicit SDF annotation still applies."
                 *t = rewritten;
             }
         }
+        // A saved image can be loaded later with a VPI or DPI library (§38.34).
+        xezim_core::elaborate::set_vpi_net_drivers(
+            _output_file.is_some() || !vpi_libs.is_empty() || !dpi_libs.is_empty(),
+        );
         match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),
@@ -4378,11 +4448,17 @@ suppressed but the explicit SDF annotation still applies."
 }
 
 /// §20.10: translate end-of-run severity state into a process exit status.
-/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// A run that a signal stopped exits 128 + the signal number. `$fatal` must
+/// never exit 0 — its finish_number is a diagnostics level, not
 /// a success code, so any `$fatal` fails the run. `$error` only fails when the
 /// user opts in with `--error-exit` (matching the "promote errors" switch other
 /// simulators provide), so existing flows that tolerate errors keep working.
 fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    // A run that SIGINT or SIGTERM stopped exits 128 + the signal (130,
+    // 143), after the dumps are finalized: it did not run to its end.
+    if let Some(code) = xezim::compiler::interrupted_exit_status() {
+        return code;
+    }
     if sim.saw_fatal {
         return 1;
     }

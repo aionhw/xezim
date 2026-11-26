@@ -73,16 +73,14 @@ endmodule
     );
 }
 
-/// The interception must still serve real containers: a mailbox `put`
-/// from inside a function body still delivers (the regression risk of
-/// falling through to generic dispatch).
+/// §13.4, §15.4: a function can use the nonblocking mailbox operation.
 #[test]
-fn real_mailbox_put_from_function_still_delivers() {
+fn real_mailbox_try_put_from_function_delivers() {
     const SRC: &str = "module tb;
   mailbox mb;
   int got;
   function void produce();
-    mb.put(42);
+    void'(mb.try_put(42));
   endfunction
   initial begin
     mb = new();
@@ -95,7 +93,7 @@ endmodule
     assert_eq!(
         u(&sim, "got"),
         42,
-        "mailbox put from a function still delivers"
+        "mailbox try_put from a function delivers"
     );
 }
 

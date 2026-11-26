@@ -20,13 +20,13 @@ module tb;
    int mt;                     // module-scope scalar
    int ma [4];                 // module-scope array
 
-   task automatic chk(input int id, input int got, input int exp);
+   function automatic void chk(input int id, input int got, input int exp);
       checks++;
       if (got !== exp) begin
          errors++;
          $display("CHECK_FAIL id=%0d got=%0d exp=%0d", id, got, exp);
       end
-   endtask
+   endfunction
 
    // UNSAT: 4 elements bounded to [20:60] can never sum to 999999
    function void rollback_static_fn();

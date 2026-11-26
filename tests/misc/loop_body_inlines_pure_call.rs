@@ -84,7 +84,7 @@ endmodule
 "#);
     // 1<<3 and 1<<5; an X shift amount yields an all-X result. Reference-verified.
     assert!(
-        text.contains("R v0_3=8 v1_5=20 vx=x"),
+        text.contains("R v0_3=8 v1_5=20 vx=xxxx"),
         "inlined helper produced wrong values:\n{text}"
     );
     // And the loop must be COMPILED — that is the whole point.

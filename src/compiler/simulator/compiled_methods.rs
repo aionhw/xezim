@@ -1014,7 +1014,21 @@ impl Simulator {
                 break;
             }
             for p in cd.string_properties.iter() {
-                if !cd.static_properties.contains(p) && !self.shadowed_prop_names.contains(p) {
+                // §6.16, §7: `string_properties` lists every property declared
+                // `string`, collections of strings too (`string q[$]`); only a
+                // scalar is a string member. A collection of strings
+                // (`class_string_coll_member_names`) is read and written
+                // element-wise, never as one packed value.
+                let unpacked = cd.queue_properties.contains_key(p)
+                    || cd.assoc_properties.contains_key(p)
+                    || cd.array_properties.contains_key(p)
+                    || cd.array_nd_properties.contains_key(p)
+                    || cd.array_of_coll_properties.contains_key(p)
+                    || cd.prop_coll_shapes.contains_key(p);
+                if !unpacked
+                    && !cd.static_properties.contains(p)
+                    && !self.shadowed_prop_names.contains(p)
+                {
                     out.insert(p.clone());
                 }
             }
@@ -1642,7 +1656,7 @@ impl Simulator {
     pub(super) fn free_call_pkg(
         &mut self,
         call_name: &str,
-        decl_name: &str,
+        fd: &crate::ast::decl::FunctionDeclaration,
     ) -> Option<std::rc::Rc<str>> {
         if let Some(p) = self.free_call_pkgs.get(call_name) {
             return p.clone();
@@ -1650,13 +1664,27 @@ impl Simulator {
         let p: Option<std::rc::Rc<str>> = match call_name.rsplit_once("::") {
             Some((pkg, _)) => Some(std::rc::Rc::from(pkg)),
             None => self
-                .module
-                .func_decl_scope
-                .get(decl_name)
-                .map(|p| std::rc::Rc::from(p.as_str())),
+                .subroutine_decl_scope(&fd.name.name.name, fd.span, false)
+                .map(std::rc::Rc::from),
         };
         self.free_call_pkgs.insert(call_name.to_string(), p.clone());
         p
+    }
+
+    /// Does `body` declare, at any depth, a virtual-interface local (also
+    /// through a class-scoped typedef, `decl_is_virtual_iface`)?
+    fn declares_vif_local(&self, body: &[Statement]) -> bool {
+        use crate::ast::stmt::StatementKind;
+        body.iter().any(|s| match &s.kind {
+            StatementKind::VarDecl { data_type, .. } => self.decl_is_virtual_iface(data_type),
+            _ => self.declares_vif_local_in(&Self::sub_stmts(s)),
+        })
+    }
+
+    fn declares_vif_local_in(&self, stmts: &[&Statement]) -> bool {
+        stmts
+            .iter()
+            .any(|s| self.declares_vif_local(std::slice::from_ref(*s)))
     }
 
     /// class-perf free-function tier: run a package/module-scope FUNCTION
@@ -1902,6 +1930,16 @@ impl Simulator {
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }
+            // §25.9, Table 6-7: a virtual-interface local starts null and an
+            // assignment binds it to an interface instance, both through the
+            // interpreter's declaration and assignment arms. Compiled it was
+            // an integral register: `v == null` read 0 before any
+            // assignment, and an assignment bound nothing.
+            if self.declares_vif_local(body) {
+                trace_decline("vif-local");
+                self.compiled_method_skip.insert((cid, mid, spec_id));
+                return None;
+            }
             // A wait-free TASK compiles exactly like a `function void`: the
             // compiler bails on any timing control (allow_waits=false), so a
             // task whose body compiles is purely sequential and the
@@ -2051,7 +2089,11 @@ impl Simulator {
                 // Collection return: the VALUE leaves via the side channel;
                 // the result register is never consumed by the caller.
                 (0u32, false)
-            } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
+            } else if let Some(pair) = self.scalar_integral_in(
+                &_f.return_type,
+                self.method_typedef_types(),
+                self.method_typedef_widths(),
+            ) {
                 pair
             } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
                 // Step 6: an enum RETURN is integral — width of the enum's base
@@ -2235,11 +2277,17 @@ impl Simulator {
                 resolve_type_width(
                     &pre.return_type,
                     Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
+                    Some(self.method_typedef_widths()),
                 )
             } else {
-                let scope = self.instance_param_scope(handle);
-                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+                let values: HashMap<String, Value> =
+                    self.instance_value_params(handle).into_iter().collect();
+                let scope = self.instance_param_env(&values);
+                super::elaborate::resolve_type_width_env(
+                    &pre.return_type,
+                    Some(&scope),
+                    Some(self.method_typedef_widths()),
+                )
             };
             if w > 0 { w } else { pre.static_result_width }
         } else {
@@ -2484,6 +2532,29 @@ impl Simulator {
                     for ip in instance_props.iter() {
                         static_members.remove(ip);
                         const_names.remove(ip);
+                    }
+                    // §8.9, §7: a STATIC collection (associative array,
+                    // queue, dynamic or fixed-size array) has no scalar cell
+                    // for `LoadClassStatic` to read: its elements, methods
+                    // and whole-value reads keep their collection paths, and
+                    // any other spelling of it (`this.fa[i]`, `fa` passed
+                    // whole) stays on the interpreter.
+                    let mut cur = Some(cname.to_string());
+                    let mut guard = 0;
+                    while let Some(cn) = cur
+                        && guard < 64
+                    {
+                        guard += 1;
+                        let Some(cd) = self.module.classes.get(&cn) else {
+                            break;
+                        };
+                        let colls = cd.static_collections.iter().map(|(n, ..)| n);
+                        for n in colls.chain(cd.static_fixed_arrays.iter().map(|(n, ..)| n)) {
+                            if static_members.remove(n) {
+                                shadow_names.insert(n.clone());
+                            }
+                        }
+                        cur = cd.extends.clone();
                     }
                     // A localparam lives in BOTH sets after the union
                     // walk; it is READ-ONLY — drop it from the writable
@@ -2880,6 +2951,10 @@ impl Simulator {
                         let strings = self.class_string_coll_member_names(class);
                         let packed = self.class_coll_elem_packed_dims(class);
                         let mut colls = super::bytecode::ClassColls::default();
+                        colls.row_members = owners.iter()
+                            .filter(|(name, (_, cd))| cd.prop_coll_shapes.contains_key(name.as_str()))
+                            .map(|(name, _)| name.clone())
+                            .collect();
                         colls.members = self
                             .class_coll_member_names(class)
                             .into_iter()
@@ -3032,6 +3107,30 @@ impl Simulator {
                                         .or_default()
                                         .insert(index);
                                 }
+                                if self.formal_is_unpacked_collection(class, port) {
+                                    facts
+                                        .coll_formal_positions
+                                        .entry((class.clone(), name.clone()))
+                                        .or_default()
+                                        .insert(index);
+                                }
+                            }
+                        }
+                    }
+                    // §13.5.1: a free function or task called from a method
+                    // body binds its unpacked formals the same way.
+                    let free_ports = (self.module.functions.iter())
+                        .map(|(n, f)| (n, &f.ports))
+                        .chain(self.module.tasks.iter().map(|(n, t)| (n, &t.ports)));
+                    for (key, ports) in free_ports {
+                        let name = key.rsplit(['.', ':']).next().unwrap_or(key);
+                        for (index, port) in ports.iter().enumerate() {
+                            if self.formal_is_unpacked_collection("", port) {
+                                facts
+                                    .coll_formal_positions
+                                    .entry((String::new(), name.to_string()))
+                                    .or_default()
+                                    .insert(index);
                             }
                         }
                     }
@@ -3236,6 +3335,12 @@ impl Simulator {
                         &self.module.queue_vars,
                     );
                     compiler.method_enum_constants = method_enum_constants;
+                    compiler.method_pkg = cname
+                        .strip_prefix("__free_fn__")
+                        .filter(|p| !p.is_empty())
+                        .or_else(|| self.module.class_decl_pkg.get(cname).map(String::as_str))
+                        .map(|p| (p.to_string(), &self.module.parameters));
+                    compiler.method_pkg_imports = Some(&self.module.def_pkg_imports);
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
                         None => {
@@ -3303,6 +3408,11 @@ impl Simulator {
                         }
                     }
                     compiler.set_dpi_import_fds(dpi_fds);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     if method_trace_enabled() {
                         compiler.diagnostic_scope = Some(format!("{}.{}", cname, method_name));
                     }
@@ -3737,7 +3847,7 @@ impl Simulator {
         if result.is_real && !pre.is_class_result && !pre.is_void_result {
             result = Self::compiled_ret_from_real(&result, result_width);
         }
-        if result_width > 0 && result.width != result_width {
+        if result_width > 0 && (result.width != result_width || result.is_fill) {
             result = result.resize_for_assign(result_width);
         }
         if !pre.is_class_result && !pre.is_void_result && !result.is_real {
@@ -3817,7 +3927,7 @@ impl Simulator {
                     continue;
                 }
                 let copy_in = matches!(port.direction, PortDirection::Ref | PortDirection::Inout);
-                let real = matches!(port.data_type, crate::ast::types::DataType::Real { .. });
+                let real = self.dt_is_real(&port.data_type);
                 if !copy_in || real || !scalar.contains(&i) {
                     never(self);
                     return None;
@@ -3899,13 +4009,15 @@ impl Simulator {
         // the declared width and stamp; other packed formals keep width.
         use crate::ast::types::DataType as DT;
         let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(f.ports.len());
-        for port in f.ports.iter() {
+        for (i, port) in f.ports.iter().enumerate() {
             let dt = &port.data_type;
             let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
                 (0, None)
             } else if matches!(dt, DT::TypeReference { .. }) {
                 if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
-                    (pw, Some(signed))
+                    // `scalar_formal_integral` sizes a class typedef from module
+                    // scope; the plan's width is this specialization's.
+                    (pre.formal_widths.get(i).copied().unwrap_or(pw), Some(signed))
                 } else if self.type_is_signed_concrete(dt) {
                     (0, Some(true))
                 } else {
@@ -3938,7 +4050,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)
@@ -4074,10 +4186,10 @@ impl Simulator {
         // width resolution is fully deterministic. Mirror it so the block
         // cache key matches.
         let result_width = if pre.param_able_result {
-            let scope = self.instance_param_scope(0);
+            // Handle 0 binds no class parameters: the design table alone.
             let w = super::elaborate::resolve_type_width(
                 &pre.return_type,
-                Some(&scope),
+                Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
             if w > 0 { w } else { pre.static_result_width }
@@ -4163,7 +4275,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)
@@ -4976,6 +5088,24 @@ impl Simulator {
         )
     }
 
+    /// Is `port`, a formal of a method of `class_name`, declared with unpacked
+    /// dimensions, either directly or through a typedef?
+    fn formal_is_unpacked_collection(
+        &self,
+        class_name: &str,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> bool {
+        if !port.dimensions.is_empty() {
+            return true;
+        }
+        let DataType::TypeReference { name, .. } = &port.data_type else {
+            return false;
+        };
+        Self::typedef_dims_via_tables(&self.module, class_name, &name.qualified())
+            .or_else(|| Self::typedef_dims_via_tables(&self.module, class_name, &name.name.name))
+            .is_some_and(|dims| !dims.is_empty())
+    }
+
     /// class-perf row 2: argument positions of `class_name::method` whose
     /// formals are NON-INPUT plain scalars (output / inout / ref; integral,
     /// string, enum or class-handle typed, no dimensions) — exactly the set
@@ -4987,7 +5117,14 @@ impl Simulator {
         class_name: &str,
         method: &str,
     ) -> Vec<usize> {
-        let Some(md) = self.method_defining_class(class_name, method) else {
+        // §6.18, §8.23, §8.25.1: a class-scope receiver may be a typedef of
+        // the class, a class type parameter or a `C#(..)` text; it names the
+        // class the call itself dispatches to (`exec_class_scope_static_call`).
+        // Only a name that is no class pays for the resolution.
+        let Some(md) = self.method_defining_class(class_name, method).or_else(|| {
+            let (base, _) = self.resolve_class_scope_prefix(class_name)?;
+            self.method_defining_class(&base, method)
+        }) else {
             return Vec::new();
         };
         // §13.5: task and function formals bind the same way; a task callee
@@ -5045,6 +5182,9 @@ impl Simulator {
         base: usize,
         n: usize,
     ) -> (Vec<Expression>, bool) {
+        if n == 0 {
+            return (Vec::new(), false);
+        }
         let pos = self.vm_writeback_scalar_positions(class_name, method);
         if pos.is_empty() || self.local_stack.is_empty() {
             let mut args = Vec::with_capacity(n);
@@ -5515,8 +5655,11 @@ impl Simulator {
         if let Some(t) = self.class_prop_type_named(type_name, member) {
             return Some(t);
         }
-        if let Some(dt) = self.module.typedef_types.get(type_name).cloned() {
-            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+        // Read the typedef in place: a register-block struct has hundreds
+        // of members, and this runs for every dotted name the interpreter
+        // reads or writes (`dotted_name_declared_class`).
+        if let Some(dt) = self.module.typedef_types.get(type_name) {
+            let resolved = Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types);
             if let DataType::Struct(su) = resolved {
                 for m in &su.members {
                     for d in &m.declarators {
@@ -5525,7 +5668,7 @@ impl Simulator {
                                 return Some(name.name.name.clone());
                             }
                             if let DataType::TypeReference { name, .. } =
-                                self.resolve_dt(&m.data_type)
+                                self.resolve_dt_ref(&m.data_type)
                             {
                                 return Some(name.name.name.clone());
                             }

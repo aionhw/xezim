@@ -128,6 +128,11 @@ bug":
   always blocks.
 - `XEZIM_ACTIVE_REGION=0` — resumed waiters run after the NBA commit
   (post-NBA reads) instead of inline in the active region.
+- `XEZIM_WAITER_INDEX=0` — examine every parked `@(...)` waiter at each
+  scheduling pass, not only those whose signals were written. Results are
+  the same either way; `XEZIM_WAITER_INDEX_SHADOW=1` examines all of them
+  and stops at a waiter the index would have skipped although its signal
+  changed (a write that went unnoticed).
 
 If a testbench passes only with one of these set, it has a same-edge race;
 the default matches commercial behavior.

@@ -27,6 +27,7 @@ fn run_profiled(src: &str) -> String {
             "--no-cache",
         ])
         .env("XEZIM_PROFILE_TIMING", "1")
+        .env("XEZIM_PROC_LOOP_STATS", "1")
         .output()
         .expect("run profiled design");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -87,4 +88,54 @@ endmodule
     assert!(text.contains("R 2.0000 0.0040 500.0"), "{text}");
     assert_eq!(entry_hist(&text, "contassign_ast"), 0, "{text}");
     assert!(entry_hist(&text, "contassign_c") >= 3, "{text}");
+}
+
+/// §11.4.1 / §13.4: assignments to local loop counters are pure. The two
+/// counter forms must produce the same values on successive compiled calls.
+#[test]
+fn local_assignment_loop_steps_compile() {
+    let text = run_profiled(r#"
+module top;
+  function automatic int f(input int x);
+    int i, j, a;
+    a=0;
+    for (i=0; i<3; i=i+1)
+      for (j=0; j<2; j+=1) a += x+i+j;
+    return a;
+  endfunction
+  int x=1;
+  wire [31:0] out=f(x);
+  initial begin #1 $display("first=%0d",out);
+    x=2; #1 $display("second=%0d",out);
+  end
+endmodule
+"#);
+    assert!(text.contains("first=15") && text.contains("second=21"), "{text}");
+    assert_eq!(entry_hist(&text, "contassign_ast"), 0, "{text}");
+    assert!(entry_hist(&text, "contassign_c") > 0, "{text}");
+}
+
+/// §20.8.2: both a cold branch and an executed math call retain the timed
+/// process bytecode. The helper's formal deliberately shadows module state.
+#[test]
+fn stepped_math_uses_the_inlined_arguments() {
+    let text = run_profiled(r#"
+`timescale 1ns/1ns
+module stepper;
+  real v=81.0, x=4.0;
+  int count=0, k=0;
+  function automatic real f(input real v); return $sqrt(v); endfunction
+  always #2 begin
+    count=count+1;
+    if(count==2) begin x=f(x)+$tanh(0.0); k=$rtoi(-2.75); end
+    if(count<0) x=$hypot(x,v);
+  end
+endmodule
+module top;
+  stepper run();
+  initial begin #7 $display("math=%0.2f count=%0d integer=%0d",run.x,run.count,run.k); $finish; end
+endmodule
+"#);
+    assert!(text.contains("math=2.00 count=3 integer=-2"), "{text}");
+    assert!(text.lines().any(|l| l.contains("[PROC-FSM] registered") && l.contains("run")), "{text}");
 }

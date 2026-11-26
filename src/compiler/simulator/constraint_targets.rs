@@ -4,6 +4,13 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Result of picking a trial length for a dynamic array in `solve_array_sizes`.
+pub(super) enum PickedSize {
+    Unconstrained,
+    Size(u64),
+    Impossible,
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum CompiledForeachCheck {
     /// A member (`off`, `width`) of an unsigned packed struct element equals
@@ -1222,19 +1229,24 @@ impl Simulator {
     /// queue, BEFORE any element is solved: the element set does not exist
     /// until the array has a length. Rows of a 2-D dynamic array are sized
     /// from the `foreach (m[i]) m[i].size() == …` body.
+    ///
+    /// Returns `false` when an `a.size() == E` target is negative or exceeds
+    /// the per-trial allocation cap (`1 << 16`), so the trial can skip
+    /// element drawing and `foreach` repair and move directly to the redraw.
     pub(super) fn solve_array_sizes(
         &mut self,
         colls: &[RandColl],
         constraints: &[ClassConstraint],
-    ) {
+    ) -> bool {
         for c in colls {
             if c.kind != CollKind::Dyn {
                 continue;
             }
             let cur = self.get_queue_size(&c.scoped);
             let n = match self.pick_size(&c.prop, None, constraints) {
-                Some(n) => n,
-                None => cur,
+                PickedSize::Size(n) => n,
+                PickedSize::Unconstrained => cur,
+                PickedSize::Impossible => return false,
             };
             if c.row_tail.is_some() {
                 self.resize_row_owner(c, n);
@@ -1246,14 +1258,17 @@ impl Simulator {
                 for i in 0..n {
                     let row = format!("{}[{}]", c.scoped, i);
                     let cur_row = self.get_queue_size(&row);
-                    let m = self
-                        .pick_size(&c.prop, Some(i as i64), constraints)
-                        .unwrap_or(cur_row);
+                    let m = match self.pick_size(&c.prop, Some(i as i64), constraints) {
+                        PickedSize::Size(m) => m,
+                        PickedSize::Unconstrained => cur_row,
+                        PickedSize::Impossible => return false,
+                    };
                     self.resize_coll(&row, m);
                     self.module.dynamic_arrays.insert(row);
                 }
             }
         }
+        true
     }
 
     /// The row shape of the dynamic member `prop` of `cd` declared over
@@ -1325,18 +1340,22 @@ impl Simulator {
         self.set_queue_size(scoped, n);
     }
 
+    /// Maximum per-trial dynamic-array length accepted for an exact `.size()` equality.
+    const MAX_TRIAL_EQ_SIZE: u64 = 1 << 16;
+
     /// Pick a length for `prop` (or for row `row` of it) from the constraint
-    /// set. `None` when the array's size is unconstrained — the caller keeps
-    /// the current length (§18.4: an unconstrained rand dynamic array is not
-    /// re-shaped by xezim; only its elements are drawn).
+    /// set. `Unconstrained` when the array's size is unconstrained — the caller
+    /// keeps the current length (§18.4: an unconstrained rand dynamic array is
+    /// not re-shaped by xezim; only its elements are drawn).
     pub(super) fn pick_size(
         &mut self,
         prop: &str,
         row: Option<i64>,
         constraints: &[ClassConstraint],
-    ) -> Option<u64> {
+    ) -> PickedSize {
         use rand::Rng;
         let mut exact: Option<u64> = None;
+        let mut impossible = false;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut lo_b: u64 = 0;
         let mut hi_b: u64 = 64;
@@ -1348,6 +1367,7 @@ impl Simulator {
         for kind in items {
             match kind {
                 SizeCon::Eq(n) => exact = Some(n),
+                SizeCon::Impossible => impossible = true,
                 SizeCon::In(rs) => ranges.extend(rs),
                 SizeCon::Dist(items) => dist = Some(items),
                 SizeCon::Rel(op, v) => {
@@ -1362,8 +1382,11 @@ impl Simulator {
                 }
             }
         }
+        if impossible {
+            return PickedSize::Impossible;
+        }
         if let Some(n) = exact {
-            return Some(n.min(1 << 16));
+            return PickedSize::Size(n);
         }
         // §18.5.4: a dist on the size draws it by weight on every randomize,
         // within whatever bounds the other size constraints set. Without it
@@ -1389,22 +1412,22 @@ impl Simulator {
                 };
                 let n = if h > l { self.rng.gen_range(l..=h) } else { l };
                 if admits(n) {
-                    return Some(n.min(1 << 16));
+                    return PickedSize::Size(n.min(Self::MAX_TRIAL_EQ_SIZE));
                 }
             }
         }
         if !ranges.is_empty() {
             let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
-            return Some(if h > l { self.rng.gen_range(l..=h) } else { l });
+            return PickedSize::Size(if h > l { self.rng.gen_range(l..=h) } else { l });
         }
         if bounded && lo_b <= hi_b {
-            return Some(if hi_b > lo_b {
+            return PickedSize::Size(if hi_b > lo_b {
                 self.rng.gen_range(lo_b..=hi_b)
             } else {
                 lo_b
             });
         }
-        None
+        PickedSize::Unconstrained
     }
 
     /// Collect the `.size()` constraints that apply to `prop` (when `row` is
@@ -1597,8 +1620,8 @@ impl Simulator {
                         let other = (**other).clone();
                         match eff {
                             BinaryOp::Eq => {
-                                if let Some(n) = self.eval_expr(&other).to_u64() {
-                                    out.push(SizeCon::Eq(n));
+                                if let Some(sc) = self.eval_eq_size(&other) {
+                                    out.push(sc);
                                 }
                             }
                             BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
@@ -1630,6 +1653,37 @@ impl Simulator {
             _ => {}
         }
         out
+    }
+
+    /// Evaluate an exact `.size() == other` target, flagging negative signed
+    /// targets or lengths above `MAX_TRIAL_EQ_SIZE` as `SizeCon::Impossible`.
+    fn eval_eq_size(&mut self, other: &Expression) -> Option<SizeCon> {
+        let v = self.eval_expr(other);
+        if v.is_real {
+            return None;
+        }
+        if !v.has_xz() {
+            if v.is_signed {
+                let neg = if v.width > 64 {
+                    v.get_bit((v.width - 1) as usize) == LogicBit::One
+                } else {
+                    v.to_i64().is_some_and(|i| i < 0)
+                };
+                if neg {
+                    return Some(SizeCon::Impossible);
+                }
+            }
+            if v.width > 64 && (64..v.width as usize).any(|b| v.get_bit(b) == LogicBit::One) {
+                return Some(SizeCon::Impossible);
+            }
+        }
+        v.to_u64().map(|n| {
+            if n > Self::MAX_TRIAL_EQ_SIZE {
+                SizeCon::Impossible
+            } else {
+                SizeCon::Eq(n)
+            }
+        })
     }
 
     /// Evaluate a constraint range list to concrete inclusive (lo, hi) pairs.
@@ -4551,6 +4605,7 @@ impl Simulator {
         handle: usize,
         class_name: &str,
         constraints: &[ClassConstraint],
+        colls: &[RandColl],
     ) -> bool {
         let timed_out = self
             .randomize_budget_deadline
@@ -4563,10 +4618,18 @@ impl Simulator {
                     if constraint.name.name == "__back_ref__" {
                         continue;
                     }
-                    if constraint.items.iter().any(|item| {
-                        !Self::constraint_unmodeled(item)
-                            && !self.check_constraint_item(handle, item)
-                    }) {
+                    let scope = self.constraint_scope_of(constraint);
+                    if let Some(s) = &scope {
+                        self.class_context_stack.push(Some(s.clone()));
+                    }
+                    let failed = constraint
+                        .items
+                        .iter()
+                        .any(|item| !self.rand_item_accept(handle, item, colls, &mut false));
+                    if scope.is_some() {
+                        self.class_context_stack.pop();
+                    }
+                    if failed {
                         failed_names.push(constraint.name.name.clone());
                     }
                 }

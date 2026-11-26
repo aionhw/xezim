@@ -54,6 +54,8 @@ mod dyn_array_of_mailboxes;
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]
 mod fixed_array_member_pattern_forms;
+#[path = "collections/fixed_array_row_copy_order.rs"]
+mod fixed_array_row_copy_order;
 #[path = "collections/foreach_assoc_key_types.rs"]
 mod foreach_assoc_key_types;
 #[path = "collections/foreach_blocking_resume.rs"]
@@ -351,8 +353,14 @@ mod assoc_elem_select_read;
 mod assoc_packed_elem;
 #[path = "collections/packed_struct_member_idx_select.rs"]
 mod packed_struct_member_idx_select;
+#[path = "collections/real_unpacked_concat_items.rs"]
+mod real_unpacked_concat_items;
+#[path = "collections/review_unpacked_concat_1322.rs"]
+mod review_unpacked_concat_1322;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
+#[path = "collections/unpacked_concat_fixed_row.rs"]
+mod unpacked_concat_fixed_row;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
@@ -403,5 +411,27 @@ mod dyn_array_of_dyn_array_rows;
 
 #[path = "collections/pattern_array_items.rs"]
 mod pattern_array_items;
+#[path = "collections/pattern_replication_evaluated_once.rs"]
+mod pattern_replication_evaluated_once;
+#[path = "collections/pattern_struct_array_and_slice_items.rs"]
+mod pattern_struct_array_and_slice_items;
+#[path = "collections/pattern_struct_element_items.rs"]
+mod pattern_struct_element_items;
 #[path = "collections/struct_concat_forms.rs"]
 mod struct_concat_forms;
+#[path = "collections/queue_front_shift.rs"]
+mod queue_front_shift;
+#[path = "collections/stream_with_range_1197.rs"]
+mod stream_with_range_1197;
+#[path = "collections/stream_with_range_unpack.rs"]
+mod stream_with_range_unpack;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
+#[path = "collections/pattern_self_read_scopes.rs"]
+mod pattern_self_read_scopes;
+#[path = "collections/queue_pop_drain_loop_1210.rs"]
+mod queue_pop_drain_loop_1210;
+#[path = "collections/unpacked_concat_targets.rs"]
+mod unpacked_concat_targets;
+#[path = "collections/concat_operand_effects.rs"]
+mod concat_operand_effects;

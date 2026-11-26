@@ -3,6 +3,18 @@
 use super::*;
 
 impl Simulator {
+    pub(super) fn method_typedef_widths(&self) -> &super::elaborate::TypedefTable {
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedefs, |t| &t.0)
+    }
+
+    pub(super) fn method_typedef_types(&self) -> &super::elaborate::SharedMap<DataType> {
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedef_types, |t| &t.1)
+    }
+
     /// Declared return width of the function `func` names, without calling it.
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
@@ -94,7 +106,7 @@ impl Simulator {
         if matches!(fd.return_type, DataType::Void { .. }) {
             return None;
         }
-        if matches!(fd.return_type, DataType::Real { .. }) {
+        if self.dt_is_real(&fd.return_type) {
             return Some(64);
         }
         let w = super::elaborate::resolve_type_width(
@@ -190,7 +202,10 @@ impl Simulator {
         while let Some(cd) = self.module.classes.get(&cur) {
             if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
-                    if matches!(f.return_type, DataType::Real { .. }) {
+                    if super::elaborate::is_type_real_resolved(
+                        &f.return_type,
+                        &self.module.typedef_types,
+                    ) {
                         return Some(64);
                     }
                     if matches!(f.return_type, DataType::Void { .. }) {
@@ -199,7 +214,7 @@ impl Simulator {
                     let w = super::elaborate::resolve_type_width(
                         &f.return_type,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     );
                     return (w > 0).then_some(w);
                 }
@@ -550,6 +565,14 @@ impl Simulator {
                             return w;
                         }
                     }
+                }
+                // §7.4.3: after an index the labels count ELEMENTS of the
+                // next dimension — `a[1][4:2]` on `logic [3:0][5:0][7:0] a`
+                // is 24 bits, the context its RHS is evaluated in (§11.6.1).
+                if matches!(rs_base.kind, ExprKind::Index { .. })
+                    && let Some(ew) = self.select_base_elem_stride(rs_base)
+                {
+                    return count.saturating_mul(ew);
                 }
                 count
             }

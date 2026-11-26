@@ -9,7 +9,8 @@
 //! SIGINT/SIGTERM now set a flag that the event loop polls, so the run leaves
 //! through its normal exit and reaches `vcd_finish`/`xtrace_finish`/
 //! `fst_finish`. A second signal restores the default disposition and
-//! re-raises, so an interrupt is never swallowed.
+//! re-raises, so an interrupt is never swallowed. The run then exits 128 +
+//! the signal number (130 here), not 0.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -68,7 +69,12 @@ fn sigint_finalizes_fst_and_vcd() {
         let _ = std::fs::remove_file(p);
     }
 
-    assert!(status.success(), "an interrupted run should exit cleanly");
+    // Through the normal exit, which reports the interrupt: 128 + SIGINT.
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "an interrupted run should leave through its normal exit with status 130"
+    );
 
     // The FST must carry a value-change block, not just a header. A dump that
     // lost its data is a few hundred bytes; one with data is far larger.

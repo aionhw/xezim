@@ -2,8 +2,8 @@
 //! run at a clock fire. Previously the action / `else` action were tallied but
 //! never executed, so a failing `assert property (...) else $error(...)` was
 //! silent — a verification hole. Now the `else` runs on a fail, the pass action
-//! on a non-vacuous pass, a cover action on a match, and a VACUOUS pass runs
-//! nothing. Cross-checked against a reference simulator and a commercial simulator.
+//! on a non-vacuous pass, a cover action on a match, and a vacuous pass runs
+//! its pass action by default (§20.11).
 
 use xezim::simulate;
 
@@ -54,18 +54,18 @@ endmodule
     );
 }
 
-/// A vacuous pass (false antecedent) must NOT run the pass action.
+/// A vacuous pass (false antecedent) runs the pass action.
 #[test]
-fn vacuous_pass_runs_no_action() {
+fn vacuous_pass_runs_action_by_default() {
     let o = out(r#"
 module t; logic clk=0, a=0, b=0; always #5 clk=~clk;
   ap: assert property (@(posedge clk) a |-> b) $display("PASSACT at %0t", $time);
-  initial begin repeat(3) @(posedge clk); $display("DONE"); $finish; end
+  initial begin repeat(3) @(negedge clk); $display("DONE"); $finish; end
 endmodule
 "#);
     assert!(
-        o.contains("DONE") && !o.contains("PASSACT"),
-        "vacuous pass must not run the pass action; got: {}",
+        o.contains("DONE") && o.matches("PASSACT at").count() == 3,
+        "vacuous pass should run the pass action; got: {}",
         o
     );
 }

@@ -1,5 +1,7 @@
 // top: c16_multi
 module c16_multi;
+  // The trace records nonvacuous matches and failures.
+  initial $assertvacuousoff(0);
   bit c1, c2; bit a, b, req, gnt;
   always #5 c1 = ~c1;
   always #7 c2 = ~c2;

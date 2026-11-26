@@ -23,7 +23,11 @@ impl PatternTypeResolver for Simulator {
     }
 
     fn is_type_name(&mut self, name: &str) -> bool {
-        !self.module.parameters.contains_key(name) && self.lookup_typedef_target(name).is_some()
+        self.resolve_type_key_name(name).is_some()
+    }
+
+    fn specialized_type_key(&mut self, e: &Expression) -> Option<DataType> {
+        self.resolve_specialized_class_typedef_expr(e)
     }
 
     fn expr_type(&mut self, e: &Expression) -> Option<DataType> {
@@ -129,8 +133,9 @@ impl Simulator {
         &mut self,
         items: &[AssignmentPatternItem],
         dt: &DataType,
+        is_member: &dyn Fn(&str) -> bool,
     ) -> Option<Value> {
-        let plan = packed_assignment_pattern_plan::default_plan(items, dt, self)?;
+        let plan = packed_assignment_pattern_plan::default_plan(items, dt, self, is_member)?;
         Some(self.exec_packed_assignment_pattern_plan(&plan))
     }
 
@@ -211,13 +216,16 @@ impl Simulator {
         if unpacked(&name.name.name) {
             return None;
         }
+        if let Some((scoped_key, dt)) = self.lookup_hint_scoped_typedef(&name.name.name) {
+            return (!unpacked(&scoped_key)).then_some(dt);
+        }
         self.lookup_typedef_target(&name.name.name).or_else(|| {
             let bound = self.resolve_type_param_binding(&name.name.name)?;
             let bound = bound.trim();
             if unpacked(bound) {
                 return None;
             }
-            self.module.typedef_types.get(bound).cloned()
+            self.resolve_type_binding_dt(bound)
         })
     }
 
@@ -313,6 +321,9 @@ impl Simulator {
     /// The declared type of an assignment target, which a pattern assigned to
     /// it takes (§10.8).
     pub(super) fn lvalue_pattern_type(&mut self, lvalue: &Expression) -> Option<DataType> {
+        if let Some(dt) = self.decl_pattern_type(lvalue) {
+            return Some(dt);
+        }
         if let Some(access) = self.declared_packed_access(lvalue)
             && access.unpacked == 0
         {
@@ -516,13 +527,97 @@ impl Simulator {
         }
     }
 
+    /// Declared type of a variable (or indexed element/slice of one) when
+    /// preserving typedef, signedness, and enum identity.
+    fn decl_pattern_type(&mut self, lvalue: &Expression) -> Option<DataType> {
+        let mut cur = lvalue;
+        let mut index_count = 0usize;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Index { expr, .. } => {
+                    index_count += 1;
+                    cur = expr;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if !h.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        if (h.path.len() == 1 && self.this_prop_hides(&h.path[0].name.name))
+            || (h.path.len() > 1
+                && (matches!(h.path[0].name.name.as_str(), "this" | "super")
+                    || self.bare_name_is_class_channel(&h.path[0].name.name)
+                    || self.hier_parent_handle(h).is_some()))
+        {
+            return None;
+        }
+        let name = self
+            .frame_bound_bare_name(h)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+        if self.is_associative_array(&name) {
+            return None;
+        }
+        let dt = packed_assignment_pattern_plan::declared_type(
+            &name,
+            &self.module.var_decl_types,
+            Some(&self.module.port_aliases),
+        )?
+        .clone();
+        let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
+            dims.len()
+        } else if self.module.arrays_2d.contains_key(&name) {
+            2
+        } else if self.module.arrays.contains_key(&name)
+            || self.module.dynamic_arrays.contains(&name)
+            || self.module.queue_vars.contains(&name)
+        {
+            1
+        } else {
+            0
+        };
+        let packed_selects = index_count.checked_sub(unpacked)?;
+        let peeled = packed_assignment_pattern_plan::peel_packed_dims(&dt, packed_selects, self)?;
+        packed_assignment_pattern_plan::is_packed(&peeled, self).then_some(peeled)
+    }
+
     /// The type of a `base.member...` target whose base is a declared
     /// variable (`s.inner`, `u_inst.s`).
     fn member_path_type(&mut self, lvalue: &Expression) -> Option<DataType> {
-        let flat = self.flat_member_name(lvalue)?;
+        let mut base = lvalue;
+        let mut index_count = 0usize;
+        loop {
+            match &base.kind {
+                ExprKind::Paren(inner) => base = inner,
+                ExprKind::Index { expr, .. } => {
+                    index_count += 1;
+                    base = expr;
+                }
+                _ => break,
+            }
+        }
+        let flat = self.flat_member_name(base)?;
         if flat.contains('[') {
             return None;
         }
+        let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&flat) {
+            dims.len()
+        } else if self.module.arrays_2d.contains_key(&flat) {
+            2
+        } else if self.module.arrays.contains_key(&flat)
+            || self.module.dynamic_arrays.contains(&flat)
+            || self.module.queue_vars.contains(&flat)
+        {
+            1
+        } else {
+            0
+        };
+        let packed_selects = index_count.checked_sub(unpacked)?;
         let mut split = flat.len();
         loop {
             split = flat[..split].rfind('.')?;
@@ -533,9 +628,14 @@ impl Simulator {
             )
             .cloned()
             {
-                return packed_assignment_pattern_plan::member_path_type(
+                let mty = packed_assignment_pattern_plan::member_path_type(
                     &dt,
                     &flat[split + 1..],
+                    self,
+                )?;
+                return packed_assignment_pattern_plan::peel_packed_dims(
+                    &mty,
+                    packed_selects,
                     self,
                 );
             }

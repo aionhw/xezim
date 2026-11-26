@@ -355,6 +355,24 @@ impl Simulator {
                         .map(|(n, _)| n.clone()),
                 );
             }
+            // Class typedefs of a virtual interface (`typedef virtual bus_if
+            // vif_t;`), by leaf: the names `class_scope_typedef_target`
+            // looks up through a class scope. A leaf several classes declare
+            // is keyed `<class>::<leaf>`.
+            let mut vif_typedef_leaves: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                vif_typedef_leaves.extend(
+                    cd.typedef_targets
+                        .iter()
+                        .filter(|(_, dt)| {
+                            matches!(
+                                Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types),
+                                DataType::Interface { .. }
+                            )
+                        })
+                        .map(|(n, _)| n.rsplit("::").next().unwrap_or(n).to_string()),
+                );
+            }
             // Names that can prefix `name::member` without being a class
             // key: class parameters and typedef names (module or class
             // scope) — see `class_scope_member_value`.
@@ -399,6 +417,7 @@ impl Simulator {
                 subroutine_suffixes,
                 alias_typedefs,
                 scoped_typedefs,
+                vif_typedef_leaves,
                 scope_prefixes,
                 param_first,
                 params,
@@ -567,12 +586,19 @@ impl Simulator {
 
     /// `dt` followed through bare typedef names in `typedef_types`, by
     /// reference (no resolved-type clone). Stops at the first non-alias.
+    /// A class-scoped virtual-interface typedef (`cfg_t::vif_t`, §8.23) is
+    /// followed too, so its local's initializer binds the interface.
     pub(super) fn typedef_chain_end<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
         let mut cur = dt;
         for _ in 0..16 {
             match cur {
-                DataType::TypeReference { name, .. } if name.scopes.is_empty() => {
-                    match self.module.typedef_types.get(&name.name.name) {
+                DataType::TypeReference { name, .. } => {
+                    let next = if name.scopes.is_empty() {
+                        self.module.typedef_types.get(&name.name.name)
+                    } else {
+                        self.class_scope_vif_typedef(name)
+                    };
+                    match next {
                         Some(next) if !std::ptr::eq(next, cur) => cur = next,
                         _ => break,
                     }
@@ -657,7 +683,7 @@ impl Simulator {
             DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
             _ => None,
         };
-        let fill = if su.is_none() && super::elaborate::is_type_real(self.resolve_dt_ref(dt)) {
+        let fill = if su.is_none() && self.dt_is_real(dt) {
             // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
             Value::from_f64(0.0)
         } else if su.is_none() && self.type_starts_x(dt) {
@@ -748,10 +774,10 @@ impl Simulator {
     /// are `real`/`shortreal`, so a new element starts at real 0.0.
     pub(super) fn coll_elem_is_real(&self, name: &str) -> bool {
         if let Some(dt) = self.class_member_coll_type(name) {
-            return super::elaborate::is_type_real(self.resolve_dt_ref(dt));
+            return self.dt_is_real(dt);
         }
         self.p_elem_type_ref(name)
-            .is_some_and(|dt| super::elaborate::is_type_real(self.resolve_dt_ref(&dt)))
+            .is_some_and(|dt| self.dt_is_real(&dt))
     }
 
     /// The declared element type of the class-member collection stored at
@@ -887,7 +913,7 @@ impl Simulator {
             };
             let dv = if nested.is_some() {
                 Value::zero(0)
-            } else if super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type)) {
+            } else if self.dt_is_real(&m.data_type) {
                 Value::from_f64(0.0)
             } else if Self::dt_is_class_handle(&m.data_type, &self.module) {
                 // §8.4: a class handle member starts null.
@@ -1041,10 +1067,10 @@ impl Simulator {
                     width: super::elaborate::resolve_type_width(
                         rt,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     ),
                     signed: super::elaborate::is_type_signed(rt),
-                    real: super::elaborate::is_type_real(rt),
+                    real: self.dt_is_real(rt),
                     two_state: super::elaborate::is_type_two_state(rt),
                     class,
                     collection: self.fn_returns_collection(rt),
@@ -1632,6 +1658,7 @@ impl Simulator {
                 // actual on return (e.g. `randomize_instr(output riscv_instr
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
                 let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                let mut ref_aliases: HashMap<String, String> = HashMap::default();
                 // §25.9 __vif_local__: record vif actuals under formal names.
                 // A plain scalar or class formal cannot be bound to an
                 // interface; its actual is not resolved (a stale key under its
@@ -1648,12 +1675,14 @@ impl Simulator {
                     } else {
                         let absent = ports
                             .iter()
-                            .all(|p| !self.vif_local_names.contains(&p.name.name));
+                            .map(|p| p.name.name.as_str())
+                            .chain(Self::body_decl_names(body))
+                            .all(|n| !self.vif_local_names.contains(n));
                         plan.vif_absent.set((vif_len0, absent));
                         absent
                     }
                 };
-                let vif_formals: Vec<(&str, Option<&Expression>)> = if vif_fast {
+                let mut vif_formals: Vec<(&str, Option<&Expression>)> = if vif_fast {
                     Vec::new()
                 } else {
                     ports
@@ -1674,6 +1703,11 @@ impl Simulator {
                         })
                         .collect()
                 };
+                // §13.5 / §25.9: the variables the body declares are the
+                // method's own, like its plain formals (see `vif_own_names`).
+                if !vif_fast && !self.vif_local_names.is_empty() {
+                    self.vif_own_names(ports, body, &mut vif_formals);
+                }
                 let vif_saved = if vif_fast {
                     Vec::new()
                 } else {
@@ -1717,7 +1751,13 @@ impl Simulator {
                         }
                         None => port,
                     };
-                    if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                    // §7.4.1, §13.5: so does a formal that is a packed array
+                    // of a named type (`lane_t [0:1] v`, or a typedef of
+                    // one): its range labels its elements and their type
+                    // gives them their signing, as for a function's formal.
+                    if !plain
+                        && (matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                            || self.names_packed_array_of_named(&port.data_type))
                     {
                         self.register_formal_type_metadata(
                             &port.name.name,
@@ -1733,6 +1773,17 @@ impl Simulator {
                         .get(i)
                         .filter(|_| arg_supplied(i))
                         .or_else(|| Self::default_actual(port));
+                    // Freeze the actual in the caller, before installing this method's
+                    // receiver and locals. Ref writes go directly to that storage.
+                    let ref_storage = if port.direction == PortDirection::Ref && arg_supplied(i) {
+                        self.ref_scope_alias_target(port, &args[i]).or_else(|| {
+                            let ExprKind::Ident(h) = &args[i].kind else { return None };
+                            if h.path.len() != 1 || !h.path[0].selects.is_empty() { return None; }
+                            self.ref_alias_stack.last()?.get(&h.path[0].name.name).cloned()
+                        })
+                    } else {
+                        None
+                    };
                     // An associative-array `output`/`inout`/`ref` formal
                     // is copied back via the assoc-param signal-namespace
                     // merge, NOT the scalar `output_bindings` path (which
@@ -1742,7 +1793,9 @@ impl Simulator {
                         PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                     ) && !is_assoc
                     {
-                        if arg_supplied(i) {
+                        if let Some(storage) = &ref_storage {
+                            ref_aliases.insert(port.name.name.clone(), storage.clone());
+                        } else if arg_supplied(i) {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         } else if let Some(d) = port
                             .default
@@ -1875,6 +1928,7 @@ impl Simulator {
                         if let Some((store, caller)) = self.bind_queue_param(
                             &port.name.name,
                             &eff_dims,
+                            port.dimensions.is_empty(),
                             actual,
                             &port.data_type,
                             port.direction,
@@ -1942,7 +1996,9 @@ impl Simulator {
                     // Class methods have automatic lifetime. An output handle
                     // starts null on every call; it never copies in the caller's
                     // previous object (including when the actual is a default).
-                    let mut val = if plain_class && port.direction == PortDirection::Output {
+                    let mut val = if let Some(value) = ref_storage.as_deref().and_then(|key| self.ref_alias_peek(key)) {
+                        value
+                    } else if plain_class && port.direction == PortDirection::Output {
                         Value::zero(32)
                     } else if arg_supplied(i) {
                         let value = match self.formal_pattern_value(port, &args[i]) {
@@ -1998,7 +2054,17 @@ impl Simulator {
                     // derived from a CLASS type-param (not in module.parameters)
                     // isn't mis-resolved to `1` and truncates the caller's
                     // value.
-                    if matches!(&port.data_type, DataType::TypeReference { .. }) {
+                    if !plain_class
+                        && port.dimensions.is_empty()
+                        && self.method_dt_is_real(handle, cname, &port.data_type)
+                    {
+                        // §13.5, §6.12.1: a real formal (declared `real`,
+                        // through a typedef, or by a type parameter bound to
+                        // one) holds a real; an integral actual converts.
+                        if !val.is_real && port.direction != PortDirection::Output {
+                            val = Value::from_f64(val.to_f64());
+                        }
+                    } else if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some(pw) = param_w {
@@ -2195,6 +2261,9 @@ impl Simulator {
                             }
                         }
                     }
+                    if plan.ports[i].plain_scalar {
+                        self.note_plain_formal_range(&port.name.name, &port.data_type);
+                    }
                     locals.insert(port.name.name.clone(), val);
                 }
                 if let Some(rn) = fn_ret_name {
@@ -2241,14 +2310,8 @@ impl Simulator {
                                 self.method_formal_param_width(handle, cname, &f.return_type)
                             {
                                 w
-                            } else if plan.type_gen == self.type_tables_gen {
-                                rp.width
                             } else {
-                                super::elaborate::resolve_type_width(
-                                    &f.return_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
+                                rp.width
                             }
                             .max(1);
                             match self.widths.get_mut(rn) {
@@ -2286,6 +2349,9 @@ impl Simulator {
                     }
                     if !locals.contains_key(rn) {
                         locals.insert(rn.to_string(), init);
+                    }
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        self.note_plain_formal_range(rn, &f.return_type);
                     }
                     // Register the return variable's class type so an
                     // implicit-return `funcname = new()` knows WHICH class to
@@ -2413,6 +2479,15 @@ impl Simulator {
                     self.modclass_depth.set(self.modclass_depth.get() + 1);
                     self.activation_scope.replace(Some(inst))
                 });
+                let aliased_formals = !ref_aliases.is_empty();
+                let ref_frame = aliased_formals || self.ref_redirect_possible();
+                if ref_frame {
+                    self.ref_pins_acquire(&ref_aliases);
+                    self.ref_alias_stack.push(ref_aliases);
+                    self.ref_identity_stack.push(Vec::new());
+                    self.ref_binding_stack.push(HashMap::default());
+                    self.refresh_ref_redirect_hot();
+                }
                 self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
                 // Record the `local_stack` depth BEFORE this method's own
@@ -2619,7 +2694,7 @@ impl Simulator {
                 // paid a whole plan + compile for each of the many tasks a
                 // UVM run calls only a few times.
                 let mut ast_string_cleanup = None;
-                if let Some(cval) = compiled_methods_enabled()
+                if let Some(cval) = (compiled_methods_enabled() && !aliased_formals)
                     .then(|| {
                         self.try_run_compiled_method(
                             handle,
@@ -2823,7 +2898,7 @@ impl Simulator {
                     && matches!(&f.return_type, DataType::TypeReference { .. })
                     && let Some(w) = self.method_formal_param_width(handle, &cname, &f.return_type)
                 {
-                    if w != ret.width {
+                    if w != ret.width || ret.is_fill {
                         ret = ret.resize_for_assign(w);
                     }
                     if let DataType::TypeReference { name, .. } = &f.return_type
@@ -2841,11 +2916,17 @@ impl Simulator {
                         let w = match static_dyn_w {
                             Some(w) => w,
                             None => {
-                                let scope = self.instance_param_scope(handle);
-                                resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs))
+                                let values: HashMap<String, Value> =
+                                    self.instance_value_params(handle).into_iter().collect();
+                                let scope = self.instance_param_env(&values);
+                                super::elaborate::resolve_type_width_env(
+                                    rt,
+                                    Some(&scope),
+                                    Some(&self.module.typedefs),
+                                )
                             }
                         };
-                        if w > 0 && w != ret.width {
+                        if w > 0 && (w != ret.width || ret.is_fill) {
                             ret = ret.resize_for_assign(w);
                         }
                     }
@@ -2887,8 +2968,8 @@ impl Simulator {
                                 Some(&self.module.typedefs),
                             ),
                         };
-                        if w > 0 && w != ret.width {
-                            ret = ret.resize(w);
+                        if w > 0 && (w != ret.width || ret.is_fill) {
+                            ret = ret.resize_for_assign(w);
                         }
                         ret.is_signed = plan.ret.as_ref().map_or_else(
                             || super::elaborate::is_type_signed(&f.return_type),
@@ -2923,6 +3004,13 @@ impl Simulator {
                 } else {
                     self.snapshot_default_outs(&default_out_bindings)
                 };
+                if ref_frame {
+                    let frame = self.ref_alias_stack.pop().unwrap();
+                    self.ref_pins_release(&frame);
+                    self.ref_binding_stack.pop();
+                    self.ref_identity_stack.pop();
+                    self.refresh_ref_redirect_hot();
+                }
                 self.pop_local_frame();
                 if !default_wb.is_empty() {
                     self.apply_default_outs(default_wb, &cname);

@@ -7,16 +7,6 @@
 //! whose 64 bits are not a context width either, and for the other operand
 //! of a comparison or a `?:` with a real arm.
 //!
-//! §11.8.2 also lets a relational operator's real type reach the integral
-//! side. The reference simulator applies that to a CONSTANT integral side
-//! (`3.5 == 7/2` divides as reals, and so does a localparam) and converts a
-//! run-time one whole (`x == a/b` divides as integers); xezim does the same.
-//! The reference simulator also folds module code whose variables it can see
-//! are constant, with the real type propagated; the run-time cases below
-//! therefore pass their values through function arguments.
-//!
-//! Every expected value below comes from the reference simulator.
-
 use xezim::simulate;
 
 fn t_lines(src: &str) -> Vec<String> {
@@ -198,7 +188,8 @@ endmodule
             "T|B16 65534.000000",
             "T|L4 15.000000",
             "T|L4b 4294967295.000000",
-            "T|SR 4294967295.000000",
+            // §6.12: a shortreal rounds to binary32 (the reference keeps 4294967295).
+            "T|SR 4294967296.000000",
             "T|MX 4294967294.000000",
             "T|MX2 4294967295.000000",
             "T|PW 4294967295.000000",
@@ -272,7 +263,8 @@ endmodule
     );
 }
 
-/// A CONSTANT integral subexpression next to a real operand: arithmetic still converts its self-determined value (`1.5 + 7/2` is 4.5), a comparison takes the real type (`3.5 == 7/2`), and localparams fold the same way.
+/// §11.8.2: integral constant expressions keep integer division and unsigned
+/// wrapping until the comparison or arithmetic converts their result to real.
 #[test]
 fn constant_integral_operands() {
     let got = t_lines(
@@ -297,8 +289,7 @@ module top;
     $display("T|K18 %0d", {u - 2} > 1.0);
     $display("T|K22 %0d", (u * 3) > 1.0);
     $display("T|K23 %0d", (u - 2) * 2 > 1.0);
-    // Keep this operand explicitly constant; module-variable optimization
-    // differs from a run-time formal (covered by unsigned_negation_359).
+    // A parameter and a run-time formal both wrap at unsigned int width.
     $display("T|K24 %0d", -UP > 1.0);
   end
 endmodule
@@ -308,19 +299,19 @@ endmodule
         got,
         sorted(&[
             "T|K1 4.500000",
-            "T|K2 1",
+            "T|K2 0",
             "T|K3 4294967295.000000",
             "T|K4 4.500000",
             "T|K6 4.500000",
             "T|K7 0",
             "T|K8 3.000000",
             "T|K11 4294967295.000000",
-            "T|K12 4294967295.000000 4.500000 0",
+            "T|K12 4294967295.000000 4.500000 1",
             "T|K14 0",
             "T|K18 1",
             "T|K22 1",
             "T|K23 1",
-            "T|K24 0",
+            "T|K24 1",
         ]),
     );
 }

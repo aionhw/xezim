@@ -2,7 +2,7 @@
 //! inside compiled class-method bodies lower to `LoadCollElem` /
 //! `StoreCollElem`. The exec arms mirror the interpreter's own read/write
 //! funnel bodies (`expr_assoc_name` → `assoc_key_str` → signals-map store,
-//! §7.10.2.3 queue append, §10.7 element-width fit, settle + waiter
+//! §7.10.1 queue append, §10.7 element-width fit, settle + waiter
 //! notify), resolved through the same runtime helpers
 //! (`instance_assoc_member` / `handle_collection_name`), so the storage
 //! layout and side effects are identical to the AST path.
@@ -11,12 +11,7 @@
 //! `this.`-rooted and handle-dotted read+write, computed index, byte
 //! (8-bit) element width fit, string-formal whole-Ident index
 //! (`aa[nm]` — the `uvm_component::get_child` shape), dotted in-range
-//! queue writes, and bare static member queue element access. The
-//! out-of-range queue APPEND shape (§7.10.2.3) is xezim-vs-reference
-//! divergent (xezim appends; the reference simulator ignores the write —
-//! pre-existing, same category as the refsim-3829 assoc-miss warnings), so
-//! it is asserted in its own test against the interpreter's established
-//! behavior.
+//! queue writes, and bare static member queue element access. Queue element writes also cover the §7.10.1 bounds.
 //!
 //! Expectations are reference-simulator-validated (method_vm31 runs
 //! byte-for-byte identically under the reference simulator, gate OFF, and
@@ -144,15 +139,11 @@ endmodule
     assert_eq!(u(&sim, "sqv"), 511);
 }
 
-/// Out-of-range queue element write (`q[7] = 5` on a 3-element member
-/// queue): xezim's interpreter APPENDS per §7.10.2.3 (deliberate — UVM's
-/// queue-unpack fills an empty queue exactly this way), whereas the
-/// reference simulator ignores the write. The exec arm mirrors the
-/// interpreter, so both xezim paths agree; asserted here against the
-/// interpreter's established behavior.
+/// §7.10.1: a write at size appends, but a write beyond size or at a
+/// negative or unknown index is ignored. Check both execution policies.
 #[test]
 fn queue_elem_append_out_of_range() {
-    if !gate_on() {
+    if !super::compiled_method_test_env::policies(&[("0", "0"), ("1", "0")]) {
         return;
     }
     let src = r#"
@@ -165,6 +156,8 @@ class outer_t;
   endfunction
   function void append_write();
     q[7] = 5;
+    q[-1] = 6;
+    q[32'bx] = 8;
   endfunction
   function int read7();
     return q[7];
@@ -172,7 +165,7 @@ class outer_t;
 endclass
 
 module top;
-  int qsz, q7, q0;
+  int qsz, q7, q0, appended, qsz2;
   initial begin
     outer_t o;
     o = new();
@@ -181,12 +174,17 @@ module top;
     qsz = o.q.size();
     q7 = o.read7();
     q0 = o.q[0];
+    o.q[3] = 44;
+    appended = o.q[3];
+    qsz2 = o.q.size();
   end
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulation should run");
-    assert_eq!(u(&sim, "qsz"), 8);
-    assert_eq!(u(&sim, "q7"), 5);
+    assert_eq!(u(&sim, "qsz"), 3);
+    assert_eq!(u(&sim, "q7"), 0);
+    assert_eq!(u(&sim, "appended"), 44);
+    assert_eq!(u(&sim, "qsz2"), 4);
     assert_eq!(u(&sim, "q0"), 10);
 }
 

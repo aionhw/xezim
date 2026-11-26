@@ -66,6 +66,7 @@ impl Simulator {
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
         // signal + per-signal direction. `tick_clocking_blocks`
         // consumes this to maintain `clocking_snapshots`.
+        let mut bound_mirrors: Vec<(String, Expression)> = Vec::new();
         for (cb_name, cd) in self.module.clocking_blocks.iter() {
             let clk = cd.clock_signal.as_ref().map(|i| i.name.clone());
             let edge = match cd.clock_edge {
@@ -79,7 +80,7 @@ impl Simulator {
                 let mut alias_map: HashMap<String, String> = HashMap::default();
                 let mut bound_sels: HashMap<String, Expression> = HashMap::default();
                 let mut inouts: HashSet<String> = HashSet::default();
-                let sigs: Vec<(String, bool)> = cd
+                let mut sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
                     .map(|s| {
@@ -118,7 +119,56 @@ impl Simulator {
                         (net, is_input)
                     })
                     .collect();
-                let vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                let mut vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                // §14.5: an input bound to an expression (`input sum = a + 1;`,
+                // `input i = {op, ra, rb[3:1]};`) samples the value the
+                // expression has from its operands' samples. Each operand net
+                // is sampled as a hidden clocking input; the clockvar itself
+                // samples nothing by name, so a same-named variable outside
+                // the block is not read instead.
+                let mut bound_exprs: HashMap<String, ClockingBoundExpr> = HashMap::default();
+                for (i, s) in cd.signals.iter().enumerate() {
+                    let Some(e) = s.bound_to.as_ref() else {
+                        continue;
+                    };
+                    if !sigs[i].1
+                        || Self::flatten_member_path(e).is_some()
+                        || Self::select_chain_base(e)
+                            .and_then(Self::flatten_member_path)
+                            .is_some()
+                    {
+                        continue;
+                    }
+                    let mut nets = Vec::new();
+                    Self::clocking_expr_operands(e, &self.signal_name_to_id, &mut nets);
+                    let ops: Vec<(String, String)> = nets
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, net)| {
+                            (net, format!("{}{}.{}", CB_OPERAND_PREFIX, s.name.name, k))
+                        })
+                        .collect();
+                    sigs[i].0 = format!("{}{}", CB_OPERAND_PREFIX, s.name.name);
+                    for (net, hidden) in &ops {
+                        sigs.push((net.clone(), true));
+                        vis.push(hidden.clone());
+                    }
+                    bound_exprs.insert(s.name.name.clone(), (e.clone(), ops));
+                }
+                for (name, (e, _)) in &bound_exprs {
+                    bound_mirrors.push((
+                        format!("{}{}.{}", CB_SAMPLE_PREFIX, cb_name, name),
+                        e.clone(),
+                    ));
+                }
+                if !bound_exprs.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_bound_expr
+                            .insert("__xz_default_clocking".to_string(), bound_exprs.clone());
+                    }
+                    self.clocking_sig_bound_expr
+                        .insert(cb_name.clone(), bound_exprs);
+                }
                 self.clocking_vis.insert(cb_name.clone(), vis);
                 if !inouts.is_empty() {
                     if cd.is_default {
@@ -203,11 +253,24 @@ impl Simulator {
                 if !sig_edges.is_empty() {
                     self.clocking_sig_out_edge.insert(cb_name.clone(), sig_edges);
                 }
+                self.clocking_in_indexed_scope |= cb_name.contains('[');
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // §14.5: the `@(cb.sum)` mirror of an expression-bound input takes
+        // the expression's width.
+        for (hidden, e) in bound_mirrors {
+            let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) else {
+                continue;
+            };
+            let w = self.lrm_self_width(&e).unwrap_or(1).max(1);
+            if self.signal_widths[id] != w {
+                self.signal_widths[id] = w;
+                self.signal_table[id] = Value::new(w);
             }
         }
         // §14.4 output skews: evaluate the per-cb default and per-signal
@@ -269,8 +332,10 @@ impl Simulator {
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
+            // §3.14.1: by an exact power of ten (`secs / 1e-15` is not).
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
-                return (secs / slf.tick_s).round() as u64;
+                let ticks = super::elaborate::scale_pow10(*secs, -Self::secs_to_exp(slf.tick_s));
+                return super::elaborate::round_time_units(ticks) as u64;
             }
             // §14.4: a plain number is in the time unit of the module or
             // interface declaring the block (unlike statement delays, the
@@ -331,6 +396,16 @@ impl Simulator {
             for (net, e) in in_per_sig {
                 let t = skew_ticks(self, &cb, &e);
                 in_m.insert(net, t);
+            }
+            // §14.5: the operands of an expression-bound input take its skew.
+            if let Some(exprs) = self.clocking_sig_bound_expr.get(&cb) {
+                for (name, (_, ops)) in exprs {
+                    if let Some(&t) = in_m.get(name) {
+                        for (_, hidden) in ops {
+                            in_m.insert(hidden.clone(), t);
+                        }
+                    }
+                }
             }
             if !in_m.is_empty() {
                 self.clocking_sig_in_skew.insert(cb, in_m);
@@ -476,7 +551,7 @@ impl Simulator {
         }
         self.colliding_static_colls = colliding_names.iter().cloned().collect();
         self.colliding_static_colls_ready = true;
-        let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
+        let mut static_cols = Vec::new();
         for cd in self.module.classes.values() {
             for (name, is_assoc, width) in &cd.static_collections {
                 let is_str = cd
@@ -500,11 +575,15 @@ impl Simulator {
                     *is_assoc,
                     *width,
                     is_str,
+                    cd.queue_property_names.contains(name),
                 ));
             }
         }
         self.register_struct_member_collections();
-        for (name, is_assoc, width, is_str) in static_cols {
+        for (name, is_assoc, width, is_str, is_queue) in static_cols {
+            if is_queue {
+                self.module.queue_vars.insert(name.clone());
+            }
             if is_assoc {
                 self.module
                     .associative_arrays
@@ -1477,6 +1556,7 @@ impl Simulator {
         // constant nets, and the reference fires them once at t0. Snapshotting
         // AFTER the settle erased that change and the blocks never ran.
         self.snapshot_edge_signals_full();
+        self.hold_time0_effect_entries();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();

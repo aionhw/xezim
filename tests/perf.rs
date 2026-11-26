@@ -62,3 +62,23 @@ mod const_index_array_arming;
 
 #[path = "perf/class_aggregate_resolution.rs"]
 mod class_aggregate_resolution;
+
+#[path = "perf/parked_waiter_index.rs"]
+mod parked_waiter_index;
+#[path = "perf/queue_shift_counters.rs"]
+mod queue_shift_counters;
+#[path = "perf/select_store_counters.rs"]
+mod select_store_counters;
+#[path = "perf/timing_check_conditions.rs"]
+mod timing_check_conditions;
+#[path = "perf/struct_formal_member_calls.rs"]
+mod struct_formal_member_calls;
+#[path = "perf/static_local_select_cover.rs"]
+mod static_local_select_cover;
+#[path = "perf/local_select_width_chain.rs"]
+mod local_select_width_chain;
+
+#[path = "perf/fallback_hotspots.rs"]
+mod fallback_hotspots;
+#[path = "perf/process_memory_paths.rs"]
+mod process_memory_paths;

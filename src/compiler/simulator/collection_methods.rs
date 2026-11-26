@@ -608,8 +608,29 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&lb)
             .or_else(|| self.coll_elem_width(&rb));
+        // §7.2: an element of an unpacked-struct array compares member by
+        // member.
+        let leaves = self
+            .p_elem_type(&lb)
+            .or_else(|| self.p_elem_type(&rb))
+            .and_then(|dt| self.unpacked_struct_of(&dt))
+            .map(|su| self.struct_leaf_suffixes(&su));
         let mut acc = PatCmp::Equal;
         for (a, b) in ls.iter().zip(rs.iter()) {
+            if let Some(sfx) = &leaves {
+                for s in sfx {
+                    let lv = self.struct_leaf_value(&format!("{lb}{a}.{s}"));
+                    let rv = self.struct_leaf_value(&format!("{rb}{b}.{s}"));
+                    acc = acc.and(match (lv, rv) {
+                        (Some(x), Some(y)) => Self::struct_leaf_cmp(&x, &y, mode),
+                        _ => PatCmp::Unequal,
+                    });
+                }
+                if acc == PatCmp::Unequal {
+                    break;
+                }
+                continue;
+            }
             let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
             let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
             let (Some(lv), Some(rv)) = (lv, rv) else {
@@ -2362,6 +2383,7 @@ impl Simulator {
         &mut self,
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
+        dims_from_type: bool,
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
         dir: PortDirection,
@@ -2375,7 +2397,14 @@ impl Simulator {
             return None;
         }
         if let Some(selected) = self.selected_aggregate_formal_rhs(queue_data_type, dims, arg) {
-            return self.bind_queue_param(pname, dims, &selected, queue_data_type, dir);
+            return self.bind_queue_param(
+                pname,
+                dims,
+                dims_from_type,
+                &selected,
+                queue_data_type,
+                dir,
+            );
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
@@ -2442,7 +2471,9 @@ impl Simulator {
                 if self.assign_struct_concat(&key, parts.clone()) {
                     return Some((key, String::new()));
                 }
-                let vals = self.unpacked_concat_operand_values(parts);
+                let expand_rows = dims.len() == 1
+                    && (dims_from_type || !self.concat_element_type_is_array(queue_data_type));
+                let vals = self.unpacked_concat_operand_values(parts, expand_rows, None);
                 let n = vals.len() as u64;
                 for (j, v) in vals.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
@@ -2615,6 +2646,20 @@ impl Simulator {
         if !plain {
             self.module.var_decl_types.insert(key.clone(), dt.clone());
         }
+        if let Some(dims) = super::elaborate::packed_full_dims_chained(
+            dt,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        )
+        .filter(|dims| dims.len() > 1)
+        {
+            self.module.packed_full_dims.insert(key.clone(), dims);
+            if let Some(width) = self.ast_decl_elem_width(dt) {
+                self.module
+                    .packed_signal_elem_widths
+                    .insert(key.clone(), width);
+            }
+        }
         if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt {
             if self.module.classes.contains_key(&tn.name.name) {
                 self.module
@@ -2755,6 +2800,16 @@ impl Simulator {
                     n = std::borrow::Cow::Owned(s);
                 }
                 n.into_owned()
+            }
+            // §8.9, §8.23: `Cls::q` names the class's static queue or
+            // dynamic array.
+            ExprKind::Ident(h)
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(&h.path[0].name.name)
+                    && self.member_is_static_coll(&h.path[0].name.name, &h.path[1].name.name) =>
+            {
+                self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)?
             }
             // §13.5.2: a queue/dynamic-array member of ANOTHER object passed
             // as the actual — `cb.doit(comp.q)` / `cb.doit(this.q)`, or a
@@ -3543,8 +3598,10 @@ impl Simulator {
                         return Some(Value::zero(32));
                     }
                 }
-                for i in (0..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, true) {
+                    for i in (0..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let head = Self::name_with_index(obj_name, 0);
                 self.queue_store_elem(obj_name, &head, arg);
@@ -3556,8 +3613,10 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self.queue_elem_value(obj_name, 0);
-                for i in 1..cur_size {
-                    self.queue_move_elem(obj_name, i, i - 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, false) {
+                    for i in 1..cur_size {
+                        self.queue_move_elem(obj_name, i, i - 1);
+                    }
                 }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
@@ -3662,8 +3721,10 @@ impl Simulator {
                 };
                 // Move elements member-wise: an unpacked-struct element has no
                 // container signal, so a packed copy shifts nothing at all.
-                for i in (idx..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, idx, cur_size, true) {
+                    for i in (idx..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let slot = format!("{}[{}]", obj_name, idx);
                 self.queue_store_elem(obj_name, &slot, &args[1]);
@@ -4023,8 +4084,10 @@ impl Simulator {
                     let cur_size = self.get_queue_size(obj_name) as usize;
                     if idx < cur_size {
                         // Member-wise, for the same reason as `insert`.
-                        for i in idx..cur_size - 1 {
-                            self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                        if !self.queue_shift_fast(obj_name, idx as u64, cur_size as u64, false) {
+                            for i in idx..cur_size - 1 {
+                                self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                            }
                         }
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }

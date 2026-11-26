@@ -241,8 +241,14 @@ impl NameMap {
         // Only alias-determined answers are kept: the canonical spelling (its
         // id is looked up again on every hit) or "no alias applies". A miss of
         // an aliased name is not, since a later `insert` /
-        // `add_virtual_array` can add the canonical name.
-        let stored = if ans.is_some() {
+        // `add_virtual_array` can add the canonical name. Nor is the answer
+        // for a subroutine call's own storage (`@q#17`, `@q#17[3]`): its key
+        // is new on every call and not asked for again once the call returns,
+        // so keeping it only grew the cache, by one entry per call and
+        // element, for the whole run.
+        let stored = if name.starts_with('@') {
+            None
+        } else if ans.is_some() {
             Some(Some(canonical.into_owned()))
         } else if canonical == name {
             Some(None)
@@ -720,6 +726,36 @@ mod tests {
             true
         });
         assert_eq!(all, 6);
+    }
+
+    /// A subroutine call's own storage key (`@q#17`) is not kept in the
+    /// interface-alias cache, which would otherwise grow by one entry per
+    /// call for the whole run; every other answer still is, and the lookups
+    /// return the same ids either way.
+    #[test]
+    fn call_storage_keys_stay_out_of_the_interface_cache() {
+        let mut m = NameMap::default();
+        m.insert(Arc::from("u_if.d"), 0);
+        m.insert(Arc::from("@q#7"), 1);
+        m.insert(Arc::from("@q#8[0]"), 2);
+        let mut aliases = HashMap::default();
+        aliases.insert("u.p".to_string(), "u_if".to_string());
+        m.set_interface_aliases("top".to_string(), aliases);
+        assert_eq!(m.get("u.p.d"), Some(&0), "an aliased name resolves");
+        assert_eq!(m.get("other"), None);
+        for k in 9..200 {
+            assert_eq!(m.get(&format!("@q#{k}")), None);
+            assert_eq!(m.get(&format!("@q#{k}[2]")), None);
+        }
+        assert_eq!(m.get("@q#7"), Some(&1));
+        assert_eq!(m.get("@q#8[0]"), Some(&2));
+        let cache = m.interface_cache.read().unwrap();
+        assert!(cache.contains_key("u.p.d") && cache.contains_key("other"));
+        assert!(
+            cache.keys().all(|k| !k.starts_with('@')),
+            "call storage keys were cached: {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -289,7 +289,7 @@ impl Simulator {
                     .collect()
             } else {
                 pick(
-                    &m.var_decl_types,
+                    m.var_decl_types.as_map(),
                     name,
                     &pfx,
                     members,
@@ -367,7 +367,11 @@ impl Simulator {
         put(&mut self.var_class_types, name, &meta.class);
         put(&mut self.var_container_types, name, &meta.container);
         put(&mut self.var_type_args, name, &meta.type_args);
-        put(&mut self.widths, name, &meta.width);
+        if let Some(w) = meta.width {
+            self.widths.insert(name.to_owned(), w);
+        } else {
+            self.widths.remove(name);
+        }
         flag(&mut self.signed_signals, name, meta.signed);
         flag(&mut self.real_signals, name, meta.real);
         flag(&mut self.string_signals, name, meta.string);
@@ -377,7 +381,7 @@ impl Simulator {
             m.var_decl_types.remove(key);
         }
         for (key, ty) in &meta.decl_types {
-            m.var_decl_types.insert(key.clone(), ty.clone());
+            m.var_decl_types.insert_shared(key.clone(), ty.clone());
         }
         keyed(
             &mut m.struct_members,
@@ -1714,6 +1718,82 @@ impl Simulator {
             v.dedup();
         }
         out
+    }
+
+    /// §6.18, §6.12: whether a declared type is `real`, `shortreal` or
+    /// `realtime`, directly or through any chain of typedefs (a package or
+    /// class scope included), or is a class type parameter the running
+    /// specialization binds to one (§8.25). Every place that classifies a
+    /// variable, member, formal, return value or cast target as real asks
+    /// here, so an alias behaves as the type it names.
+    pub(super) fn dt_is_real(&self, dt: &DataType) -> bool {
+        match dt {
+            DataType::Real { .. } => true,
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                if dimensions.is_empty()
+                    && !name.has_scope()
+                    && let Some(ctx) = self.class_context_stack.last().and_then(|c| c.as_deref())
+                {
+                    // A typedef of the running method's class, then a type
+                    // parameter of it.
+                    if let Some(td) = self.class_local_typedef(ctx, &name.name.name) {
+                        return !matches!(td, DataType::TypeReference { name: n, .. }
+                            if n.name.name == name.name.name)
+                            && self.dt_is_real(td);
+                    }
+                    // The receiver's own binding first: it also answers for
+                    // a parameter that shares its name with a typedef of an
+                    // enclosing scope (§8.25).
+                    if let Some(bound) = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.obj_type_param(h, ctx, &name.name.name))
+                        .or_else(|| self.local_type_param_concrete(dt))
+                    {
+                        return self.concrete_type_real(bound.trim());
+                    }
+                }
+                super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+            }
+            _ => false,
+        }
+    }
+
+    /// `dt_is_real` for a formal or the return type of a method of class
+    /// `cname` called on `handle`, before the call has made that class the
+    /// running context.
+    pub(super) fn method_dt_is_real(&self, handle: usize, cname: &str, dt: &DataType) -> bool {
+        match dt {
+            DataType::Real { .. } => true,
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                if dimensions.is_empty() && !name.has_scope() {
+                    if let Some(td) = self.class_local_typedef(cname, &name.name.name) {
+                        return !matches!(td, DataType::TypeReference { name: n, .. }
+                            if n.name.name == name.name.name)
+                            && self.method_dt_is_real(handle, cname, td);
+                    }
+                    if let Some(bound) = self.obj_type_param(handle, cname, &name.name.name) {
+                        return self.concrete_type_real(bound.trim());
+                    }
+                }
+                super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+            }
+            _ => false,
+        }
+    }
+
+    /// `dt_is_real` for the type a type-parameter binding names.
+    pub(super) fn concrete_type_real(&self, name: &str) -> bool {
+        matches!(name, "real" | "shortreal" | "realtime")
+            || self.module.typedef_types.get(name).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+            })
     }
 
     /// Follow a typedef chain to the underlying type.

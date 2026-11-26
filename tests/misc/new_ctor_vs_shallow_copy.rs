@@ -48,10 +48,10 @@ module top;
   initial begin
     Box q, a, c;
     Holder h;
-    q = new Box(9);
+    q = new(9);
     h = new(q);          // PAREN -> constructor: h.b = q -> 9
     $display("PAREN=%0d", h.val_out());
-    a = new Box(3);
+    a = new(3);
     c = new a;           // NO-PAREN -> shallow copy of a -> 3
     $display("NOARG=%0d", c.val());
   end

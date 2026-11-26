@@ -12,6 +12,7 @@ use xezim::simulate;
 
 const SRC: &str = r#"// Each assertion prints its failures (F) and passes (P) with the tick time.
 module t;
+  initial $assertvacuousoff(0);
   logic clk = 0;
   logic a, b, c;
   logic [1:0] m;

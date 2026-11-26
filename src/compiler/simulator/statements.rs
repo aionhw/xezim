@@ -19,12 +19,17 @@ impl Simulator {
     /// §10.10/§11.4.12: the elements an unpacked-array concatenation's
     /// operands contribute, in order — a queue / array operand (bare, an
     /// object member, a struct member reached through any selects, an
-    /// associative element that is itself a collection) or a slice of one
-    /// contributes all of its elements; anything else is one element.
+    /// associative element that is itself a collection) or a slice contributes
+    /// its elements. Expand a fixed row only for a non-array element type.
     #[inline(never)]
-    pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
+    pub(super) fn unpacked_concat_operand_values<'e>(
+        &mut self,
+        items: Vec<&'e Expression>,
+        expand_rows: bool,
+        mut first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
+    ) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
-        for expr in items {
+        for (position, expr) in items.into_iter().enumerate() {
             // §10.10, §13.4.1: a call returning an unpacked array contributes
             // the elements it returns, in order (the call runs once).
             if matches!(expr.kind, ExprKind::Call { .. })
@@ -37,6 +42,24 @@ impl Simulator {
                         }
                     }
                 }
+                continue;
+            }
+            if expand_rows
+                && let Some(row) = if first_row
+                    .as_ref()
+                    .is_some_and(|(e, _)| std::ptr::eq(*e, expr))
+                {
+                    // A preceding operand can change an object's receiver.
+                    first_row
+                        .take()
+                        .filter(|(_, row)| position == 0 || !row.object_member())
+                        .map(|(_, row)| row)
+                        .or_else(|| self.fixed_row_concat_shape(expr))
+                } else {
+                    self.fixed_row_concat_shape(expr)
+                }
+            {
+                self.append_fixed_row_concat_values(row, &mut all_vals);
                 continue;
             }
             // A queue/array operand — bare (`q`), an instance-
@@ -68,13 +91,27 @@ impl Simulator {
                 ..
             } = &expr.kind
             {
-                if let ExprKind::Ident(rhier) = &rbase.kind {
-                    let mut rname = self.resolve_hier_name(rhier);
-                    // Instance-scope a member-queue slice
-                    // operand inside a concat (`{q[0:i], …}`).
-                    if let Some(s) = self.instance_assoc_member(&rname) {
-                        rname = std::borrow::Cow::Owned(s);
+                let rname = match &rbase.kind {
+                    ExprKind::Ident(rhier) => {
+                        let mut rname = self.resolve_hier_name(rhier);
+                        // Instance-scope a member-queue slice
+                        // operand inside a concat (`{q[0:i], …}`).
+                        if let Some(s) = self.instance_assoc_member(&rname) {
+                            rname = std::borrow::Cow::Owned(s);
+                        }
+                        Some(rname)
                     }
+                    _ => None,
+                };
+                // §7.4.5, §10.10: a slice of a fixed array or of one of its
+                // rows; a queue or dynamic-array slice takes the path below.
+                let collection = rname.as_deref().is_some_and(|n| {
+                    self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n)
+                });
+                if !collection && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
+                    continue;
+                }
+                if let Some(rname) = rname {
                     if self.module.arrays.contains_key(&*rname) {
                         let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
                         let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
@@ -104,9 +141,87 @@ impl Simulator {
                     }
                 }
             }
+            // §10.10, §11.4.11, §6.24.1: a conditional choosing between two
+            // array operands contributes the chosen operand's elements, and a
+            // cast of an array operand to an unpacked array type
+            // (`row_t'(src[1])`) contributes its operand's. An ambiguous
+            // condition keeps the value path below.
+            if let Some(inner) = self.unpacked_concat_inner_operand(expr) {
+                let vals = self.unpacked_concat_operand_values(vec![inner], expand_rows, None);
+                all_vals.extend(vals);
+                continue;
+            }
+            if self.append_member_array_concat_values(expr, &mut all_vals) {
+                continue;
+            }
             all_vals.push(self.eval_expr(expr));
         }
         all_vals
+    }
+
+    /// The array operand that a conditional or an unpacked-array cast item
+    /// of an unpacked concatenation stands for; `None` for any other item.
+    /// Only the condition is evaluated.
+    fn unpacked_concat_inner_operand<'e>(&mut self, e: &'e Expression) -> Option<&'e Expression> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.unpacked_concat_inner_operand(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } if self.concat_array_operand_like(then_expr)
+                && self.concat_array_operand_like(else_expr) =>
+            {
+                match self.eval_expr(condition).is_nonzero()? {
+                    true => Some(Self::unparen(then_expr)),
+                    false => Some(Self::unparen(else_expr)),
+                }
+            }
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_named_cast"
+                    && args.len() == 2
+                    && matches!(&args[0].kind, ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+                        && {
+                            let class = self
+                                .class_context_stack
+                                .last()
+                                .and_then(|c| c.as_deref())
+                                .unwrap_or("");
+                            Self::typedef_dims_via_tables(&self.module, class, &h.path[0].name.name)
+                                .is_some()
+                        })
+                    && self.concat_array_operand_like(&args[1]) =>
+            {
+                Some(Self::unparen(&args[1]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `e` names an array operand of an unpacked concatenation (a
+    /// collection, a fixed array or one of its rows), without evaluating it.
+    fn concat_array_operand_like(&mut self, e: &Expression) -> bool {
+        let e = Self::unparen(e);
+        self.fixed_row_concat_shape(e).is_some()
+            || self.array_operand_name(e).is_some()
+            || self.unpacked_concat_inner_operand_shape(e)
+    }
+
+    /// A nested conditional or cast of array operands, checked without
+    /// evaluating its condition.
+    fn unpacked_concat_inner_operand_shape(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.concat_array_operand_like(then_expr)
+                    && self.concat_array_operand_like(else_expr)
+            }
+            _ => false,
+        }
     }
 
     /// The size and optional source of a §7.5.1 dynamic-array constructor:
@@ -426,6 +541,26 @@ impl Simulator {
             self.set_queue_size(name, n);
             return;
         }
+        // §7.5.1, §10.10: `new[n]({src[1], 5})` initializes from the elements
+        // of an unpacked concatenation, read before the target is resized
+        // (`d = new[3]({d, 8})`). Read as one packed value, it was broadcast.
+        let concat_vals = match src_expr.map(|e| &e.kind) {
+            Some(ExprKind::Concatenation(parts))
+                if !self.module.arrays_2d.contains_key(name)
+                    && !self.module.arrays_nd.contains_key(name) =>
+            {
+                let mut items = Vec::with_capacity(parts.len());
+                let mut stack: Vec<&Expression> = parts.iter().rev().collect();
+                while let Some(e) = stack.pop() {
+                    match &e.kind {
+                        ExprKind::Concatenation(inner) => stack.extend(inner.iter().rev()),
+                        _ => items.push(e),
+                    }
+                }
+                Some(self.unpacked_concat_operand_values(items, true, None))
+            }
+            _ => None,
+        };
         let keep = match &src {
             Some(sn) => self.get_queue_size(sn).min(n),
             None => 0,
@@ -540,7 +675,12 @@ impl Simulator {
         // assignment pattern (array literal), not just a
         // named source array. Populate elements from it,
         // mirroring a plain `arr = '{...}` pattern assign.
-        if let Some(se) = src_expr
+        if let Some(vals) = concat_vals {
+            for (i, v) in vals.into_iter().take(n as usize).enumerate() {
+                let v = self.fit_queue_push_elem(name, v);
+                self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+            }
+        } else if let Some(se) = src_expr
             && src.is_none()
         {
             match &self.unpacked_pattern(se).kind {
@@ -2184,6 +2324,9 @@ impl Simulator {
         signed: bool,
     ) -> Value {
         if is_real_type {
+            if matches!(data_type, DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }) {
+                return Value::from_f64(raw.to_f64() as f32 as f64);
+            }
             return if raw.is_real {
                 raw
             } else {
@@ -2330,7 +2473,7 @@ impl Simulator {
                 _ => false,
             };
         // §6.4: `real`/`shortreal` variables default to 0.0.
-        let is_real_type = super::elaborate::is_type_real(data_type);
+        let is_real_type = self.dt_is_real(data_type);
         // §6.11.3: the declared signedness every declarator's value and
         // later reads carry.
         let decl_signed = !plain_class
@@ -2341,7 +2484,7 @@ impl Simulator {
         // §25.9 / IEEE 1800-2023 Table 6-7: a virtual-interface handle
         // defaults to `null`, also when its type is a typedef alias
         // (`vif_t v;`) or an explicit `virtual bus_if v` declaration.
-        let is_vif_handle = !is_class_handle && Self::dt_is_virtual_iface(data_type, &self.module);
+        let is_vif_handle = !is_class_handle && self.decl_is_virtual_iface(data_type);
         let mut default_v = if is_real_type {
             Value::from_f64(0.0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
@@ -2643,6 +2786,7 @@ impl Simulator {
                             }
                             self.signals.insert(k, dv);
                         }
+                        self.register_local_struct_member_arrays(&d.name.name, &su, 0);
                         if self.struct_colls_possible() {
                             self.fresh_struct_colls(&d.name.name, &su);
                         }
@@ -3199,6 +3343,9 @@ impl Simulator {
                         bare
                     };
                     self.adopt_local_shape(&name);
+                    if let Some(bounds) = self.declared_fixed_dims(dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     match shape.len() {
                         2 => {
                             self.module
@@ -3610,6 +3757,9 @@ impl Simulator {
                     None
                 };
                 if let Some(shape) = nd_shape {
+                    if let Some(bounds) = self.declared_fixed_dims(&dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     self.module.arrays.remove(&name);
                     if shape.len() == 2 {
                         self.module
@@ -3667,6 +3817,11 @@ impl Simulator {
                         for (k, dv, mdt) in leaves {
                             self.register_packed_leaf_layout(&k, &mdt);
                             self.widths.insert(k.clone(), dv.width);
+                            // §6.11.3: a signed member (`int`, `byte`) reads
+                            // signed, as a module-scope leaf does.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            }
                             self.signals.insert(k, dv);
                         }
                         continue;
@@ -4292,6 +4447,8 @@ impl Simulator {
                     }
                     None => rvalue,
                 };
+                let frozen_rhs = self.freeze_array_rhs_selectors(rvalue);
+                let rvalue = frozen_rhs.as_ref().unwrap_or(rvalue);
                 // §9.4.5 intra-assignment EVENT control on an NBA
                 // (`lhs <= [repeat(n)] @(edge sig) rhs`, canonicalized to
                 // `$__xz_intra_ev(n, edge, sig, rhs)`). Only the BLOCKING arm
@@ -4509,11 +4666,46 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.4.2, §7.6: a subarray or slice of a multidimensional
+                // array (a design variable's, a class property's) that the
+                // element-wise paths above do not pair with the target
+                // (`q <= src[1]` into a one-dimensional array) is read element
+                // by element now and stored as the pattern of those values.
+                // It was read as one scalar, so every element received 0.
+                // Only a design with multidimensional storage has one.
+                if packed_pattern.is_none()
+                    && intra_cycles.is_none()
+                    && (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+                    && let Some((pattern, release)) =
+                        self.unpacked_array_snapshot(rvalue, rvalue.span)
+                {
+                    let d = intra_d.unwrap_or_else(|| {
+                        delay
+                            .as_ref()
+                            .map(|e| self.eval_delay_ticks(e))
+                            .unwrap_or(0)
+                    });
+                    let delay = (d > 0)
+                        .then(|| self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span));
+                    self.exec_statement(&Statement::new(
+                        StatementKind::NonblockingAssign {
+                            lvalue: packed_lvalue.clone(),
+                            delay: delay.map(Box::new),
+                            rvalue: pattern,
+                        },
+                        stmt.span,
+                    ));
+                    if let Some(release) = release {
+                        self.exec_statement(&release);
+                    }
+                    return;
+                }
                 let val = match (packed_pattern, &rvalue.kind) {
                     (Some(v), _) => v,
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
                     (None, _) => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
+                let val = self.fill_into_real_target(lvalue, val);
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
                 // edge (output skew) instead of driving now. Handles both a
@@ -4808,24 +5000,9 @@ impl Simulator {
                     // §4.9.4: matures in the target slot's NBA REGION — the
                     // separate queue commits inside apply_nba, so Active
                     // reads at the same time still see the old value.
-                    //
-                    // Reference-parity (#145): a delayed NBA whose captured
-                    // value equals the CURRENT value is elided at SCHEDULE
-                    // time (`q = 0; q <= #5 0; #1 q = 1;` leaves q at 1 —
-                    // the reference never lands the update). Elide only when
-                    // no delayed NBA is already pending for the id: a
-                    // pending entry, not the register, is the truth then
-                    // (the #142 rule).
                     let mut v = val.resize_for_assign(w);
-                    // Normalize signedness to the TARGET before comparing —
-                    // the apply site does the same at maturity, and without
-                    // it the elision compare saw identical bits as unequal
-                    // Values and always pushed.
                     v.is_signed = self.signal_signed[id];
-                    let pending_here = self.delayed_nba.iter().any(|(_, sid, _)| *sid == id);
-                    if pending_here || self.signal_table[id] != v {
-                        self.delayed_nba.push((self.time + d, id, v));
-                    }
+                    self.delayed_nba.push((self.time + d, id, v));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let qval = if self.nba_target_is_assoc_elem(lvalue) {
@@ -4889,7 +5066,7 @@ impl Simulator {
                     self.exec_case_matches(expr, items);
                     return;
                 }
-                let val = self.case_selector_value(kind, expr, items);
+                let comparison = self.case_comparison(kind, expr, items);
                 // SV-2023: under unique/unique0/priority, pre-pass the items
                 // and emit a violation message if multiple match or (for
                 // unique/priority) none match without a default.
@@ -4905,22 +5082,7 @@ impl Simulator {
                             continue;
                         }
                         for pat in &item.patterns {
-                            let hit = match kind {
-                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                CaseKind::Casez => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casez_eq(&pv).is_true()
-                                }
-                                CaseKind::Casex => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casex_eq(&pv).is_true()
-                                }
-                                _ => {
-                                    let pv = self.eval_expr(pat);
-                                    val.case_eq(&pv).is_true()
-                                }
-                            };
-                            if hit {
+                            if self.case_item_matches(kind, &comparison, pat) {
                                 match_count += 1;
                                 break;
                             }
@@ -4956,22 +5118,7 @@ impl Simulator {
                         continue;
                     }
                     for pat in &item.patterns {
-                        let hit = match kind {
-                            CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                            CaseKind::Casez => {
-                                let pv = self.eval_expr(pat);
-                                val.casez_eq(&pv).is_true()
-                            }
-                            CaseKind::Casex => {
-                                let pv = self.eval_expr(pat);
-                                val.casex_eq(&pv).is_true()
-                            }
-                            _ => {
-                                let pv = self.eval_expr(pat);
-                                val.case_eq(&pv).is_true()
-                            }
-                        };
-                        if hit {
+                        if self.case_item_matches(kind, &comparison, pat) {
                             self.exec_statement(&item.stmt);
                             matched = true;
                             break;
@@ -5448,8 +5595,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_set.clone());
+                    self.register_named_fork(&nm.name, &child_set);
                 }
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
@@ -5609,7 +5755,7 @@ impl Simulator {
                             let sens = self.event_to_sens(e);
                             let is_clk_ev = self.is_clocking_event(e);
                             let w = self.make_event_waiter_kind(wpid, sens, wake, is_clk_ev);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         self.sync_wait(id);
                     }
@@ -5691,7 +5837,7 @@ impl Simulator {
                         let pid = self.cg_this.unwrap_or(0); // placeholder
                         {
                             let w = self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         self.break_flag = true;
                         return;
@@ -5928,10 +6074,10 @@ impl Simulator {
                                 // like `f = e` (`return b + u` with a byte b
                                 // and 8-bit u in an int function is 9 bits).
                                 // §10.8: a pattern takes the return type.
-                                // §13.4.1/§7.2: any other unpacked-struct
-                                // storage (a module or package variable, a
-                                // member, an element) is its leaves too.
-                                None => match self.ret_pattern_value(e) {
+                                None => match self
+                                    .ret_struct_elem_value(e)
+                                    .or_else(|| self.ret_pattern_value(e))
+                                {
                                     Some(v) => v,
                                     None => {
                                         let storage = if matches!(
@@ -5992,9 +6138,10 @@ impl Simulator {
             }
             StatementKind::Disable(target) => {
                 let name = crate::ast::stmt::disable_name(target);
+                let fork_target = self.named_fork_target(target);
                 // §38.36.1 cbDisable, reported once the disable took effect.
                 if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
-                    self.vpi_note_disable(name);
+                    self.vpi_note_disable(name, fork_target.as_deref());
                 }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
@@ -6007,7 +6154,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(name).cloned() {
+                if let Some(children) = fork_target.as_ref().and_then(|key| self.fork_block_children.get_mut(key)).map(std::mem::take) {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);
@@ -6030,7 +6177,7 @@ impl Simulator {
                             // (UVM's run-phase watchdog timer).
                             self.event_queue.remove_pid(pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.event_waiters.remove_pids(&to_kill);
                         self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
@@ -6059,7 +6206,7 @@ impl Simulator {
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
                         self.event_queue.remove_pid(pid);
-                        self.event_waiters.retain(|w| w.pid != pid);
+                        self.event_waiters.remove_pid(pid);
                         self.instance_event_waiters.remove_pid(pid);
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
@@ -6114,7 +6261,7 @@ impl Simulator {
                             // (UVM's run-phase watchdog timer).
                             self.event_queue.remove_pid(pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.event_waiters.remove_pids(&to_kill);
                         self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
@@ -6175,7 +6322,7 @@ impl Simulator {
                     // §9.6.2: incl. its future-time #delay (see above).
                     self.event_queue.remove_pid(pid);
                 }
-                self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                self.event_waiters.remove_pids(&to_kill);
                 self.instance_event_waiters.remove_pids(to_kill.iter());
                 self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
                 self.ready_condition_waiters
@@ -6323,9 +6470,10 @@ impl Simulator {
                     // (common `@(clk) <expr>` shape) and stored in
                     // `module.property_decls`.
                     let resolved_expr: Expression = match &a.expr.kind {
-                        ExprKind::Ident(h) if h.path.len() == 1 => {
-                            let name = &h.path[0].name.name;
-                            if let Some(body) = self.module.property_decls.get(name).cloned() {
+                        ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                            if let Some(name) = self.sva_named_key(&a.expr) =>
+                        {
+                            if let Some(body) = self.sva_body_with_defaults(&name) {
                                 body
                             } else {
                                 a.expr.clone()
@@ -6341,29 +6489,21 @@ impl Simulator {
                         // was silently dropped: it never passed, never
                         // failed, and read as always-true.
                         ExprKind::Call { func, args } => {
-                            let pname: Option<String> = match &func.kind {
-                                ExprKind::Ident(h)
-                                    if !h.path.is_empty()
-                                        && h.path.iter().all(|s| s.selects.is_empty()) =>
-                                {
-                                    Some(h.path.last().unwrap().name.name.clone())
-                                }
-                                _ => None,
-                            };
+                            // §26.3: `pkg::p(...)` names that package's
+                            // property; any other dotted name its leaf.
+                            let pname: Option<String> =
+                                self.sva_named_key(func).or_else(|| match &func.kind {
+                                    ExprKind::Ident(h)
+                                        if !h.path.is_empty()
+                                            && h.path.iter().all(|s| s.selects.is_empty()) =>
+                                    {
+                                        Some(h.path.last().unwrap().name.name.clone())
+                                    }
+                                    _ => None,
+                                });
                             let resolved = pname.and_then(|n| {
                                 let body = self.module.property_decls.get(&n).cloned()?;
-                                let formals = self
-                                    .module
-                                    .property_params
-                                    .get(&n)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut map: HashMap<String, Expression> = HashMap::default();
-                                for (i, f) in formals.iter().enumerate() {
-                                    if let Some(actual) = args.get(i) {
-                                        map.insert(f.clone(), actual.clone());
-                                    }
-                                }
+                                let map = self.sva_bind_actuals(&n, args);
                                 Some(super::elaborate::rewrite_expr(
                                     &body,
                                     "",
@@ -6638,12 +6778,23 @@ impl Simulator {
                 // resolve it — it was parsed and DISCARDED before, so a
                 // local `typedef struct packed {...} t; t v;` lost the
                 // member layout. Enum members become named constants.
-                let w = super::elaborate::resolve_type_width(
-                    &td.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
+                // §8.5: in a class method, by the class's own constants too.
+                let spec = self.class_type_env(&td.data_type);
+                let w = {
+                    let params = self.spec_param_env(&spec);
+                    super::elaborate::resolve_type_width_env(
+                        &td.data_type,
+                        Some(&params),
+                        Some(&self.module.typedefs),
+                    )
+                };
                 self.type_tables_gen += 1;
+                self.declaration_typedefs.get_or_insert_with(|| {
+                    (
+                        self.module.typedefs.clone(),
+                        self.module.typedef_types.clone(),
+                    )
+                });
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module
                     .typedef_types

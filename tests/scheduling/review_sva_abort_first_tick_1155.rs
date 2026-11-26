@@ -17,6 +17,7 @@ fn an_abort_at_the_first_tick_spares_an_unmatched_implication() {
     let result = simulate(
         r#"
 module t;
+  initial $assertvacuousoff(0);
   logic clk = 0, rst = 1, req = 0, ack = 0, rst2 = 1, req2 = 1;
   always #5 clk = ~clk;
   initial begin #22 rst = 0; rst2 = 0; end

@@ -733,9 +733,9 @@ impl Simulator {
             let resolved = self.resolve_dt(dt);
             let value = match Self::ret_conv_of(&resolved, &self.module.typedef_types) {
                 RetConv::Keep => self.eval_expr(e),
-                RetConv::Real => {
+                conv @ (RetConv::Real | RetConv::ShortReal) => {
                     let raw = self.eval_expr(e);
-                    Self::ret_convert(raw, RetConv::Real, 64, None)
+                    Self::ret_convert(raw, conv, 64, None)
                 }
                 RetConv::Int { two_state } => {
                     let width = super::elaborate::resolve_type_width(

@@ -130,6 +130,16 @@ cargo test --features jit --test <suite> <name>  # with the native backend
 - **User-visible changes:** a bullet under `### Unreleased` in `NOTES.md`
   (**Correctness**, **Performance** or **Command line**).
 
+## Coordinating agents on GitHub
+
+When multiple agents are working on related tasks, use GitHub issues to
+coordinate across hosts. Before starting, check the issue and record which
+agent owns each task. Update the issue when work is blocked or changes hands.
+Link related issues and pull requests, including those in the sibling repository,
+so the next agent can find dependencies and test results.
+
+A single agent may skip this coordination.
+
 ## Workflows
 
 **Fix a wrong simulation result**

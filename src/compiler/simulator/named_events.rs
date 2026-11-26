@@ -658,6 +658,23 @@ impl Simulator {
         }))
     }
 
+    // A fixed array can contain null handles when an always block first arms.
+    // The declared element class still identifies the property to sample.
+    fn selected_receiver_value_property(&self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, member } = &e.kind else {
+            return false;
+        };
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return false;
+        }
+        self.get_expr_type_name(expr)
+            .and_then(|class| self.class_property_decl_type(&class, &member.name))
+            .is_some_and(|(dt, dims)| dims.is_empty() && !matches!(
+                self.resolve_dt_ref(&dt),
+                DataType::Simple { kind: crate::ast::types::SimpleType::Event, .. }
+            ))
+    }
+
     fn expr_has_non_event_prop(&mut self, expr: &Expression) -> bool {
         match &expr.kind {
             ExprKind::Paren(inner) => self.expr_has_non_event_prop(inner),
@@ -688,8 +705,9 @@ impl Simulator {
                     || self.expr_has_non_event_prop(else_expr)
             }
             _ => {
-                self.expr_handle_prop_any(expr)
-                    .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
+                self.selected_receiver_value_property(expr)
+                    || self.expr_handle_prop_any(expr)
+                        .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
                     || (self.chain_rooted_at_handle(expr)
                         && !self.chain_may_name_vif(expr)
                         && self
@@ -904,6 +922,9 @@ impl Simulator {
                 .any(|f| f.contains_key(h.path[0].name.name.as_str()))
         {
             return false;
+        }
+        if self.selected_receiver_value_property(e) {
+            return true;
         }
         if let Some((h, f)) = self.expr_handle_prop_any(e) {
             return !self.class_prop_is_event(h, &f);
@@ -1252,8 +1273,48 @@ impl Simulator {
         if matches!(e.kind, ExprKind::Null) {
             return Some(Self::EVENT_NULL_KEY.to_string());
         }
-        let k = self.event_ref_key(e)?;
-        Some(self.resolve_event_key(&k))
+        if let Some(k) = self.event_ref_key(e) {
+            return Some(self.resolve_event_key(&k));
+        }
+        self.class_event_operand_key(e)
+    }
+
+    /// §15.5.5: the identity key of a class-property event: the null key once
+    /// the property holds `null` (the assignment still stores the handle),
+    /// else the event object its slot holds, or the slot itself while it has
+    /// never shared one.
+    fn class_event_operand_key(&mut self, e: &Expression) -> Option<String> {
+        let leaf = match &e.kind {
+            ExprKind::Ident(h) => h
+                .path
+                .last()
+                .filter(|s| s.selects.is_empty())?
+                .name
+                .name
+                .as_str(),
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            _ => return None,
+        };
+        let mut root = e;
+        while let ExprKind::MemberAccess { expr, .. } = &root.kind {
+            root = expr;
+        }
+        if !self.class_event_names().contains(leaf)
+            || !(matches!(root.kind, ExprKind::This) || Self::cond_expr_is_effect_free(e, false))
+        {
+            return None;
+        }
+        let k = self
+            .instance_event_slot(e)
+            .filter(|k| self.class_prop_declared_event(k.0, &k.1))?;
+        let v = self.eval_expr(e);
+        if !v.has_xz() && v.to_u64() == Some(0) {
+            return Some(Self::EVENT_NULL_KEY.to_string());
+        }
+        Some(match self.event_obj_ids.get(&k) {
+            Some(id) => format!("\u{2}obj{id}"),
+            None => Self::instance_event_stamp_key(&k),
+        })
     }
 
     /// `.triggered` stamp key for a per-instance class event. Instance events
@@ -1789,31 +1850,7 @@ impl Simulator {
                 _ => None,
             }
         };
-        let names = match &self.class_event_prop_names {
-            Some(n) => n.clone(),
-            None => {
-                let n: HashSet<String> = self
-                    .module
-                    .classes
-                    .values()
-                    .flat_map(|cd| {
-                        cd.property_types.iter().filter_map(|(p, dt)| {
-                            matches!(
-                                dt,
-                                DataType::Simple {
-                                    kind: crate::ast::types::SimpleType::Event,
-                                    ..
-                                }
-                            )
-                            .then(|| p.clone())
-                        })
-                    })
-                    .collect();
-                let n = std::rc::Rc::new(n);
-                self.class_event_prop_names = Some(n.clone());
-                n
-            }
-        };
+        let names = self.class_event_names();
         if names.is_empty() || !leaf(lvalue).is_some_and(|n| names.contains(&n)) {
             return;
         }
@@ -1868,6 +1905,34 @@ impl Simulator {
         }
         self.event_obj_slots.entry(id).or_default().push(slot);
         note_event_trigger();
+    }
+
+    /// Every property name some class declares `event`, built on first use: a
+    /// quick filter, not proof that a given object's property is an event.
+    fn class_event_names(&mut self) -> std::rc::Rc<HashSet<String>> {
+        if let Some(n) = &self.class_event_prop_names {
+            return n.clone();
+        }
+        let n: HashSet<String> = self
+            .module
+            .classes
+            .values()
+            .flat_map(|cd| {
+                cd.property_types.iter().filter_map(|(p, dt)| {
+                    matches!(
+                        dt,
+                        DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
+                        }
+                    )
+                    .then(|| p.clone())
+                })
+            })
+            .collect();
+        let n = std::rc::Rc::new(n);
+        self.class_event_prop_names = Some(n.clone());
+        n
     }
 
     /// Is `field` of the object `handle` declared `event` (`class_prop_is_event`

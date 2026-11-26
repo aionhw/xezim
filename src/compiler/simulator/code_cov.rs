@@ -1224,6 +1224,18 @@ impl Simulator {
             let copy = |k: &str, sp: Span| {
                 !k.contains('.') && !k.contains("::") && dotted.contains(&(k.to_string(), sp.start))
             };
+            // Materialize any deferred instance-scoped callable bodies before
+            // instrumenting so per-instance signal references are in place.
+            let deferred_fns: Vec<String> =
+                self.module.deferred_function_bodies.keys().cloned().collect();
+            for key in deferred_fns {
+                Self::materialize_deferred_fn_in_place(&mut self.module, &key);
+            }
+            let deferred_tasks: Vec<String> =
+                self.module.deferred_task_bodies.keys().cloned().collect();
+            for key in deferred_tasks {
+                Self::materialize_deferred_task_in_place(&mut self.module, &key);
+            }
             let mut functions = std::mem::take(&mut self.module.functions).into_map();
             for (key, fd) in functions.iter_mut() {
                 if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
@@ -1322,7 +1334,7 @@ impl Simulator {
                 .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
                 .unwrap_or_default()
         } else {
-            scope
+            scope.to_string()
         };
         let paths = std::mem::take(&mut cov.inst_paths);
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);

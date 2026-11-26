@@ -172,7 +172,7 @@ impl Simulator {
         if let Some(c) = self.event_queue.pending_stmts_for(pid) {
             return Some(c);
         }
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             return Some(&w.continuation);
         }
         if let Some((_, c)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
@@ -225,6 +225,47 @@ impl Simulator {
         let info = self.suspended_proc_info.remove(&pid)?;
         self.suspended_pids.remove(&pid);
         Some(info.continuation)
+    }
+
+    /// §9.6.2: a named fork belongs to a lexical declaration. Concurrent
+    /// activations of that declaration share a target, sibling instances do not.
+    pub(super) fn register_named_fork(&mut self, label: &str, children: &HashSet<usize>) {
+        let key = format!("{}.{label}", self.m_path());
+        let mut all = self.fork_block_children.remove(&key).unwrap_or_default();
+        all.retain(|pid| {
+            !self.killed_pids.contains(pid) && (!self.finished_pids.contains(pid)
+                || self.process_parents.values().any(|parent| parent == pid))
+        });
+        all.extend(children.iter().copied());
+        self.fork_block_children.insert(key, all);
+    }
+
+    pub(super) fn named_fork_target(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<String> {
+        let mut path = String::new();
+        for segment in &target.path {
+            if !path.is_empty() { path.push('.'); }
+            path.push_str(&segment.name.name);
+            for index in &segment.selects {
+                use std::fmt::Write;
+                write!(path, "[{}]", Self::try_const_u64(index)?).ok()?;
+            }
+        }
+        if let Some(path) = path.strip_prefix("$root.") {
+            return self.fork_block_children.contains_key(path).then(|| path.to_owned());
+        }
+        if self.fork_block_children.contains_key(&path) {
+            return Some(path);
+        }
+        let current = self.m_path();
+        let mut scope = if target.root.is_some() { self.module.name.as_str() } else { &current };
+        loop {
+            let key = format!("{scope}.{path}");
+            if self.fork_block_children.contains_key(&key) { return Some(key); }
+            scope = scope.rsplit_once('.')?.0;
+        }
     }
 
     /// IEEE 1800-2023 §9.6.2: `disable x` where `x` is a block (or task)
@@ -620,6 +661,7 @@ impl Simulator {
                                     )
                                         && super::bytecode::BytecodeCompiler::static_local_carries(
                                             &d.name.name,
+                                            Some(&*data_type),
                                             rest,
                                         )))
                         })
@@ -1071,6 +1113,77 @@ impl Simulator {
         }
     }
 
+    pub(super) fn materialize_fn_fields(
+        functions: &mut super::elaborate::FuncTable,
+        deferred: &mut HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        packages: &HashSet<String>,
+        key: &str,
+    ) -> bool {
+        let Some(ctx) = deferred.remove(key) else {
+            return false;
+        };
+        let Some(mut fd) = functions.get(key).cloned() else {
+            return false;
+        };
+        fd.items = crate::ast::cache::without_scope_caches(|| {
+            let mut items = ctx.materialize_body(&fd.ports, &fd.items);
+            if !packages.is_empty() {
+                let pkgs: std::collections::HashSet<String> = packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
+        functions.insert(key.to_string(), fd);
+        true
+    }
+
+    pub(super) fn materialize_task_fields(
+        tasks: &mut HashMap<String, TaskDeclaration>,
+        deferred: &mut HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        packages: &HashSet<String>,
+        key: &str,
+    ) -> bool {
+        let Some(ctx) = deferred.remove(key) else {
+            return false;
+        };
+        let Some(td) = tasks.get_mut(key) else {
+            return false;
+        };
+        td.items = crate::ast::cache::without_scope_caches(|| {
+            let mut items = ctx.materialize_body(&td.ports, &td.items);
+            if !packages.is_empty() {
+                let pkgs: std::collections::HashSet<String> = packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
+        true
+    }
+
+    pub(super) fn materialize_deferred_fn_in_place(module: &mut ElaboratedModule, key: &str) {
+        Self::materialize_fn_fields(
+            &mut module.functions,
+            &mut module.deferred_function_bodies,
+            &module.packages,
+            key,
+        );
+    }
+
+    pub(super) fn materialize_deferred_task_in_place(module: &mut ElaboratedModule, key: &str) {
+        Self::materialize_task_fields(
+            &mut module.tasks,
+            &mut module.deferred_task_bodies,
+            &module.packages,
+            key,
+        );
+    }
+
     /// §6.21 / §13.3 / §13.4: module subroutine statics have one
     /// declaration-owned store, shared by recursion and allocated before
     /// time zero. Allocate all cells first, then evaluate their initializers.
@@ -1111,6 +1224,29 @@ impl Simulator {
                 | StatementKind::Wait { stmt: body, .. } => selected(body, nba_names),
                 _ => false,
             }
+        }
+        fn needs_prepare(
+            items: &[Statement],
+            routine: &str,
+            automatic: bool,
+            addressed: &HashSet<String>,
+            selected_memo: &mut HashMap<usize, bool>,
+            ptr: usize,
+        ) -> bool {
+            if !addressed.is_empty()
+                && items.iter().any(|stmt| {
+                    Simulator::has_addressed_statics(stmt, routine, automatic, addressed)
+                })
+            {
+                return true;
+            }
+            *selected_memo.entry(ptr).or_insert_with(|| {
+                let mut nba_names = HashSet::default();
+                for stmt in items.iter() {
+                    Simulator::collect_nba_roots(stmt, &mut nba_names);
+                }
+                items.iter().any(|s| selected(s, &nba_names))
+            })
         }
         fn collect(
             s: &Statement,
@@ -1299,7 +1435,10 @@ impl Simulator {
                     }
                 ) {
                     Expression::new(ExprKind::StringLiteral(String::new()), port.span)
-                } else if super::elaborate::is_type_real(&port.data_type) {
+                } else if super::elaborate::is_type_real_resolved(
+                    &port.data_type,
+                    &module.typedef_types,
+                ) {
                     Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::Real(0.0)),
                         port.span,
@@ -1340,6 +1479,7 @@ impl Simulator {
         let mut allocate = Vec::new();
         let mut initialize = Vec::new();
         let mut ordinal = 0usize;
+        let mut selected_memo: HashMap<usize, bool> = HashMap::default();
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
         let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> =
@@ -1351,12 +1491,34 @@ impl Simulator {
             if !original.name.scopes.is_empty() {
                 continue;
             }
-            let mut fd = original.clone();
-            if let Some(items) = rewritten.get(&fd.name.name.name) {
+            if let Some(items) = rewritten.get(&original.name.name.name) {
+                let mut fd = original.clone();
                 fd.items = items.clone();
-            } else {
-                ordinal += 1;
-                if !prepare(
+                module.functions.insert(key, fd);
+                continue;
+            }
+            // `psub<ordinal>_` names the cells of every routine's statics:
+            // count each routine, prepared or not, so the names do not depend
+            // on which bodies are still deferred.
+            ordinal += 1;
+            let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
+            let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
+            if !needs_prepare(
+                &original.items,
+                &original.name.name.name,
+                automatic,
+                addressed,
+                &mut selected_memo,
+                ptr,
+            ) {
+                continue;
+            }
+            Self::materialize_deferred_fn_in_place(module, &key);
+            let Some(mut fd) = module.functions.get(&key).cloned() else {
+                continue;
+            };
+            let changed = crate::ast::cache::without_scope_caches(|| {
+                prepare(
                     module,
                     &mut fd.items,
                     &fd.ports,
@@ -1366,24 +1528,44 @@ impl Simulator {
                     &mut initialize,
                     &mut names,
                     addressed,
-                    fd.lifetime == Some(crate::ast::types::Lifetime::Automatic),
-                ) {
-                    continue;
-                }
-                routines.insert(fd.name.name.name.clone());
-                rewritten.insert(fd.name.name.name.clone(), fd.items.clone());
+                    automatic,
+                )
+            });
+            if !changed {
+                continue;
             }
+            routines.insert(fd.name.name.name.clone());
+            rewritten.insert(fd.name.name.name.clone(), fd.items.clone());
             module.functions.insert(key, fd);
         }
         let mut tasks: Vec<_> = module.tasks.keys().cloned().collect();
         tasks.sort();
         for key in tasks {
+            let Some(original) = module.tasks.get(&key) else {
+                continue;
+            };
+            if !original.name.scopes.is_empty() {
+                continue;
+            }
+            ordinal += 1;
+            let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
+            let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
+            if !needs_prepare(
+                &original.items,
+                &original.name.name.name,
+                automatic,
+                addressed,
+                &mut selected_memo,
+                ptr,
+            ) {
+                continue;
+            }
+            Self::materialize_deferred_task_in_place(module, &key);
             let Some(mut td) = module.tasks.remove(&key) else {
                 continue;
             };
-            if td.name.scopes.is_empty() {
-                ordinal += 1;
-                if prepare(
+            let changed = crate::ast::cache::without_scope_caches(|| {
+                prepare(
                     module,
                     &mut td.items,
                     &td.ports,
@@ -1393,10 +1575,11 @@ impl Simulator {
                     &mut initialize,
                     &mut names,
                     addressed,
-                    td.lifetime == Some(crate::ast::types::Lifetime::Automatic),
-                ) {
-                    routines.insert(td.name.name.name.clone());
-                }
+                    automatic,
+                )
+            });
+            if changed {
+                routines.insert(td.name.name.name.clone());
             }
             module.tasks.insert(key, td);
         }
@@ -1915,7 +2098,11 @@ impl Simulator {
             for d in declarators {
                 let nm = d.name.name.as_str();
                 sv.declared_names.push(nm.to_string());
-                if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
+                // §13.5 / §25.9: a variable of any type hides a key left under
+                // its name by an enclosing or a caller's binding too.
+                if (d.dimensions.is_empty() && self.is_virtual_iface_type(data_type))
+                    || self.vif_local_names.contains(nm)
+                {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
                     // nested block has rebound or cleared the same bare name.
@@ -3123,7 +3310,7 @@ impl Simulator {
                                     pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 );
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             }
                             return;
                         }
@@ -4207,6 +4394,18 @@ impl Simulator {
         !self.nba_queued_partial_ids.is_empty() && self.nba_queued_partial_ids.contains(&id)
     }
 
+    /// The signal a clocking select drive writes (`net[0]`, `net[3:2]`).
+    /// The target is read outside any method: a select issued from a class
+    /// task names the bound net by its own name, which the method-scope
+    /// lookup would read as a possible class property.
+    pub(super) fn clocking_select_signal(&mut self, target: &Expression) -> Option<usize> {
+        let mut ids = Vec::new();
+        self.this_stack.push(None);
+        self.partial_nba_signal_ids(target, &mut ids);
+        self.this_stack.pop();
+        ids.first().copied()
+    }
+
     /// The signals a partial nonblocking lvalue writes: a concatenation
     /// contributes each element's, a select the signal of its base, anything
     /// else the signal [`Self::packed_nba_base_slice`] finds.
@@ -4614,7 +4813,9 @@ impl Simulator {
     pub(super) fn fit_value_to_signal(&self, id: usize, val: &Value) -> Value {
         let width = self.signal_widths[id];
         if self.signal_real[id] {
-            let mut r = if val.is_real {
+            let mut r = if self.shortreal_signals.contains(&id) {
+                Value::from_f64(val.to_f64() as f32 as f64)
+            } else if val.is_real {
                 val.clone()
             } else {
                 Value::from_f64(val.to_f64())
@@ -4800,6 +5001,21 @@ impl Simulator {
         applied
     }
 
+    /// A driver that evaluates to zero delay belongs to Active (§4.4.2).
+    /// Deliver its edges before an inactive continuation or NBA can observe
+    /// the old net or change the values an edge-sensitive process samples.
+    pub(super) fn drain_active_driver_updates(&mut self) {
+        if self.delayed_updates.is_empty() {
+            return;
+        }
+        let was_in_edge_cont = self.in_edge_cont;
+        self.in_edge_cont = true;
+        if self.apply_due_delayed_now() {
+            self.drain_edge_exec_rescan();
+        }
+        self.in_edge_cont = was_in_edge_cont;
+    }
+
     /// Get the next time a delayed update is due (for time advancement).
     pub(super) fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _, _)| *t).min();
@@ -4870,7 +5086,7 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     pub(super) fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
-        self.schedule_delayed_transition(id, val, delay, None);
+        self.schedule_delayed_transition(id, val, delay, None, None);
     }
 
     /// §10.3.3 / §28.16: the delay of a change from `old` to `new` with the
@@ -4926,6 +5142,7 @@ impl Simulator {
         val: Value,
         delay: u64,
         delay_target: Option<DelayTarget>,
+        runtime: Option<(Option<u64>, Option<u64>)>,
     ) {
         // §30.4 path-delayed net: the module paths pick the delay.
         if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
@@ -4939,7 +5156,7 @@ impl Simulator {
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
         // goes fully zero.
-        let delay = if self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
+        let delay = if runtime.is_none() && self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
         {
             delay
         } else {
@@ -4959,8 +5176,10 @@ impl Simulator {
             let old_value = selected
                 .as_ref()
                 .map_or(&self.signal_table[id], |(_, old)| old);
-            let fall = self.gate_fall_delay_by_id.get(&id).copied();
-            let off = self.gate_off_delay_by_id.get(&id).copied();
+            let (fall, off) = runtime.unwrap_or_else(|| (
+                self.gate_fall_delay_by_id.get(&id).copied(),
+                self.gate_off_delay_by_id.get(&id).copied(),
+            ));
             Self::transition_delay(new_value, old_value, delay, fall, off, vector_assign)
         };
         let target_time = self.time + delay;
@@ -5247,7 +5466,11 @@ impl Simulator {
         }
     }
 
-    fn snapshot_wide(previous: &mut HashMap<usize, Value>, id: usize, current: &Value) {
+    pub(super) fn snapshot_wide(
+        previous: &mut HashMap<usize, Value>,
+        id: usize,
+        current: &Value,
+    ) {
         match previous.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 slot.get_mut().copy_from(current);
@@ -5369,25 +5592,7 @@ impl Simulator {
                 );
             }
         }
-        for i in 0..self.event_waiters.len() {
-            for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
-                let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
-                // A cell of a memory stored without element names (arena or
-                // bulk) has no edge snapshot; its waiter compares against
-                // its own `captured_prev`.
-                if sid >= self.prev_val.len() {
-                    continue;
-                }
-                snap_one(
-                    sid,
-                    &self.signal_table,
-                    &self.signal_widths,
-                    &mut self.prev_val,
-                    &mut self.prev_xz,
-                    &mut self.prev_wide,
-                );
-            }
-        }
+        self.snapshot_waiter_signals();
         for i in 0..self.cg_event_waiters.len() {
             for j in 0..self.cg_event_waiters[i].1.len() {
                 let sid = self.cg_event_waiters[i].1[j].signal_id;

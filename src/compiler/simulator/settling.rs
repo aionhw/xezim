@@ -5,9 +5,34 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Install a register file of the evaluation's own for the bytecode of
+    /// the combinational logic a settle evaluates, and return the caller's.
+    /// A compiled method or process loop that waits in an interpreted call
+    /// keeps `this`, its formals, locals and held operands in `vm_regs`; the
+    /// logic a write in that call triggers is a separate evaluation (§4.5,
+    /// §9.2.2.2, §10.3) and must not change what the subroutine owns (§13.4,
+    /// §13.5, §8.11). A pointer swap and a pool pop in steady state.
+    #[inline]
+    pub(super) fn enter_private_regs(&mut self) -> Vec<Value> {
+        let own = self.vm_regs_pool.pop().unwrap_or_default();
+        std::mem::replace(&mut self.vm_regs, own)
+    }
+
+    /// Put the caller's register file back (see `enter_private_regs`).
+    #[inline]
+    pub(super) fn leave_private_regs(&mut self, caller: Vec<Value>) {
+        let own = std::mem::replace(&mut self.vm_regs, caller);
+        self.vm_regs_pool.push(own);
+    }
+
     pub(super) fn settle_combinatorial(&mut self) {
         if self.finished {
             return;
+        }
+        // §9.2.2.2: an entry held for the time-0 start batch does not stay
+        // held past time zero, whichever loop moved the time on.
+        if !self.comb_time0_held.is_empty() && self.time != 0 {
+            self.release_time0_held();
         }
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
@@ -86,16 +111,49 @@ impl Simulator {
         self.mark_release_sources_dirty(id);
     }
 
+    /// The indices of the comb entries that write signal `id`, in table
+    /// order (§10.6.2). A release re-drives the net from them; looking them
+    /// up in `comb_writer_index` replaces a scan of every entry, which a
+    /// testbench releasing a signal each clock repeated every cycle. Empty
+    /// while a settle pass has the table taken out, as the scan was.
+    pub(super) fn comb_writers_of(&mut self, id: usize) -> Vec<usize> {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if self
+            .comb_writer_index
+            .as_ref()
+            .is_none_or(|(len, _)| *len != n)
+        {
+            let mut index: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (eidx, entry) in self.comb_entries.iter().enumerate() {
+                for &w in &entry.cold.write_signal_ids {
+                    let writers = index.entry(w).or_default();
+                    // An entry that lists a signal twice is one writer.
+                    if writers.last() != Some(&(eidx as u32)) {
+                        writers.push(eidx as u32);
+                    }
+                }
+            }
+            self.comb_writer_index = Some((n, index));
+        }
+        self.comb_writer_index
+            .as_ref()
+            .and_then(|(_, index)| index.get(&id))
+            .map(|writers| writers.iter().map(|&e| e as usize).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
         let mut constant_drivers: Vec<CombEntry> = Vec::new();
-        for entry in self.comb_entries.iter() {
-            if entry.cold.write_signal_ids.contains(&id) {
-                if entry.cold.read_signal_ids.is_empty() {
-                    constant_drivers.push(entry.clone());
-                } else {
-                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                }
+        for eidx in self.comb_writers_of(id) {
+            let entry = &self.comb_entries[eidx];
+            if entry.cold.read_signal_ids.is_empty() {
+                constant_drivers.push(entry.clone());
+            } else {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
             }
         }
         for src_id in sources {
@@ -235,6 +293,7 @@ impl Simulator {
         let mut next_seed = std::mem::take(&mut self.bsp_next_seed);
         next_seed.clear();
         let mut view = std::mem::take(&mut self.signal_table);
+        let caller_regs = self.enter_private_regs();
         let mut vm_regs = std::mem::take(&mut self.vm_regs);
         let mut dirtied: Vec<u32> = Vec::new();
         let mut par_scratch: Vec<usize> = Vec::new();
@@ -307,6 +366,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let shortreal_signals = &self.shortreal_signals;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
@@ -351,6 +411,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            shortreal_signals,
                                             two_state,
                                             gate_driven,
                                             n2id,
@@ -532,6 +593,7 @@ impl Simulator {
 
         self.signal_table = view;
         self.vm_regs = vm_regs;
+        self.leave_private_regs(caller_regs);
         // Restore reusable buffers (retain capacity for the next call).
         seed_list.clear();
         self.settle_triggered_list = seed_list;
@@ -618,6 +680,13 @@ impl Simulator {
         }
     }
 
+    /// The elaborator has already scaled each delay expression to global ticks.
+    pub(super) fn eval_driver_delays(&mut self, exprs: &[Option<Expression>; 3]) -> [Option<u64>; 3] {
+        exprs.each_ref().map(|expr| {
+            expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+        })
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -632,6 +701,7 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
                 delay_target,
+                delay_exprs,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
@@ -687,17 +757,19 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 }
                 let w = self.infer_lhs_width(lhs);
-                // §20.3: `$time` in the RHS counts the assign's own module's
-                // timeunit, not that of the process whose write woke it.
+                // §20.3: use the timeunit of the scope that authored the RHS.
                 let saved_ts =
-                    std::mem::replace(&mut self.timescale_scope_override, entry.cold.ts_scope());
+                    std::mem::replace(&mut self.timescale_scope_override, entry.ts_scope());
                 // §10.8, §10.9: a pattern takes the net's declared type.
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
+                let runtime = delay_exprs.as_deref().map(|exprs| self.eval_driver_delays(exprs));
                 self.timescale_scope_override = saved_ts;
-                let delay = if *explicit_delay > 0 {
+                let delay = if let Some([Some(rise), _, _]) = runtime {
+                    rise
+                } else if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
                     lhs_id
@@ -728,7 +800,7 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0
+                if runtime.is_some() || delay > 0
                     || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
@@ -738,7 +810,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_transition(id, val, delay, delay_target);
+                                self.schedule_delayed_transition(id, val, delay, delay_target,
+                                    runtime.map(|[_, fall, off]| (fall, off)));
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -757,6 +830,7 @@ impl Simulator {
                                 select_delays: Some((fall, off)),
                                 ..
                             }) => {
+                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
                                 let hi = (lo + sel_w - 1) as usize;
                                 let old = self.signal_table[base_id].range_select(hi, lo as usize);
                                 Self::transition_delay(
@@ -775,11 +849,7 @@ impl Simulator {
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
                     let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
+                        self.fit_value_to_signal(id, &val)
                     } else if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
                     } else {
@@ -813,7 +883,7 @@ impl Simulator {
                 // An absent name hint still needs an explicit top override;
                 // None would inherit the last scheduled process's timescale.
                 let saved_ts = self.timescale_scope_override.take();
-                self.timescale_scope_override = entry.cold.ts_scope();
+                self.timescale_scope_override = entry.ts_scope();
                 self.exec_statement(stmt);
                 self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
@@ -847,6 +917,10 @@ impl Simulator {
             }
             CombItem::CompiledContAssign { compiled, .. }
             | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                // Inside a settle the file is already the settle's own; a
+                // `release`, a force refresh or a time-0 replay outside one
+                // can run while a compiled caller waits (§13.4).
+                let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                 if self.vm_regs.len() < compiled.num_regs as usize {
                     self.vm_regs
                         .resize(compiled.num_regs as usize, Value::zero(1));
@@ -860,11 +934,14 @@ impl Simulator {
                 // §20.3: `$time` in a fallback counts the entry's own module,
                 // not the process whose write or release reached it.
                 let saved_ts = compiled.has_fallback.then(|| {
-                    std::mem::replace(&mut self.timescale_scope_override, entry.cold.ts_scope())
+                    std::mem::replace(&mut self.timescale_scope_override, entry.ts_scope())
                 });
                 self.exec_insns(insns);
                 if let Some(ts) = saved_ts {
                     self.timescale_scope_override = ts;
+                }
+                if let Some(caller_regs) = caller_regs {
+                    self.leave_private_regs(caller_regs);
                 }
             }
             CombItem::FusedGate { op } => {
@@ -950,7 +1027,8 @@ impl Simulator {
         self.quiet_bits.resize(n.div_ceil(64), 0);
         for id in 0..n {
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            // An edge signal, or one a parked waiter is indexed under.
+            let edge = self.waiter_signal_hooked(id);
             if !armed && !edge {
                 self.quiet_bits[id >> 6] |= 1u64 << (id & 63);
             }
@@ -1295,7 +1373,7 @@ impl Simulator {
             self.gate_lane[eidx] = self.gate_ops.len() as u32;
             self.gate_ops.push(*op);
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            let edge = self.waiter_signal_hooked(id);
             let wide = self.signal_widths.get(id).copied().unwrap_or(65) > 64;
             self.gate_obs
                 .push((armed as u8) | ((edge as u8) << 1) | ((wide as u8) << 2));
@@ -1629,6 +1707,7 @@ impl Simulator {
             self.settling = false;
             return;
         }
+        let caller_regs = self.enter_private_regs();
 
         // Chaotic-iteration loop: drain a sorted worklist of triggered
         // entries each pass. New triggers added during a pass (via worklist
@@ -2498,7 +2577,7 @@ impl Simulator {
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
                                         *self.name_resolve_hint.borrow_mut() = sc;
-                                        self.timescale_scope_override = entries[eidx].cold.ts_scope();
+                                        self.timescale_scope_override = entries[eidx].ts_scope();
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2549,7 +2628,7 @@ impl Simulator {
                             let saved_ts = compiled.has_fallback.then(|| {
                                 std::mem::replace(
                                     &mut self.timescale_scope_override,
-                                    entries[eidx].cold.ts_scope(),
+                                    entries[eidx].ts_scope(),
                                 )
                             });
                             if self.dispatch_comb_plan(eidx, compiled) {
@@ -2617,7 +2696,7 @@ impl Simulator {
                                     let saved_vm_ts = compiled.has_fallback.then(|| {
                                         std::mem::replace(
                                             &mut self.timescale_scope_override,
-                                            entries[eidx].cold.ts_scope(),
+                                            entries[eidx].ts_scope(),
                                         )
                                     });
                                     self.exec_insns(insns);
@@ -2955,6 +3034,7 @@ impl Simulator {
         if total_iters > self.max_settle_iters {
             self.max_settle_iters = total_iters;
         }
+        self.leave_private_regs(caller_regs);
         self.settling = false;
     }
 

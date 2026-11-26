@@ -150,10 +150,11 @@ fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
     assert_eq!(sim.heap.len(), slots);
     assert!(sim.signals.elem_keys(&dead_array).is_empty());
     assert!(!sim.module.arrays.contains_key(&dead_array));
-    assert!(!sim
-        .signals
-        .keys()
-        .any(|n| super::Simulator::class_storage_owner(n) == Some(dead)));
+    assert!(
+        !sim.signals
+            .keys()
+            .any(|n| super::Simulator::class_storage_owner(&n) == Some(dead))
+    );
     assert_eq!(sim.signals.get(&format!("{live_array}[0]")), Some(&saved));
     assert!(sim.module.arrays.contains_key(&live_array));
     assert_eq!(sim.release_unreachable_class_storage(&mask), 0);

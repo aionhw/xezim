@@ -65,10 +65,10 @@ fn fixed_array_pattern_accepts_bare_const_ident_keys() {
     let src = r#"
 module top;
   localparam int IDX = 2;
-  int fa [4] = '{ IDX : 9 };
+  int fa [4] = '{ IDX : 9, default: 0 };
   initial begin
     int local_fa [4];
-    local_fa = '{ IDX : 7, 0 : 5 };
+    local_fa = '{ IDX : 7, 0 : 5, default: 0 };
     $display("T|fa=%0d/%0d/%0d/%0d", fa[0], fa[1], fa[2], fa[3]);
     $display("T|lfa=%0d/%0d", local_fa[0], local_fa[IDX]);
   end

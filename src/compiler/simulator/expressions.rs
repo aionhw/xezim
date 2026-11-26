@@ -231,6 +231,18 @@ impl Simulator {
                 return v;
             }
         }
+        // §27.6: through an indexed scope, `gen[1].cb.a` reads the block of
+        // copy 1 (`u[0].cb.a`, of an instance-array element).
+        if matches!(expr.kind, ExprKind::MemberAccess { .. })
+            && let Some(flat) = self.clocking_indexed_term_as_ident(expr)
+            && let ExprKind::Ident(h) = &flat.kind
+        {
+            let mut refs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+            refs.push(member.name.as_str());
+            if let Some(v) = self.try_clocking_signal_read(&refs) {
+                return v;
+            }
+        }
         // §25.10: member access through an indexed plain virtual-
         // interface array (`vifs[i].data`). Resolve the element alias
         // before generic flattened aggregate handling creates/reads a
@@ -551,6 +563,9 @@ impl Simulator {
                         for i in 0..w {
                             out.set_bit(i as usize, cur.get_bit((off + i) as usize));
                         }
+                        if w == 64 && self.union_real_member(&base_flat, &member.name) {
+                            return Self::union_real_read(out);
+                        }
                         // §7.2.1: a 2-state member of a 4-state struct.
                         if out.has_xz()
                             && !self.mixed_packed_vars.is_empty()
@@ -728,7 +743,7 @@ impl Simulator {
                     let mut m = std::collections::HashMap::new();
                     if let Some(dt) = dt_opt {
                         let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                        if let Some(fs) = Self::struct_field_layout(&resolved) {
+                        if let Some(fs) = self.struct_field_layout(&resolved) {
                             for (fn_, _, _, fr) in fs {
                                 m.insert(fn_, fr);
                             }
@@ -760,7 +775,7 @@ impl Simulator {
                                     &fd.return_type,
                                     &self.module.typedef_types,
                                 );
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             } else {
                                 None
                             }
@@ -768,7 +783,7 @@ impl Simulator {
                             // Local variable/parameter with typedef type
                             let dt = self.module.typedef_types.get(type_name.as_str())?;
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            self.struct_field_layout(&resolved)
                         } else {
                             // Module-level signal with a typedef'd struct
                             // type: resolve via signal_name_to_id →
@@ -781,13 +796,13 @@ impl Simulator {
                                 let dt = self.module.typedef_types.get(tn.as_str())?;
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             } else {
                                 // Try resolving base_name as a typedef
                                 let dt = self.module.typedef_types.get(&*base_name)?;
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             }
                         }
                     })
@@ -1134,6 +1149,9 @@ impl Simulator {
                 {
                     if let Some(sig) = self.get_local_or_signal(&name) {
                         let mut v = sig.range_select((off + w - 1) as usize, off as usize);
+                        if w == 64 && self.union_real_member(&name, &member.name) {
+                            return Self::union_real_read(v);
+                        }
                         if self.struct_member_signed(&name, &member.name) {
                             v.is_signed = true;
                         }
@@ -1478,7 +1496,7 @@ impl Simulator {
             Some(tn) => {
                 if let Some(dt) = self.module.typedef_types.get(tn.as_str()) {
                     let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                    if Self::struct_field_layout(&resolved).is_some() {
+                    if self.struct_field_layout(&resolved).is_some() {
                         return None;
                     }
                 }
@@ -2027,12 +2045,26 @@ impl Simulator {
             } else {
                 None
             };
-            for member in &segs[split..segs.len() - 1] {
-                handle = handle.and_then(|h| {
-                    let tn = self.class_prop_type_name(h, member)?;
-                    self.resolve_typeref_class_name_str(&tn)?;
-                    self.member_handle(h, member)
-                });
+            let mids = &segs[split..segs.len() - 1];
+            let mut i = 0;
+            while i < mids.len() {
+                let Some(h) = handle else {
+                    break;
+                };
+                // §7.2, §8.4: a class-handle member of an unpacked-struct
+                // property (`o.r.h.k`): the struct's members are cells of
+                // `o`, and the handle member's cell names the next object.
+                if let Some((next, used)) = self.struct_prop_handle_walk(h, &mids[i..]) {
+                    handle = Some(next);
+                    i += used;
+                    continue;
+                }
+                let member = mids[i];
+                handle = self
+                    .class_prop_type_name(h, member)
+                    .and_then(|tn| self.resolve_typeref_class_name_str(&tn))
+                    .and_then(|_| self.member_handle(h, member));
+                i += 1;
             }
             if let Some(h) =
                 handle.filter(|&h| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some()))
@@ -2073,6 +2105,22 @@ impl Simulator {
             selects += 1;
             root = base;
         }
+        // Rebase a virtual interface receiver before asking for the signal's
+        // declared element type. A selected generate scope likewise names
+        // independently stored signals.
+        let physical = match &root.kind {
+            ExprKind::MemberAccess { .. } => self.vif_rebase_expr(root)
+                .or_else(|| self.fold_indexed_hier_path(root)),
+            ExprKind::Ident(h) if h.path.len() > 1 || h.path.iter().any(|s| !s.selects.is_empty()) =>
+                self.vif_rebase_expr(root).or_else(|| {
+                    h.path.iter().any(|s| !s.selects.is_empty())
+                        .then(|| self.fold_indexed_hier_path(root)).flatten()
+                }),
+            _ => None,
+        };
+        if let Some(ref physical) = physical {
+            root = physical;
+        }
         // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
         // declared type is its class's.
         if !self.packed_named_signed_props.is_empty() {
@@ -2092,20 +2140,164 @@ impl Simulator {
             }
         }
         let ExprKind::Ident(h) = &root.kind else {
-            return false;
+            // Rebasing intentionally leaves an identity-bound interface
+            // unchanged. Its source node can still be a member access while
+            // its physical signal declaration uses the flat instance path.
+            if let ExprKind::MemberAccess { expr: receiver, member } = &root.kind
+                && let Some((bound, _)) = self.vif_recv_target(receiver)
+            {
+                let name = format!("{bound}.{}", member.name);
+                return self.declared_signed_select_depth(&name) == Some(selects);
+            }
+            // §7.2, §7.4.1: a member written as a member access
+            // (`sa[1].m[1]`, `f().m[1]`, `h.st.m[1]`).
+            return matches!(&root.kind, ExprKind::MemberAccess { member, .. }
+                if self.packed_named_signed_members.contains(member.name.as_str()))
+                && self.lvalue_static_type(root).is_some_and(|dt| {
+                    super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                        == Some(selects)
+                });
         };
-        if h.root.is_some()
-            || h.path.iter().any(|s| !s.selects.is_empty())
-            || self.frame_bound_bare_name(h).is_some()
+        if h.root.is_some() {
+            // Virtual-interface rebasing marks the physical instance rooted.
+            if h.root.as_deref() != Some("$root")
+                || h.path.iter().any(|seg| !seg.selects.is_empty())
+            {
+                return false;
+            }
+            let name = self.resolve_hier_name(h);
+            let flat = name.strip_prefix(&self.module.name)
+                .and_then(|tail| tail.strip_prefix('.')).unwrap_or(&name);
+            return self.declared_signed_select_depth(flat).or_else(|| {
+                let dt = super::bytecode::declared_type_of(
+                    flat, &self.module.var_decl_types, &self.module.typedef_types)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }) == Some(selects);
+        }
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            // A variable of an indexed scope (`g_loop[0].gv[1]`).
+            if h.path.last().is_some_and(|s| s.selects.is_empty()) {
+                let name = self.resolve_hier_name(h);
+                let name = name.as_ref();
+                if self.packed_named_signed.get(name) == Some(&selects)
+                    && !self.module.arrays.contains_key(name)
+                {
+                    return true;
+                }
+            }
+            // An element of a packed array of structures on the way
+            // (`sa[1].m` as one path): the member's declared type.
+            return h.path.len() >= 2
+                && h.path.last().is_some_and(|s| {
+                    s.selects.is_empty()
+                        && self
+                            .packed_named_signed_members
+                            .contains(s.name.name.as_str())
+                })
+                && self.lvalue_static_type(root).is_some_and(|dt| {
+                    super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                        == Some(selects)
+                });
+        }
+        // §7.4.1, §13.3: a formal or a local of the running subroutine or
+        // block. Its declaration is recorded under the bare name while the
+        // frame is live, so the element type comes from there; the table
+        // built at start-up only holds the design's own variables.
+        if let [seg] = h.path.as_slice()
+            && selects > 1
+            && let Some(store) = self.dyn_name_lookup(&seg.name.name)
+            && let Some(depth) = self.declared_signed_select_depth(store)
         {
-            return false;
+            return depth == selects;
+        }
+        if let Some(n) = self.frame_bound_bare_name(h) {
+            return self.frame_named_signed_depth(n) == Some(selects);
         }
         let name = self.resolve_hier_name(h);
         let name = name.as_ref();
-        self.packed_named_signed.get(name) == Some(&selects)
-            && !self.module.arrays.contains_key(name)
-            && !self.module.arrays_2d.contains_key(name)
-            && !self.module.arrays_nd.contains_key(name)
+        let depth = self.declared_signed_select_depth(name);
+        if depth == Some(selects) {
+            return true;
+        }
+        // §7.2, §7.4.1: a packed-array member reached through structure
+        // members, elements of a packed array of structures or an instance
+        // (`nst.i.m[1]`, `sa[1].m[1]`, `u.st.m[1]`) has its declared type.
+        depth.is_none()
+            && h.path.len() >= 2
+            && h.path.last().is_some_and(|s| {
+                self.packed_named_signed_members
+                    .contains(s.name.name.as_str())
+            })
+            && self.lvalue_static_type(root).is_some_and(|dt| {
+                super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                    == Some(selects)
+            })
+    }
+
+    fn declared_signed_select_depth(&self, name: &str) -> Option<usize> {
+        let packed = self.packed_named_signed.get(name).copied().or_else(|| {
+            if name.starts_with('@') {
+                let dt = self.p_elem_type_ref(name)?;
+                super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+            } else {
+                let dt = self.module.var_decl_types.get(name)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }
+        })?;
+        let unpacked = self.unpacked_dims_of(name).max(usize::from(
+            self.module.dynamic_arrays.contains(name) || self.module.queue_vars.contains(name)
+                || self.is_associative_array(name),
+        ));
+        Some(unpacked + packed)
+    }
+
+    /// §7.4.1: whether `dt` is a packed array of a named type, written with
+    /// its own dimensions (`lane_t [0:1]`) or carried by a typedef
+    /// (`typedef lane_t [0:1] arr_t;`).
+    pub(super) fn names_packed_array_of_named(&self, dt: &DataType) -> bool {
+        let mut cur = dt;
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name, dimensions, ..
+            } = cur
+            else {
+                return false;
+            };
+            if !dimensions.is_empty() {
+                return true;
+            }
+            match super::elaborate::lookup_scoped_type(name, &self.module.typedef_types) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// §7.4.1: the select depth at which the formal or local `n` of the
+    /// running frame, a packed array, reaches a named signed element type.
+    /// None for any other variable, an unpacked array of such arrays
+    /// included: its first selects are unpacked, and its declaration here
+    /// is that of one element.
+    fn frame_named_signed_depth(&self, n: &str) -> Option<usize> {
+        let dt = self.module.var_decl_types.get(n)?;
+        let depth =
+            super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)?;
+        let frame = self.local_stack.last()?;
+        let whole = frame.get(n)?;
+        let width = super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (whole.width == width
+            && !frame.contains_key(format!("\u{1}array_formal:{n}").as_str())
+            && !self.module.arrays.contains_key(n)
+            && !self.module.arrays_2d.contains_key(n)
+            && !self.module.arrays_nd.contains_key(n)
+            && !self.module.dynamic_arrays.contains(n)
+            && !self.module.queue_vars.contains(n))
+        .then_some(depth)
     }
 
     /// §7.4.1: the select depth at which the class property `e` names
@@ -2195,7 +2387,13 @@ impl Simulator {
                 let ExprKind::Ident(h) = &root.kind else {
                     return None;
                 };
-                if self.frame_bound_bare_name(h).is_some() {
+                if let Some(n) = self.frame_bound_bare_name(h) {
+                    // §7.4.1: an element of a named signed type.
+                    if self.packed_named_signed_types
+                        && self.frame_named_signed_depth(n) == Some(indices)
+                    {
+                        return Some(true);
+                    }
                     return self
                         .get_expr_type_name(expr)
                         .and_then(|name| self.concrete_type_signed(&name));
@@ -2213,7 +2411,7 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
-                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                if self.declared_signed_select_depth(name.as_ref()) == Some(indices) {
                     // §7.4.1: an element of a named signed type.
                     return Some(true);
                 }
@@ -2415,7 +2613,9 @@ impl Simulator {
         // §7.4.1: an element of a packed array of a named signed type is
         // signed; the slice that reads it is not. One length test when no
         // variable is declared that way.
-        if (!self.packed_named_signed.is_empty() || !self.packed_named_signed_props.is_empty())
+        if (self.packed_named_signed_types
+            || !self.packed_named_signed.is_empty()
+            || !self.packed_named_signed_props.is_empty())
             && matches!(expr.kind, ExprKind::Index { .. })
             && self.packed_named_sign_guard != expr as *const Expression as usize
             && self.packed_named_select_signed(expr)
@@ -2452,6 +2652,24 @@ impl Simulator {
                     abs.cached_resolved_name = crate::ast::cache::NameCache::new();
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
+                }
+                if h.path.len() >= 4 && h.path[0].name.name == "$root" {
+                    for i in 2..h.path.len() - 1 {
+                        if h.path[i].selects.is_empty() {
+                            continue;
+                        }
+                        let mut prefix = h.clone();
+                        prefix.path.truncate(i + 1);
+                        prefix.path[i].selects.clear();
+                        prefix.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        prefix.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        prefix.bound = crate::ast::binding::Bound::UNSET;
+                        let name = self.resolve_hier_name(&prefix);
+                        if self.module.dynamic_arrays.contains(name.as_ref()) {
+                            let selected = Self::hier_select_chain_from(h, expr.span, i);
+                            return self.eval_expr_ctx_inner(&selected, ctx_width, unsigned_context);
+                        }
+                    }
                 }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()
@@ -2631,6 +2849,11 @@ impl Simulator {
             }
             // §7.4.1/§11.5.1: a nested select of a packed variable the frame
             // owns, placed as its write is (`frame_packed_select_write`).
+            if Self::select_of_select(expr)
+                && let Some(v) = self.formal_collection_packed_read(expr)
+            {
+                return v;
+            }
             if Self::select_of_select(expr)
                 && let Some(v) = self.frame_packed_select_read(expr)
             {
@@ -2953,6 +3176,14 @@ impl Simulator {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
                     }
+                    // §7.2, §8.4: a property of the object a class-handle
+                    // member of an unpacked-struct property refers to
+                    // (`o.r.h.k`).
+                    if hier.path.len() >= 3
+                        && let Some(v) = self.struct_handle_leaf_member(expr)
+                    {
+                        return v;
+                    }
                     // Whole unpacked-struct class-property read (`c.first`
                     // where `first` is a struct): assemble the member cells.
                     if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
@@ -3195,7 +3426,9 @@ impl Simulator {
                     }
                 }
                 if hier.path.len() >= 2 {
-                    let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
+                    // §27.6: `gen[1].cb.a` names the block of copy 1.
+                    let scoped = self.clocking_scoped_read_segs(hier);
+                    let segs = Self::clocking_segs(hier, &scoped);
                     if let Some(v) = self.try_clocking_signal_read(&segs) {
                         return v;
                     }
@@ -3275,6 +3508,13 @@ impl Simulator {
                                 // returned "" for `.name` at every scope.
                                 return self.eval_call_inner(expr, &[]);
                             }
+                        }
+                        // §5.13, §6.19.5: any other receiver (a class
+                        // property, a struct member, an element) takes the
+                        // methods from its declared type, as the call does.
+                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
+                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
+                            return v;
                         }
                     }
                 }
@@ -3866,7 +4106,7 @@ impl Simulator {
                             .and_then(|dt| {
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             })
                             .or_else(|| {
                                 // Signal-stored struct: resolve type via
@@ -3881,7 +4121,7 @@ impl Simulator {
                                     .and_then(|dt| {
                                         let resolved =
                                             Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                        Self::struct_field_layout(&resolved)
+                                        self.struct_field_layout(&resolved)
                                     })
                             });
                         if let Some(fields) = layout {
@@ -4171,6 +4411,35 @@ impl Simulator {
                         }
                     }
                 }
+                // #1311, §25.9, §11.4.5: an unpacked variable of an interface
+                // reached through a virtual interface (`vif.arr == w`) is
+                // compared as the bound instance's variable is. A literal on
+                // the other side leaves a scalar comparison.
+                if PatternCmpMode::of(*op).is_some() {
+                    let chain = |e: &Expression| match &e.kind {
+                        ExprKind::MemberAccess { .. } => true,
+                        ExprKind::Ident(h) => h.path.len() >= 2,
+                        _ => false,
+                    };
+                    let (pl, pr) = (Self::peel_parens(left), Self::peel_parens(right));
+                    if (chain(pl) && !Self::cmp_literal_like(pr))
+                        || (chain(pr) && !Self::cmp_literal_like(pl))
+                    {
+                        let cl = chain(pl).then(|| self.vif_aggregate_canon(pl)).flatten();
+                        let cr = chain(pr).then(|| self.vif_aggregate_canon(pr)).flatten();
+                        if cl.is_some() || cr.is_some() {
+                            let rebased = Expression::new(
+                                ExprKind::Binary {
+                                    op: *op,
+                                    left: Box::new(cl.unwrap_or_else(|| (**left).clone())),
+                                    right: Box::new(cr.unwrap_or_else(|| (**right).clone())),
+                                },
+                                expr.span,
+                            );
+                            return self.eval_expr_ctx(&rebased, ctx_width);
+                        }
+                    }
+                }
                 // §11.4.5 / §10.9: equality against an ASSIGNMENT PATTERN
                 // (`a == '{9, 5, 5, 5}`) compares element- / member-wise. A
                 // typed pattern of an unpacked type compares the same way;
@@ -4234,8 +4503,12 @@ impl Simulator {
                     return c.value(want_eq);
                 }
                 // Short-circuit evaluation for logical operators (IEEE §11.3.5)
+                // §11.6.1 Table 11-21: the operands of `&&`, `||`, `->` and
+                // `<->` are self-determined, so the surrounding width does
+                // not reach them: `(a << 1) || 1'b0` for `logic [7:0] a =
+                // 8'h80` shifts at 8 bits and is 0 in a 32-bit context too.
                 if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
-                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let l = self.eval_expr(left);
                     match op {
                         BinaryOp::LogAnd => {
                             // §11.3.5: `&&` short-circuits only when the left is a
@@ -4246,14 +4519,14 @@ impl Simulator {
                             if !l.has_xz() && l.to_u64() == Some(0) {
                                 return Value::from_u64(0, 1);
                             }
-                            let r = self.eval_expr_ctx(right, ctx_width);
+                            let r = self.eval_expr(right);
                             return l.logic_and(&r);
                         }
                         BinaryOp::LogOr => {
                             if l.to_u64().is_some_and(|v| v != 0) {
                                 return Value::from_u64(1, 1);
                             }
-                            let r = self.eval_expr_ctx(right, ctx_width);
+                            let r = self.eval_expr(right);
                             return l.logic_or(&r);
                         }
                         _ => unreachable!(),
@@ -4266,8 +4539,8 @@ impl Simulator {
                     op,
                     BinaryOp::LogImplies | BinaryOp::LogEquiv | BinaryOp::Iff
                 ) {
-                    let l = self.eval_expr_ctx(left, ctx_width);
-                    let r = self.eval_expr_ctx(right, ctx_width);
+                    let l = self.eval_expr(left);
+                    let r = self.eval_expr(right);
                     return match op {
                         BinaryOp::LogImplies => l.logic_impl(&r),
                         BinaryOp::LogEquiv => l.logic_equiv(&r),
@@ -4376,11 +4649,37 @@ impl Simulator {
                 );
                 // Operands the width probe had to evaluate are kept and
                 // reused below instead of being evaluated again.
-                let has_shift = (is_arith_or_bitwise
+                let shift_scanned = is_arith_or_bitwise
                     || is_comparison
-                    || matches!(op, BinaryOp::Div | BinaryOp::Mod))
+                    || matches!(op, BinaryOp::Div | BinaryOp::Mod);
+                // An operand whose parent found it shift-free is, and so are
+                // its operands (see `shift_free_operand`).
+                let shift_free = std::mem::take(&mut self.shift_free_operand)
+                    == expr as *const Expression as usize;
+                let has_shift = shift_scanned
+                    && !shift_free
                     && (super::bytecode::has_context_shift(left)
                         || super::bytecode::has_context_shift(right));
+                // The operand of a shift-free scan that the scan recursed
+                // into, marked while it is evaluated.
+                let shift_free_mark = |e: &Expression| -> usize {
+                    match &e.kind {
+                        ExprKind::Binary {
+                            op:
+                                BinaryOp::Add
+                                | BinaryOp::Sub
+                                | BinaryOp::Mul
+                                | BinaryOp::Div
+                                | BinaryOp::Mod
+                                | BinaryOp::BitAnd
+                                | BinaryOp::BitOr
+                                | BinaryOp::BitXor
+                                | BinaryOp::BitXnor,
+                            ..
+                        } if shift_scanned && !has_shift => e as *const Expression as usize,
+                        _ => 0,
+                    }
+                };
                 let mut pre_l: Option<Value> = None;
                 let mut pre_r: Option<Value> = None;
                 let self_det_w = if is_arith_or_bitwise {
@@ -4575,7 +4874,12 @@ impl Simulator {
                         }
                         v
                     }
-                    None => self.eval_expr_typed(left, self_det_w, left_unsigned),
+                    None => {
+                        self.shift_free_operand = shift_free_mark(left);
+                        let v = self.eval_expr_typed(left, self_det_w, left_unsigned);
+                        self.shift_free_operand = 0;
+                        v
+                    }
                 };
                 // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
                 // value the other side can take — `0 & x` and `0 & z` are both
@@ -4622,7 +4926,10 @@ impl Simulator {
                     let rw = self.infer_width(right);
                     self.eval_expr_ctx(right, rw)
                 } else {
-                    self.eval_expr_typed(right, self_det_w, right_unsigned)
+                    self.shift_free_operand = shift_free_mark(right);
+                    let v = self.eval_expr_typed(right, self_det_w, right_unsigned);
+                    self.shift_free_operand = 0;
+                    v
                 };
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
                 // are 2-STATE when applied to the `string` data type — they
@@ -4839,7 +5146,7 @@ impl Simulator {
                 // §11.4.11/§11.8.2: with a REAL arm the result is real; the
                 // integral arm converts from its self-determined value
                 // (`c ? (u - 2) : 1.5` is 4294967295.0 for `int unsigned u =
-                // 1`). An x condition yields the else arm, as below.
+                // 1`).
                 // (A node with a known non-64 static width is integral.)
                 let maybe_real = |e: &Expression| !e.cached_width.get().is_some_and(|w| w != 64);
                 if (maybe_real(then_expr) || maybe_real(else_expr))
@@ -4858,7 +5165,7 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                if c.has_unknown() {
+                if c.is_nonzero().is_none() {
                     // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
                     // only where both branches agree; otherwise X.
                     let mut t = self.eval_expr_typed(then_expr, arm_ctx, arms_unsigned);
@@ -4870,16 +5177,7 @@ impl Simulator {
                     } else if e.is_fill && !t.is_fill {
                         e = e.resize(t.width);
                     }
-                    // A REAL result cannot hold X, so the bitwise merge would
-                    // read the IEEE-754 bits of the operands as garbage (e.g. a
-                    // real `1000.0` came out as 4.65e18). §11.3.1: the result is
-                    // real when either branch is real — return a defined real
-                    // value (x condition → the else/false branch) instead.
-                    if t.is_real || e.is_real {
-                        e
-                    } else {
-                        t.merge_unknown(&e)
-                    }
+                    t.merge_unknown(&e)
                 } else {
                     let (taken, other): (&Expression, &Expression) = if c.is_true() {
                         (then_expr, else_expr)
@@ -4948,51 +5246,10 @@ impl Simulator {
                     // by row. A queue / dynamic-array SLICE `q[a:b]` streams
                     // elements a..b.
                     // §11.4.14: resolve the collection's backing storage,
-                    // including class members, before reading its elements.
-                    let elem_list = if let Some(name) = self.array_operand_name(p) {
-                        self.stream_elem_order(&name)
-                    } else {
-                        match &p.kind {
-                            ExprKind::Ident(h) => {
-                                let name = self.resolve_hier_name(h);
-                                self.stream_elem_order(&name)
-                            }
-                            ExprKind::RangeSelect {
-                                expr: base,
-                                left,
-                                right,
-                                ..
-                            } => {
-                                if let Some(name) = self.array_operand_name(base)
-                                    && self.module.dynamic_arrays.contains(&name)
-                                {
-                                    let left = self.eval_expr(left).to_i64();
-                                    let right = self.eval_expr(right).to_i64();
-                                    match (left, right) {
-                                        (Some(left), Some(right))
-                                            if left <= right && right - left < 1 << 20 =>
-                                        {
-                                            self.stream_elem_order(&name).map(|(_, width)| {
-                                                (
-                                                    (left..=right)
-                                                        .map(|i| format!("{name}[{i}]"))
-                                                        .collect(),
-                                                    width,
-                                                )
-                                            })
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            ExprKind::Paren(inner) => self
-                                .array_operand_name(inner)
-                                .and_then(|name| self.stream_elem_order(&name)),
-                            _ => None,
-                        }
-                    };
+                    // including class members, before reading its elements;
+                    // a `with [range]` / slice sub-range streams only the
+                    // selected elements (§11.4.14.4), in stream order.
+                    let elem_list = self.stream_operand_elems(p, false);
                     let piece = if let Some((names, ew)) = elem_list {
                         let mut acc = Value::zero(0);
                         for en in &names {
@@ -5106,6 +5363,14 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1/§11.5.1: a bit of a vector the call frame holds, at
+                // the bit its declared range labels; it hides a design
+                // variable of its name.
+                if !self.local_stack.is_empty()
+                    && let Some(v) = self.frame_vector_select_read(expr, None, index, None)
+                {
+                    return v;
+                }
                 // #1108: an element of an array member of an instance-array
                 // element (`lane[0].nest[1][j]`).
                 if let Some(base) = self.inst_array_member_canon(expr) {
@@ -5752,30 +6017,7 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let mut base_name = self.resolve_hier_name(hier);
-                        // Bare class-member N-D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_nd.contains_key(&*base_name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *base_name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j][k]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2
-                        {
-                            if let Some(s) = self
-                                .expr_assoc_name(cur)
-                                .filter(|s| self.module.arrays_nd.contains_key(s))
-                            {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                         if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -5806,29 +6048,7 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let mut name = self.resolve_hier_name(hier);
-                        // Bare class-member 2D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_2d.contains_key(&*name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&name) {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
-                            if let Some(s) = self
-                                .expr_assoc_name(inner_expr)
-                                .filter(|s| self.module.arrays_2d.contains_key(s))
-                            {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                         if self.module.arrays_2d.contains_key(&*name) {
                             // §11.5.1: an x/z index reads an all-x element.
                             let (Some(i), Some(j)) = (
@@ -6371,6 +6591,13 @@ impl Simulator {
                 kind,
                 ..
             } => {
+                // §7.4.1/§11.5.1: a part of a vector the call frame holds.
+                if !self.local_stack.is_empty()
+                    && let Some(v) =
+                        self.frame_vector_select_read(expr, Some(*kind), left, Some(right))
+                {
+                    return v;
+                }
                 // §11.5.1: a part-select into a multi-dimensional packed
                 // associative array element selects whole packed elements.
                 if !self.module.associative_arrays.is_empty()
@@ -6645,11 +6872,17 @@ impl Simulator {
                 // bits (256), not at the 8 bits of `a8`.
                 let jw = self.inside_joint_width(expr, ranges);
                 let val = match jw {
-                    Some(w) => self.eval_expr_ctx(expr, w),
+                    Some(w) => {
+                        let v = self.eval_expr_ctx(expr, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => self.eval_expr(expr),
                 };
                 let item = |me: &mut Self, e: &Expression| match jw {
-                    Some(w) => me.eval_expr_ctx(e, w),
+                    Some(w) => {
+                        let v = me.eval_expr_ctx(e, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => me.eval_expr(e),
                 };
                 for r in ranges {
@@ -6672,7 +6905,7 @@ impl Simulator {
                             if let Some(keys) = self.inside_operand_keys(r) {
                                 for key in keys {
                                     if let Some(ev) = self.get_signal_value_by_name(&key) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
@@ -6690,19 +6923,17 @@ impl Simulator {
                             if let Some(c) = self.resolve_class_scope_array_const(r) {
                                 for i in c.lo..=c.hi {
                                     if let Some(ev) = self.class_scope_array_const_elem(&c, i) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            // §11.4.13: a set element is compared with the
-                            // tested expression using WILDCARD equality, so x/z
-                            // bits in the element are don't-cares — exactly what
-                            // `==?` does. Plain `==` missed `v inside {4'b10xx}`.
+                            // §11.4.13: real pairs use `==`; integral pairs
+                            // use `==?`, with x/z in the item as don't-cares.
                             let ev = item(self, r);
-                            if val.wildcard_eq(&ev).is_true() {
+                            if Self::inside_values_equal(&val, &ev).is_true() {
                                 return Value::from_u64(1, 1);
                             }
                         }
@@ -6782,6 +7013,10 @@ impl Simulator {
                         if is_enum {
                             return self.eval_call_inner(expr, &[]);
                         }
+                    }
+                    // §6.19.5: a property, member or element receiver.
+                    if let Some(v) = self.enum_method_on_receiver(recv, &member.name, &[]) {
+                        return v;
                     }
                 }
                 // §13.5.5, the same shape for a PACKAGE function: inside a
@@ -6997,6 +7232,42 @@ impl Simulator {
     /// `idx_val`: the interpreter's element read of a fixed, dynamic or
     /// associative array once the operand is resolved. Also the slow path of
     /// a compiled `LoadDynElem`, which must read exactly what this reads.
+    /// A collection formal stores its unpacked elements under the activation's
+    /// key. Read the element there before applying its declared packed bounds.
+    fn formal_collection_packed_read(&mut self, expr: &Expression) -> Option<Value> {
+        let (h, selectors) = Self::index_chain(expr)?;
+        let [seg] = h.path.as_slice() else { return None };
+        let store = self.dyn_name_lookup(&seg.name.name)?;
+        if !(self.module.queue_vars.contains(store) || self.module.dynamic_arrays.contains(store)
+            || self.is_associative_array(store))
+            || self.coll_shape_at(store).is_some_and(|(shape, _)| shape.dims.len() != 1)
+        {
+            return None;
+        }
+        let dims = self.module.packed_full_dims.get(store)?;
+        let (row, packed) = selectors.split_first()?;
+        if packed.is_empty() || packed.len() > dims.len() { return None; }
+        let width: u32 = dims.iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let remaining: u32 = dims[packed.len()..].iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let dims = dims.clone();
+        let store = store.to_owned();
+        let has_bound = self.module.dynamic_arrays.contains(&store)
+            && Self::expr_contains_dollar(row);
+        if has_bound {
+            self.dollar_bound.push(self.get_queue_size(&store) as i64 - 1);
+        }
+        let key = self.eval_expr(row);
+        if has_bound {
+            self.dollar_bound.pop();
+        }
+        let elem = self.coll_elem_read(&store, &store, key, width);
+        let indices: Vec<_> = packed.iter().map(|sel| self.eval_expr(sel)).collect();
+        Some(match Self::packed_chain_slice(u64::from(width), &dims, &indices) {
+            Some((lo, w)) => elem.range_select((lo + w - 1) as usize, lo as usize),
+            None => Value::new(remaining),
+        })
+    }
+
     pub(super) fn coll_elem_read(
         &mut self,
         name: &str,

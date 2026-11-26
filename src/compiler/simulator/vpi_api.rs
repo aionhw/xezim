@@ -1890,24 +1890,32 @@ fn is_path_net(sim: &Simulator, id: usize) -> bool {
 /// (rise, fall, turn-off) of net `id` as `schedule_delayed_with_delay`
 /// applies them. `sdf_only` ignores a delayed continuous assignment (an
 /// interconnect's delay is the net's annotation alone).
-fn net_delays(sim: &Simulator, id: usize, sdf_only: bool) -> [u64; 3] {
+fn net_delays(sim: &mut Simulator, id: usize, sdf_only: bool) -> [u64; 3] {
     if is_path_net(sim, id) {
         // The net's own delay is none: its module paths carry the delays.
         return [0; 3];
     }
-    let explicit = if sdf_only {
-        None
-    } else {
-        delayed_drivers(sim, id)
-            .first()
-            .and_then(|&e| match sim.comb_entries[e].item {
-                CombItem::ContAssign { delay, .. } => Some(delay),
-                _ => None,
-            })
-    };
-    let rise = explicit.unwrap_or_else(|| sim.sdf_delays.get(id).copied().unwrap_or(0));
-    let fall = sim.gate_fall_delay_by_id.get(&id).copied();
-    let off = sim.gate_off_delay_by_id.get(&id).copied();
+    let mut rise = sim.sdf_delays.get(id).copied().unwrap_or(0);
+    let mut fall = sim.gate_fall_delay_by_id.get(&id).copied();
+    let mut off = sim.gate_off_delay_by_id.get(&id).copied();
+    if !sdf_only && let Some(&index) = delayed_drivers(sim, id).first() {
+        let entry = &sim.comb_entries[index];
+        if let CombItem::ContAssign { delay, delay_exprs, .. } = &entry.item {
+            rise = *delay;
+            if let Some(exprs) = delay_exprs.clone() {
+                let hint = entry.cold.scope_hint.clone();
+                let scope = entry.cold.rhs_time_scope.as_deref().unwrap_or_default().to_owned();
+                let saved_hint = sim.name_resolve_hint.replace(hint);
+                let saved_scope = sim.timescale_scope_override.replace(scope);
+                let [r, f, o] = sim.eval_driver_delays(&exprs);
+                sim.timescale_scope_override = saved_scope;
+                sim.name_resolve_hint.replace(saved_hint);
+                rise = r.unwrap_or(0);
+                fall = f;
+                off = o;
+            }
+        }
+    }
     let fall_v = fall.unwrap_or(rise);
     let off_v = off.unwrap_or_else(|| fall.map_or(rise, |f| f.min(rise)));
     [rise, fall_v, off_v]
@@ -1990,7 +1998,8 @@ fn set_net_delays(
         sim.comb_dep_edges.clear();
     } else {
         for e in explicit {
-            if let CombItem::ContAssign { delay, .. } = &mut sim.comb_entries[e].item {
+            if let CombItem::ContAssign { delay, delay_exprs, .. } = &mut sim.comb_entries[e].item {
+                *delay_exprs = None;
                 *delay = rise;
             }
         }
@@ -2012,7 +2021,7 @@ fn set_net_delays(
 }
 
 /// The object's delays in ticks, in the §38.10 order, for `n` delays.
-fn read_delays(sim: &Simulator, obj: &DelayObj, n: usize) -> Result<Vec<i64>, String> {
+fn read_delays(sim: &mut Simulator, obj: &DelayObj, n: usize) -> Result<Vec<i64>, String> {
     match *obj {
         DelayObj::Net(id) | DelayObj::InterMod(id) => {
             let inter = matches!(obj, DelayObj::InterMod(_));

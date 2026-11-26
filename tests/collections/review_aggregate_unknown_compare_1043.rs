@@ -33,6 +33,7 @@ fn unknown_elements_fold_three_valued() {
         r#"
 module top;
   typedef logic [2:0] u3_t;
+  typedef u3_t words_t[0:3];
   u3_t ua[0:3], uc[0:3], ux1[0:3], ux2[0:3];
   u3_t qa[$], qx1[$], qx2[$];
   u3_t da[], dx1[];
@@ -51,9 +52,9 @@ module top;
     $display("F4 %b %b", uc == uc, uc != uc);
     $display("F5 %b %b", !(ua == uc), !(ua != uc));
     $display("F6 %b %b", ua === uc, ua !== uc);
-    $display("P1 %b %b", ua == '{2,2,'x,2}, ua != '{2,2,'x,2});
-    $display("P2 %b %b", ua == '{3,2,'x,2}, ua != '{3,2,'x,2});
-    $display("P3 %b %b", ua == '{2,2,'x,3}, ua != '{2,2,'x,3});
+    $display("P1 %b %b", ua == words_t'{2,2,'x,2}, ua != words_t'{2,2,'x,2});
+    $display("P2 %b %b", ua == words_t'{3,2,'x,2}, ua != words_t'{3,2,'x,2});
+    $display("P3 %b %b", ua == words_t'{2,2,'x,3}, ua != words_t'{2,2,'x,3});
     $display("Q1 %b %b", qa == qx1, qa != qx1);
     $display("Q2 %b %b", qa == qx2, qa != qx2);
     $display("D1 %b %b", da == dx1, da != dx1);
@@ -61,7 +62,7 @@ module top;
     $display("A2 %b %b", aa == ax2, aa != ax2);
     $display("S1 %b %b", sa == sx, sa != sx);
     $display("S2 %b %b", sa == sx1, sa != sx1);
-    $display("S3 %b %b", sa == '{2,'x}, sa != '{3,'x});
+    $display("S3 %b %b", sa == us_t'{2,'x}, sa != us_t'{3,'x});
   end
 endmodule
 "#,
@@ -88,6 +89,7 @@ fn unknown_elements_of_nd_struct_member_and_class_collections() {
         r#"
 module top;
   typedef logic [2:0] u3_t;
+  typedef u3_t matrix_t[0:1][0:1];
   u3_t m1[0:1][0:1], m2[0:1][0:1], m3[0:1][0:1];
   typedef struct { u3_t q[$]; int k; } sq_t;
   sq_t s1, s2;
@@ -101,7 +103,7 @@ module top;
     m1 = '{'{1,2},'{3,4}}; m2 = '{'{1,2},'{'x,4}}; m3 = '{'{1,3},'{'x,4}};
     $display("M1 %b %b %b %b", m1 == m2, m1 != m2, m1 === m2, m1 !== m2);
     $display("M2 %b %b", m1 == m3, m1 != m3);
-    $display("M3 %b %b", m2 == m2, m1 == '{'{1,2},'{'x,4}});
+    $display("M3 %b %b", m2 == m2, m1 == matrix_t'{'{1,2},'{'x,4}});
     s1.q = '{1,2}; s1.k = 1; s2.q = '{1,'x}; s2.k = 1;
     $display("SQ1 %b %b", s1 == s2, s1 != s2);
     s2.k = 2;
@@ -154,13 +156,13 @@ module top;
     y.a = 'x; z.a = 'x;
     $display("T2 %b %b %b", x === y, y === z, y !== z);
     n1 = '{'{1,2}, '{3,4}}; n2 = '{'{1,2}, '{3,4}};
-    $display("T3 %b %b %b", n1 == n2, n1 === n2, n1 == '{'{1,2}, '{3,4}});
+    $display("T3 %b %b %b", n1 == n2, n1 === n2, n1 == un_t'{'{1,2}, '{3,4}});
     n2.pk[1] = 5;
-    $display("T4 %b %b %b", n1 == n2, n1 !== n2, n1 != '{'{1,2}, '{3,4}});
+    $display("T4 %b %b %b", n1 == n2, n1 !== n2, n1 != un_t'{'{1,2}, '{3,4}});
     a = '{1,2,3,4}; b = '{1,2,'x,4};
-    $display("W1 %b %b", a ==? '{1,2,3,4}, a !=? '{1,2,3,4});
-    $display("W2 %b %b", a ==? '{1,2,3,5}, a ==? '{1,2,'x,4});
-    $display("W3 %b %b", b ==? '{1,2,3,4}, b ==? '{1,2,3,5});
+    $display("W1 %b %b", a ==? st_t'{1,2,3,4}, a !=? st_t'{1,2,3,4});
+    $display("W2 %b %b", a ==? st_t'{1,2,3,5}, a ==? st_t'{1,2,'x,4});
+    $display("W3 %b %b", b ==? st_t'{1,2,3,4}, b ==? st_t'{1,2,3,5});
     $display("V1 %b %b", a ==? b, a !=? b);
     $display("V2 %b %b", b ==? a, b !=? a);
   end

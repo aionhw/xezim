@@ -1,0 +1,15 @@
+T|writer 23
+T|reader1 saw change to 23 at 1
+T|reader2 saw change to 23 at 1
+T|reader1 bare=23 q=23 arr2=5 label=w pv=9
+T|reader2 bare=23 q=23 arr2=5 label=w pv=9
+T|fwriter 123
+T|reader1 saw change to 123 at 3
+T|reader2 saw change to 123 at 3
+T|shadow local=1 unit=123
+T|reader1 saw change to 124 at 4
+T|reader2 saw change to 124 at 4
+T|cwriter -4
+T|reader1 saw change to -4 at 5
+T|reader2 saw change to -4 at 5
+T|top -4 w=4294967292

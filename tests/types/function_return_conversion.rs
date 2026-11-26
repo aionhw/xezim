@@ -347,7 +347,9 @@ endmodule
         "edge_types",
         SRC,
         &[
-            "T|sr=0.1000000000 sr2=0.1000000000 bs=01010011 le=x1 fb=1 fl4=0 fu=4294967295 flu=10000000000000000000 fint=z ftm=3 fs4=-8",
+            // §6.12: a shortreal return holds the binary32 value nearest 0.1
+            // (the reference simulator keeps binary64 and prints 0.1000000000).
+            "T|sr=0.1000000015 sr2=0.1000000015 bs=01010011 le=x1 fb=1 fl4=0 fu=4294967295 flu=10000000000000000000 fint=z ftm=3 fs4=-8",
         ],
     );
 }

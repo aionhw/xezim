@@ -23,6 +23,7 @@ pub mod ts_jit;
 
 pub use arena::{Arena, ArenaGuard, ArenaVec};
 pub use dispatch::{DispatchTable, NUM_OPCODES, Opcode, get_dispatch_table};
+pub use interrupt::interrupted_exit_status;
 pub use simulator::Simulator;
 pub use soa::{InlineSignalArray, PackedWideSignalArray, SoaSignalStore, SoaSignalTable};
 pub use xezim_core::Value;

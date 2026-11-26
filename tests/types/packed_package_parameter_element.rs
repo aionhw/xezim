@@ -75,3 +75,33 @@ endmodule
     let msgs: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert_eq!(msgs, ["1 4", "1 1", "2 2", "3 3", "4 4"]);
 }
+
+/// §26.3: a generate block's continuous assign in an instantiated module
+/// that imports nothing selects through the scoped name.
+#[test]
+fn package_parameter_select_in_generate_block() {
+    let sim = simulate(
+        r#"
+package p;
+  parameter logic [3:0][7:0] C = {8'hA1, 8'hB2, 8'hC3, 8'hD4};
+  parameter logic [7:0] V = 8'b1010_0110;
+endpackage
+module m;
+  for (genvar k = 1; k <= 2; k++) begin : g
+    logic [7:0] pc;
+    logic v;
+    assign pc = p::C[k];
+    assign v = p::V[k];
+  end
+  initial #1 $display("%h %b %h %b", g[1].pc, g[1].v, g[2].pc, g[2].v);
+endmodule
+module top;
+  m u ();
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    let msgs: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert_eq!(msgs, ["c3 1 b2 1"]);
+}

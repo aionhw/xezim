@@ -1981,10 +1981,8 @@ impl Simulator {
                 if self.is_static_method(&base_cls, &member.name) {
                     // §8.25: same as the flattened `req::get_type()` arm — a
                     // static method through a null receiver declared with a
-                    // SPECIALIZATION runs in that specialization's context
-                    // (the body's bare self-references denote the current
-                    // specialization). Seed `current_spec` from the declared
-                    // type; the live-object recovery inside
+                    // specialization uses its bound type parameters. Seed
+                    // `current_spec` from the declared type because
                     // `exec_static_method_via_object` cannot see a null handle.
                     let saved_spec = if handle == 0 {
                         // A variable receiver's declaration names its
@@ -2559,12 +2557,9 @@ impl Simulator {
                 let name = &path[0].name.name;
                 if name.starts_with('$') {
                     return match name.as_str() {
-                        "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                        "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
                         "$realtime" => Value::from_f64(self.time_in_current_unit()),
-                        "$stime" => Value::from_u64(
-                            (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                            32,
-                        ),
+                        "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
                         "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                             Value::from_u64(0, 1)
                         }
@@ -2691,6 +2686,12 @@ impl Simulator {
                             | "reverse"
                             | "shuffle"
                             | "unique"
+                            // §7.9.4-§7.9.7: the traversal methods of an
+                            // associative array take the same receiver.
+                            | "first"
+                            | "last"
+                            | "next"
+                            | "prev"
                     )
                 {
                     let arr = hier.path[hier.path.len() - 2].name.name.clone();
@@ -2724,20 +2725,12 @@ impl Simulator {
                                 .and_then(|v| v.to_u64())
                                 .unwrap_or(0) as usize;
                         }
-                        if handle != 0 {
-                            let cn = self
-                                .heap
-                                .get(handle)
-                                .and_then(|x| x.as_ref())
-                                .map(|i| i.class_name.clone());
-                            if let Some(cn) = cn {
-                                if self.class_assoc_member(&cn, &arr) {
-                                    let scoped = format!("{}#{}", handle, arr);
-                                    if let Some(res) = self.eval_builtin_method(&scoped, m, args) {
-                                        return res;
-                                    }
-                                }
-                            }
+                        // §8.9: a static collection of the object's class
+                        // is the class's one store (`handle_collection_name`).
+                        if let Some(scoped) = self.handle_collection_name(handle, &arr)
+                            && let Some(res) = self.eval_builtin_method(&scoped, m, args)
+                        {
+                            return res;
                         }
                     }
                     // A collection reached through a hierarchical path —
@@ -2830,6 +2823,13 @@ impl Simulator {
                             Some(parts.join("."))
                         } else {
                             None
+                        };
+                        let (h_val, target_name) = match target_name {
+                            Some(t) if t.contains('.') => {
+                                let (h, t) = self.rand_mode_owner(h_val, &t);
+                                (h, Some(t))
+                            }
+                            t => (h_val, t),
                         };
                         // §18.5.11: a static constraint block's mode is shared
                         // by every instance of the class — route it to the
@@ -3368,12 +3368,8 @@ impl Simulator {
                             // receiver whose declared type is a SPECIALIZATION
                             // (`req::get_type()` where req is declared
                             // `C#(T)` — `uvm_create_on`'s shape) runs in that
-                            // specialization's context: the body's bare
-                            // self-references (the `C` type argument of a
-                            // member typedef like
-                            // `uvm_object_registry#(C,"C") type_id`, written by
-                            // `uvm_object_utils(C)`) denote the CURRENT
-                            // specialization, not the default. The live-object
+                            // specialization's context for explicit type
+                            // arguments such as C#(T). The live-object
                             // spec recovery in `exec_static_method_via_object`
                             // cannot see a null handle, so seed `current_spec`
                             // from the DECLARED type here.

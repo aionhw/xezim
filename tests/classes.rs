@@ -41,6 +41,10 @@ mod class_descending_array_members;
 mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/param_typedef_formal_fast_call.rs"]
+mod param_typedef_formal_fast_call;
+#[path = "classes/param_typedef_formal_direct_call_shapes.rs"]
+mod param_typedef_formal_direct_call_shapes;
 #[path = "classes/implicit_formal_width_1044.rs"]
 mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
@@ -225,6 +229,8 @@ mod compiled_method_collection_calls;
 mod compiled_method_enum_formals;
 #[path = "classes/compiled_method_ref_formals.rs"]
 mod compiled_method_ref_formals;
+#[path = "classes/class_member_ref_alias.rs"]
+mod class_member_ref_alias;
 #[path = "classes/ref_formal_array_of_collections_row.rs"]
 mod ref_formal_array_of_collections_row;
 #[path = "classes/compiled_method_string_members.rs"]
@@ -234,6 +240,18 @@ mod compiled_method_string_members;
 mod compiled_method_foreach;
 #[path = "classes/compiled_method_local_colls.rs"]
 mod compiled_method_local_colls;
+#[path = "classes/compiled_method_regs_across_settle.rs"]
+mod compiled_method_regs_across_settle;
+#[path = "classes/typedef_static_call_actual.rs"]
+mod typedef_static_call_actual;
+#[path = "classes/compiled_method_string_coll_member_assign.rs"]
+mod compiled_method_string_coll_member_assign;
+#[path = "classes/compiled_method_queue_literal_arg.rs"]
+mod compiled_method_queue_literal_arg;
+#[path = "classes/compiled_method_coll_formal_actual.rs"]
+mod compiled_method_coll_formal_actual;
+#[path = "classes/static_collection_through_handle.rs"]
+mod static_collection_through_handle;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
@@ -284,6 +302,12 @@ mod compiled_method_static_local_vars;
 mod compiled_nonvirtual_dispatch;
 #[path = "classes/compiled_pkg_fn_scope.rs"]
 mod compiled_pkg_fn_scope;
+#[path = "classes/compiled_pkg_param_scope.rs"]
+mod compiled_pkg_param_scope;
+#[path = "classes/compiled_pkg_scope_names.rs"]
+mod compiled_pkg_scope_names;
+#[path = "classes/bare_name_scopes_1273.rs"]
+mod bare_name_scopes_1273;
 #[path = "classes/compiled_task_wait_analysis.rs"]
 mod compiled_task_wait_analysis;
 #[path = "classes/compiled_method_type_param_members.rs"]
@@ -306,6 +330,8 @@ mod compiled_method_string_loop;
 mod compiled_method_super;
 #[path = "classes/compiled_method_tiering.rs"]
 mod compiled_method_tiering;
+#[path = "classes/compiled_method_writeback_actual_once.rs"]
+mod compiled_method_writeback_actual_once;
 #[path = "classes/constraint_algebra_inherit.rs"]
 mod constraint_algebra_inherit;
 #[path = "classes/constraint_array_sum.rs"]
@@ -356,6 +382,8 @@ mod covergroup_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_bins.rs"]
+mod covergroup_real_bins;
 #[path = "classes/covergroup_sample_args.rs"]
 mod covergroup_sample_args;
 #[path = "classes/covergroup_sampling_event.rs"]
@@ -894,6 +922,8 @@ mod vif_static_roundtrip;
 mod class_member_named_like_instance;
 #[path = "classes/covergroup_class_param_bins.rs"]
 mod covergroup_class_param_bins;
+#[path = "classes/covergroup_array_element_new.rs"]
+mod covergroup_array_element_new;
 #[path = "classes/class_method_scalar_formal_width.rs"]
 mod class_method_scalar_formal_width;
 #[path = "classes/typedef_packed_return_prototype.rs"]
@@ -1122,6 +1152,14 @@ mod review_pr720_followups;
 mod class_param_local_width_681;
 #[path = "classes/class_param_sized_method_widths.rs"]
 mod class_param_sized_method_widths;
+#[path = "classes/class_param_formal_width_per_spec.rs"]
+mod class_param_formal_width_per_spec;
+#[path = "classes/class_param_typedef_chain.rs"]
+mod class_param_typedef_chain;
+#[path = "classes/member_new_specialization.rs"]
+mod member_new_specialization;
+#[path = "classes/class_param_width_paths.rs"]
+mod class_param_width_paths;
 #[path = "classes/randc_wide_699.rs"]
 mod randc_wide_699;
 
@@ -1288,3 +1326,42 @@ mod property_shadowed_by_outer_name;
 
 #[path = "classes/method_cache_local_shadow.rs"]
 mod method_cache_local_shadow;
+
+#[path = "classes/randomize_size_from_sub_object.rs"]
+mod randomize_size_from_sub_object;
+#[path = "classes/randomize_size_from_sub_object_ipv4.rs"]
+mod randomize_size_from_sub_object_ipv4;
+#[path = "classes/randomize_size_sub_object_forms.rs"]
+mod randomize_size_sub_object_forms;
+#[path = "classes/rand_mode_sub_object_member.rs"]
+mod rand_mode_sub_object_member;
+#[path = "classes/named_param_typedef_spec.rs"]
+mod named_param_typedef_spec;
+#[path = "classes/scoped_vif_typedef_local.rs"]
+mod scoped_vif_typedef_local;
+#[path = "classes/subroutine_actual_width_1256.rs"]
+mod subroutine_actual_width_1256;
+#[path = "classes/packed_member_foreach_1192.rs"]
+mod packed_member_foreach_1192;
+#[path = "classes/unpacked_struct_packed_member_1192.rs"]
+mod unpacked_struct_packed_member_1192;
+#[path = "classes/class_scope_type_widths_1273.rs"]
+mod class_scope_type_widths_1273;
+#[path = "classes/struct_handle_member_1192.rs"]
+mod struct_handle_member_1192;
+#[path = "classes/vif_formal_name_clash_1297.rs"]
+mod vif_formal_name_clash_1297;
+#[path = "classes/review_writeback_actual_forms.rs"]
+mod review_writeback_actual_forms;
+#[path = "classes/class_constraint_sharing_721.rs"]
+mod class_constraint_sharing_721;
+#[path = "classes/class_struct_array_member_patterns.rs"]
+mod class_struct_array_member_patterns;
+#[path = "classes/multidim_property_pattern_init.rs"]
+mod multidim_property_pattern_init;
+#[path = "classes/static_string_queue_percent_p.rs"]
+mod static_string_queue_percent_p;
+#[path = "classes/typename_specialized_property.rs"]
+mod typename_specialized_property;
+#[path = "classes/queue_row_name_collision.rs"]
+mod queue_row_name_collision;

@@ -152,7 +152,7 @@ endmodule
 
 /// Off lets an attempt in flight finish, Kill aborts it; PassOff/FailOff
 /// decide when the attempt finishes; a vacuous success runs the pass action
-/// only after PassOn, and VacuousOff/NonvacuousOn split the two; `cover
+/// by default, and VacuousOff/NonvacuousOn split the two; `cover
 /// property` follows On/Off and the directive and assertion type masks.
 #[test]
 fn concurrent_controls() {
@@ -223,10 +223,10 @@ endmodule
             "T|2|kill-inflight p=0 f=1",
             "T|3|passoff-inflight p=0 f=1",
             "T|4|failoff-inflight p=3 f=1",
-            "T|5|vac base pv=0",
-            "T|6|vacuousoff pv=0",
-            "T|7|passon after vacoff pv=2",
-            "T|8|passoff+nonvacon pv=2",
+            "T|5|vac base pv=16",
+            "T|6|vacuousoff pv=16",
+            "T|7|passon after vacoff pv=18",
+            "T|8|passoff+nonvacon pv=18",
             "T|9|cover base c1=6",
             "T|10|cover off c1=6",
             "T|11|assert-only off c1=8",
@@ -464,7 +464,7 @@ endmodule
 "#;
     assert_eq!(
         t_lines(src),
-        ["T|1|base p=2 f=0", "T|2|off p=3 f=0", "T|3|on p=4 f=1",]
+        ["T|1|base p=2 f=0", "T|2|off p=3 f=0", "T|3|on p=5 f=1",]
     );
 }
 

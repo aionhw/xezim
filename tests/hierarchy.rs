@@ -43,6 +43,8 @@ mod child_struct_member_path_types;
 mod class_method_hier_subroutine_calls;
 #[path = "hierarchy/colliding_actual_child_body.rs"]
 mod colliding_actual_child_body;
+#[path = "hierarchy/default_nettype_inferred_ports.rs"]
+mod default_nettype_inferred_ports;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
 #[path = "hierarchy/disable_targets.rs"]
@@ -71,6 +73,8 @@ mod flat_actual_struct_port;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/foreach_over_submodule_array.rs"]
 mod foreach_over_submodule_array;
+#[path = "hierarchy/gated_clk_cell_by_body.rs"]
+mod gated_clk_cell_by_body;
 #[path = "hierarchy/genblk_dotted_ref_nettype_none.rs"]
 mod genblk_dotted_ref_nettype_none;
 #[path = "hierarchy/genblk_cont_assign.rs"]
@@ -119,6 +123,8 @@ mod inout_port_default;
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
 mod interface_array_element_ports;
+#[path = "hierarchy/interface_array_whole_ports.rs"]
+mod interface_array_whole_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
@@ -167,6 +173,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/packed_port_formal_type.rs"]
 mod packed_port_formal_type;
+#[path = "hierarchy/packed_port_offset_select.rs"]
+mod packed_port_offset_select;
 #[path = "hierarchy/packed_record_output_chain.rs"]
 mod packed_record_output_chain;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
@@ -217,6 +225,10 @@ mod review_implicit_net_scope;
 mod review_unit_names_in_blocks;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
+#[path = "hierarchy/signed_literal_port_actuals.rs"]
+mod signed_literal_port_actuals;
+#[path = "hierarchy/review_port_assignment_conversion.rs"]
+mod review_port_assignment_conversion;
 #[path = "hierarchy/submodule_array_element_assigns.rs"]
 mod submodule_array_element_assigns;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]
@@ -245,6 +257,8 @@ mod undeclared_names_by_binding;
 mod undefined_call_in_instance;
 #[path = "hierarchy/undriven_implicit_output_is_z.rs"]
 mod undriven_implicit_output_is_z;
+#[path = "hierarchy/unpacked_port_param_slice.rs"]
+mod unpacked_port_param_slice;
 #[path = "hierarchy/unpacked_struct_port.rs"]
 mod unpacked_struct_port;
 #[path = "hierarchy/unresolved_hier_refs.rs"]
@@ -263,6 +277,8 @@ mod vif_in_subroutines;
 mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+#[path = "hierarchy/wildcard_to_implicit_nets.rs"]
+mod wildcard_to_implicit_nets;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
@@ -298,6 +314,10 @@ mod explicit_dollar_root_read_1124;
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/library_file_macros.rs"]
+mod library_file_macros;
+#[path = "hierarchy/library_file_latin1.rs"]
+mod library_file_latin1;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
 mod lrm_package_variable_scoping;
 #[path = "hierarchy/lrm_audit_time0_port_event.rs"]
@@ -432,6 +452,8 @@ mod prepared_body_shared_across_ancestors;
 
 #[path = "hierarchy/param_port_actual_no_implicit_net.rs"]
 mod param_port_actual_no_implicit_net;
+#[path = "hierarchy/enum_label_port_actual_no_implicit_net.rs"]
+mod enum_label_port_actual_no_implicit_net;
 
 #[path = "hierarchy/generate_region_parameter_override.rs"]
 mod generate_region_parameter_override;
@@ -464,6 +486,12 @@ mod time0_port_edge;
 
 #[path = "hierarchy/child_constant_checks_893.rs"]
 mod child_constant_checks_893;
+#[path = "hierarchy/child_constant_package_scope_721.rs"]
+mod child_constant_package_scope_721;
+#[path = "hierarchy/const_function_instance_scope_721.rs"]
+mod const_function_instance_scope_721;
+#[path = "hierarchy/declared_type_sharing_721.rs"]
+mod declared_type_sharing_721;
 
 #[path = "hierarchy/generate_rename_scope.rs"]
 mod generate_rename_scope;
@@ -498,6 +526,8 @@ mod instance_struct_members_root_1046;
 mod shared_net_initializer_targets;
 #[path = "hierarchy/negative_genvar_cached.rs"]
 mod negative_genvar_cached;
+#[path = "hierarchy/unit_storage_one_object_721.rs"]
+mod unit_storage_one_object_721;
 #[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
 mod unit_storage_shared_bodies_721;
 #[path = "hierarchy/net_alias_groups_1092.rs"]
@@ -506,6 +536,36 @@ mod net_alias_groups_1092;
 mod generate_net_port_actuals_1093;
 #[path = "hierarchy/generate_real_struct_members_1099.rs"]
 mod generate_real_struct_members_1099;
+#[path = "hierarchy/struct_array_localparam_generate.rs"]
+mod struct_array_localparam_generate;
 
 #[path = "hierarchy/rooted_packed_scope.rs"]
 mod rooted_packed_scope;
+#[path = "hierarchy/clog2_port_connection_select.rs"]
+mod clog2_port_connection_select;
+#[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
+mod nettype_input_port_actuals_1280;
+#[path = "hierarchy/prepared_body_release_721.rs"]
+mod prepared_body_release_721;
+#[path = "hierarchy/parameter_type_sharing_721.rs"]
+mod parameter_type_sharing_721;
+#[path = "hierarchy/assignment_origin_sharing_721.rs"]
+mod assignment_origin_sharing_721;
+#[path = "hierarchy/upward_scope_sharing_721.rs"]
+mod upward_scope_sharing_721;
+#[path = "hierarchy/vif_whole_unpacked_1311.rs"]
+mod vif_whole_unpacked_1311;
+#[path = "hierarchy/clocking_blocks_per_scope.rs"]
+mod clocking_blocks_per_scope;
+#[path = "hierarchy/scope_named_like_a_package.rs"]
+mod scope_named_like_a_package;
+#[path = "hierarchy/generate_if_package_param_member.rs"]
+mod generate_if_package_param_member;
+#[path = "hierarchy/bind_target_order_194.rs"]
+mod bind_target_order_194;
+#[path = "hierarchy/deferred_callable_paths_193.rs"]
+mod deferred_callable_paths_193;
+#[path = "hierarchy/two_state_scalar_targets.rs"]
+mod two_state_scalar_targets;
+#[path = "hierarchy/top_ansi_packed_ports.rs"]
+mod top_ansi_packed_ports;

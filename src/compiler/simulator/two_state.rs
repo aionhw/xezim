@@ -64,7 +64,6 @@ impl Simulator {
                 // slot lookup is fine here.
                 self.run_comb_jit_slot(eidx)
             }
-            #[cfg(feature = "jit")]
             CombPlan::Jit | CombPlan::Tpl => self.run_comb_jit_slot(eidx),
             CombPlan::Interp | CombPlan::Unresolved => false,
         }
@@ -4370,7 +4369,8 @@ impl Simulator {
         let mut port_links: Vec<(usize, usize)> = Vec::new();
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
-            if self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+            if self.module.sampled_input_ports.contains(child)
+                || self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
                 || self.module.events.contains(parent)
@@ -4391,10 +4391,16 @@ impl Simulator {
                 let (Some(cid), Some(pid)) = (mirror.ids[c], mirror.ids[p]) else {
                     continue;
                 };
+                // §6.11.2, §23.3.3.2: a 2-state formal of a 4-state actual
+                // keeps the connect that drops X and Z; sharing the actual's
+                // id read them through.
                 if cid == pid
                     || self.signal_widths[cid] != self.signal_widths[pid]
                     || self.signal_signed[cid] != self.signal_signed[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
+                    || (self.signal_two_state[cid] && !self.signal_two_state[pid])
+                    || (self.signal_real[cid]
+                        && self.shortreal_signals.contains(&cid) != self.shortreal_signals.contains(&pid))
                 {
                     continue;
                 }
@@ -4496,7 +4502,8 @@ impl Simulator {
                         return None;
                     }
                     let (ln, rn) = (flat_name(lh, &self.module), flat_name(rh, &self.module));
-                    if alias_members.contains(ln.as_ref())
+                    if self.module.sampled_input_ports.contains(ln.as_ref())
+                        || alias_members.contains(ln.as_ref())
                         || alias_members.contains(rn.as_ref())
                     {
                         return None;
@@ -4533,6 +4540,8 @@ impl Simulator {
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_signed[lid] != self.signal_signed[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
+                        || (self.signal_real[lid]
+                            && self.shortreal_signals.contains(&lid) != self.shortreal_signals.contains(&rid))
                         || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
@@ -5062,6 +5071,11 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_function_scope_index(&function_scope_index);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -5482,6 +5496,11 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint);
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_function_scope_index(&function_scope_index);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -5526,6 +5545,11 @@ impl Simulator {
                 delay_compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_function_scope_index(&function_scope_index);
+                delay_compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_param_leaf_idx(self.param_leaf_index());
                 delay_compiler.set_cast_widths(&self.cast_widths);

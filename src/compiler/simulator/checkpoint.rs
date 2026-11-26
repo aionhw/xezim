@@ -35,13 +35,20 @@ use serde::ser::{SerializeSeq, Serializer};
 // §13.5.2: TaskCleanup::struct_formal_meta, Simulator::ref_park_flags.
 // §10.3.3: delayed updates retain the mask of bits owned by their driver.
 // Whole-array NBA entries carry captured element values.
-// 0x0e: procedural sequence/fork bodies use shared copy-on-write storage.
-// 0x0f: optional assignment delays and inferred assertion clocks are boxed.
-// 0x10: compact declaration payloads and cold module constructs.
-// 0x11: optional case-arm guards and patterns use boxed AST storage.
-// 0x12: an absent wide snapshot denotes its full-width initial X value.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x12";
-const DENSE_WIDE_SNAPSHOT_VERSION: u8 = 0x11;
+// §7.10: SignalMap holds queue and dynamic-array elements in runs; two profile counters.
+// §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
+// §13.5.1: MethodAdmission::coll_formal_positions.
+// §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
+// §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
+// frame cache of a synchronous fork child is rebuilt, not carried (#721).
+// Preserve declaration-scope typedefs across procedural shadowing (§6.18).
+// §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
+// and value expressions of an event term are shared.
+// §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
+// §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
+// §19.5: covergroup instances retain the real-valued coverpoint set.
+// Preserve VHDL entry scopes and the merged AST layout.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\xf0";
 
 #[derive(Default)]
 struct Session {
@@ -680,6 +687,7 @@ checkpoint_once_cells!(
     param_leaf_index_cell,
     var_decl_leaf_index_cell,
     vif_capable_statics,
+    scoped_unpacked_leaves,
     iface_instance_paths,
     iface_by_token,
     iface_path_parts,
@@ -912,7 +920,7 @@ impl Simulator {
         if &magic[..7] != &MAGIC[..7] {
             return Err("not a checkpoint".into());
         }
-        if magic[7] != MAGIC[7] && magic[7] != DENSE_WIDE_SNAPSHOT_VERSION {
+        if magic[7] != MAGIC[7] {
             return Err("written in another checkpoint format".into());
         }
         let mut z = zstd::stream::Decoder::new(f).map_err(|e| e.to_string())?;
@@ -947,6 +955,14 @@ impl Simulator {
             let inline_bits = std::mem::take(&mut self.signal_inline_bits);
             let has_xz = std::mem::take(&mut self.signal_has_xz);
             self.checkpoint_decode_state(&mut fields)?;
+            self.restore_class_width_ranges();
+            // Resolve backend choices against this run's available native slots.
+            // Keep two-state islands, which carry their portable instructions.
+            for plan in &mut self.comb_plan {
+                if matches!(plan, CombPlan::Jit | CombPlan::Tpl | CombPlan::Interp) {
+                    *plan = CombPlan::Unresolved;
+                }
+            }
             self.refill_inline_bits(inline_bits)?;
             refill_in_place(&mut self.signal_has_xz, has_xz, "signal_has_xz")?;
             #[cfg(feature = "jit")]
@@ -976,8 +992,12 @@ impl Simulator {
             Ok(())
         })?;
         self.reopen_files(file.files)?;
+        // §10.6.2: the writers index is built from the restored entry table.
+        self.comb_writer_index = None;
         // Caches keyed by an address in the run that wrote the checkpoint.
         self.recv_call_memo.clear();
+        // §23.10: the parameter overlays are built from the restored table.
+        *self.decl_param_scope_cache.get_mut() = Default::default();
         // A checkpoint is taken at the end of a time slot, so every initial
         // block of the saving run had started; the bodies this build queued
         // for its own time 0 belong to no restored process.
@@ -1228,6 +1248,7 @@ checkpoint_state!(
     clocking_array_leaves,
     clocking_output_pending,
     clocking_cycle_pending,
+    clocking_select_due,
     clocking_edge_out_pending,
     clocking_edge_drive_dirty,
     clocking_prev_clock,
@@ -1247,6 +1268,7 @@ checkpoint_state!(
     comb_plan_abortn,
     comb_time0_deferred_done,
     comb_time0_fired,
+    comb_time0_held,
     compiled_class_method_ids,
     compiled_fast_calls,
     compiled_fast_static_calls,
@@ -1527,6 +1549,7 @@ checkpoint_state!(
     program_pids,
     prop_raw_ty_cache,
     prop_width_memo,
+    queue_elem_moves,
     queue_frame_saves,
     queue_key_scratch,
     queue_name_pool,
@@ -1564,6 +1587,7 @@ checkpoint_state!(
     sampled_watches,
     saw_fatal,
     sdf_delays,
+    select_store_copies,
     semaphore_get_waiters,
     semaphores,
     sensitivity_trigger_count,
@@ -1654,6 +1678,7 @@ checkpoint_state!(
     ts_wregs,
     ts_wregs8,
     ts_xregs,
+    declaration_typedefs,
     type_tables_gen,
     typedef_layouts_by_width,
     typedef_target_cache,

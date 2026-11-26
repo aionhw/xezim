@@ -2,6 +2,12 @@
 
 use super::*;
 
+pub(super) struct CaseComparison {
+    selector: Value,
+    width: u32,
+    unsigned: bool,
+}
+
 impl Simulator {
     #[inline]
     pub(crate) fn jit_load_signal_slice_xz(&self, id: usize, lo: u32, w: u32) -> u64 {
@@ -597,7 +603,9 @@ impl Simulator {
                 super::bytecode::system_function_result(name).map(|(w, _)| w)
             }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
-            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                Some(super::elaborate::number_literal_width(n))
+            }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
@@ -719,20 +727,10 @@ impl Simulator {
                 | BinaryOp::ArithShiftLeft
                 | BinaryOp::ArithShiftRight
                 | BinaryOp::Power => self.lrm_self_width(left),
-                BinaryOp::Eq
-                | BinaryOp::Neq
-                | BinaryOp::CaseEq
-                | BinaryOp::CaseNeq
-                | BinaryOp::WildcardEq
-                | BinaryOp::WildcardNeq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-                | BinaryOp::LogAnd
-                | BinaryOp::LogOr => Some(1),
+                op if Self::binary_yields_one_bit(*op) => Some(1),
                 _ => None,
             },
+            ExprKind::Inside { .. } => Some(1),
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
@@ -1270,6 +1268,74 @@ impl Simulator {
         Some(w)
     }
 
+    /// §11.5.1: the width of a select of a vector the call frame holds
+    /// (`frame_vector_range`), from the select alone: one bit for `d[i]`,
+    /// `|l - r| + 1` for `d[l:r]` and `w` for `d[i +: w]`, with bounds that
+    /// are unsized decimal literals. The flag says whether the answer may be
+    /// kept on the node (`frame_var_width_static`).
+    pub(super) fn frame_select_width(&self, expr: &Expression) -> Option<(u32, bool)> {
+        let lit = |e: &Expression| match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                base: NumberBase::Decimal,
+                value,
+                ..
+            }) => value.replace('_', "").parse::<i64>().ok(),
+            _ => None,
+        };
+        let (base, w) = match &expr.kind {
+            ExprKind::Index { expr: base, .. } => (base, 1),
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let w = match kind {
+                    RangeKind::Constant => lit(left)?.abs_diff(lit(right)?) + 1,
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        u64::try_from(lit(right)?).ok().filter(|&w| w > 0)?
+                    }
+                };
+                (base, u32::try_from(w).ok()?)
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let name = self.frame_bound_bare_name(h)?;
+        self.frame_vector_range(name)?;
+        Some((w, self.frame_var_width_static(name)))
+    }
+
+    /// Whether the shape of frame variable `name`, a plain vector, is the
+    /// same at every execution of the code that names it, so a width
+    /// derived from it may be kept on the node: declared as a vector or an
+    /// integer atom outright, not through a typedef, outside a class method
+    /// (whose specializations share their code and bind its type
+    /// parameters, §8.25).
+    pub(super) fn frame_var_width_static(&self, name: &str) -> bool {
+        self.frame_decl_is_plain(name)
+            && !matches!(self.class_context_stack.last(), Some(Some(_)))
+            && self.local_typedef_type_of(name).is_none()
+    }
+
+    /// Whether frame variable `name` is declared a vector with at most one
+    /// packed dimension or an integer atom.
+    fn frame_decl_is_plain(&self, name: &str) -> bool {
+        use crate::ast::types::DataType;
+        self.module
+            .var_decl_types
+            .get(name)
+            .is_some_and(|dt| match dt {
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => dimensions.len() <= 1,
+                DataType::IntegerAtom { .. } => true,
+                _ => false,
+            })
+    }
+
     /// The width of a size cast `N'(x)` (§6.24.1): N, a literal or a name
     /// that is a constant (a parameter), as the cast's evaluation reads it.
     /// None for a cast to a type.
@@ -1415,29 +1481,68 @@ impl Simulator {
     /// (a8 + 8'd1) 256: ...` adds at 32 bits. A `case inside` selector is
     /// sized by its value items only — the reference simulator does not
     /// widen it for a range item.
-    pub(super) fn case_selector_value(
+    pub(super) fn case_comparison(
         &mut self,
         kind: &CaseKind,
         expr: &Expression,
         items: &[crate::ast::stmt::CaseItem],
-    ) -> Value {
-        if !matches!(
-            Self::unparen(expr).kind,
-            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-        ) {
-            return self.eval_expr(expr);
-        }
+    ) -> CaseComparison {
         let inside = matches!(kind, CaseKind::CaseInside);
-        let bounds: Vec<(&Expression, bool)> = items
-            .iter()
-            .filter(|it| !it.is_default)
-            .flat_map(|it| it.patterns.iter())
-            .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
-            .map(|p| (p, inside))
-            .collect();
-        match self.inside_joint_width_of(expr, &bounds) {
-            Some(w) => self.eval_expr_ctx(expr, w),
-            None => self.eval_expr(expr),
+        let patterns = items.iter().flat_map(|item| &item.patterns);
+        // §12.5: even an item after the first match sets the comparison
+        // type. Inspect its type without evaluating the item.
+        let unsigned = !inside
+            && (self.expression_signed_hint(expr) == Some(false)
+                || patterns
+                    .clone()
+                    .any(|p| self.expression_signed_hint(p) == Some(false)));
+        let op = |e: &Expression| {
+            matches!(
+                Self::unparen(e).kind,
+                ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+            )
+        };
+        let fill_item = inside && patterns.clone().any(|p| {
+            matches!(
+                Self::unparen(p).kind,
+                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+            )
+        });
+        let width = if fill_item || op(expr) || (!inside && patterns.clone().any(op)) {
+            let bounds: Vec<_> = patterns
+                .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
+                .map(|p| (p, inside))
+                .collect();
+            self.inside_joint_width_of(expr, &bounds).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut selector = self.eval_expr_typed(expr, width, unsigned);
+        if fill_item && width > 0 {
+            selector = selector.resize_for_assign(width);
+        }
+        CaseComparison {
+            selector,
+            width,
+            unsigned,
+        }
+    }
+
+    pub(super) fn case_item_matches(
+        &mut self,
+        kind: &CaseKind,
+        comparison: &CaseComparison,
+        pat: &Expression,
+    ) -> bool {
+        let selector = &comparison.selector;
+        if matches!(kind, CaseKind::CaseInside) {
+            return self.case_inside_match(selector, pat);
+        }
+        let item = self.eval_expr_typed(pat, comparison.width, comparison.unsigned);
+        match kind {
+            CaseKind::Casez => selector.casez_eq(&item).is_true(),
+            CaseKind::Casex => selector.casex_eq(&item).is_true(),
+            _ => Self::case_values_match(selector, &item),
         }
     }
 
@@ -1505,11 +1610,64 @@ impl Simulator {
         (self.infer_width(expr), None)
     }
 
+    /// §11.6.1 Table 11-21: the binary operators whose result is one bit.
+    pub(super) fn binary_yields_one_bit(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv
+        )
+    }
+
+    /// §11.6.1 Table 11-21: the unary operators whose result is one bit
+    /// (logical negation and the reductions).
+    pub(super) fn unary_yields_one_bit(op: UnaryOp) -> bool {
+        matches!(
+            op,
+            UnaryOp::LogNot
+                | UnaryOp::BitAnd
+                | UnaryOp::BitNand
+                | UnaryOp::BitOr
+                | UnaryOp::BitNor
+                | UnaryOp::BitXor
+                | UnaryOp::BitXnor
+        )
+    }
+
     /// `infer_width` body; the flag says whether every branch taken was
     /// static, i.e. safe to pin on the node.
     pub(super) fn infer_width_walk(&mut self, expr: &Expression) -> (u32, bool) {
         match &expr.kind {
             ExprKind::Ident(h) => {
+                // A variable the call frame holds hides a design signal of
+                // its name; a plain vector's width is kept on the node.
+                if !self.local_stack.is_empty()
+                    && let Some(name) = self.frame_bound_bare_name(h)
+                    && let Some(w) =
+                        self.local_stack
+                            .last()
+                            .and_then(|f| f.get(name))
+                            .and_then(|v| {
+                                (v.width > 1 || (v.width == 1 && self.frame_decl_is_plain(name)))
+                                    .then_some(v.width)
+                            })
+                {
+                    let keep = self.frame_var_width_static(name)
+                        && self.frame_vector_range(name).is_some();
+                    return (w, keep);
+                }
                 let n = self.resolve_hier_name(h);
                 // The resolution is node-stable only once the resolver has
                 // pinned the name on the node.
@@ -1550,7 +1708,9 @@ impl Simulator {
                 }
                 (1, false)
             }
-            ExprKind::Number(NumberLiteral::Integer { size, .. }) => (size.unwrap_or(32), true),
+            ExprKind::Number(n @ NumberLiteral::Integer { .. }) => {
+                (super::elaborate::number_literal_width(n), true)
+            }
             ExprKind::Concatenation(p) => {
                 let mut total = 0;
                 let mut st = true;
@@ -1565,6 +1725,16 @@ impl Simulator {
                 self.infer_width(lvalue),
                 lvalue.cached_width.get().is_some(),
             ),
+            // §11.6.1 Table 11-21: an equality, relational, logical,
+            // reduction or `inside` operator yields one bit, whatever its
+            // operands' widths, which are sized among themselves. Reporting
+            // the operands' width sized the sibling of `|` in a
+            // self-determined `if` condition at it: in
+            // `(~a) | (m == 5'd12)` over a 1-bit `a` and a 5-bit `m`, `~a`
+            // read 5'b11110 and the branch was taken.
+            ExprKind::Binary { op, .. } if Self::binary_yields_one_bit(*op) => (1, true),
+            ExprKind::Unary { op, .. } if Self::unary_yields_one_bit(*op) => (1, true),
+            ExprKind::Inside { .. } => (1, true),
             ExprKind::Binary { left, right, .. } => {
                 let w = self.infer_width(left).max(self.infer_width(right));
                 (
@@ -1626,6 +1796,25 @@ impl Simulator {
                 } else {
                     (self.eval_expr(expr).width, false)
                 }
+            }
+            // §11.5.1, §11.6.1: a select of a vector is as wide as the select
+            // says, never as its value. Sized by evaluating it, a select kept
+            // nothing on the node, nor did any operator above it, so every
+            // level of a chain `d[3] ^ d[9] ^ ...` evaluated every select
+            // under it again: n(n+1)/2 evaluations for n selects.
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => {
+                if !self.local_stack.is_empty()
+                    && let Some(sized) = self.frame_select_width(expr)
+                {
+                    return sized;
+                }
+                // A design signal's select keeps its width on the node.
+                if self.select_width(expr).is_some()
+                    && let Some(w) = expr.cached_width.get()
+                {
+                    return (w, true);
+                }
+                (self.eval_expr(expr).width, false)
             }
             _ => (self.eval_expr(expr).width, false),
         }

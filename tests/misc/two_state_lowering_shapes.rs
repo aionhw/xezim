@@ -182,11 +182,11 @@ endmodule
     );
     assert!(out.contains(&"A_15_c0".to_string()), "{out:?}");
     assert!(out.contains(&"B_2a_c0".to_string()), "{out:?}");
-    // `%0h` of an all-x value is a single `x`; s=4'd3 matches no arm, so
+    // §21.2.1.3: six unknown bits form two x digits. s=4'd3 matches no arm, so
     // `y` takes the default too — the x reaching BOTH a whole-signal store
     // and a [7:4] range store is exactly what the fold has to preserve.
-    assert!(out.contains(&"C_x_c0".to_string()), "{out:?}");
-    assert!(out.contains(&"D_x_x0".to_string()), "{out:?}");
+    assert!(out.contains(&"C_xx_c0".to_string()), "{out:?}");
+    assert!(out.contains(&"D_xx_x0".to_string()), "{out:?}");
 }
 
 #[test]

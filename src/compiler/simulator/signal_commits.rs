@@ -531,7 +531,7 @@ impl Simulator {
         }
         self.signal_commit_plan.resize(self.signal_table.len(), 0);
         for id in 0..self.signal_commit_plan.len() {
-            if self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0) {
+            if self.waiter_signal_hooked(id) {
                 self.signal_commit_plan[id] |= 1;
             }
             if self.armed_input_set(id) {
@@ -542,6 +542,13 @@ impl Simulator {
 
     #[inline(always)]
     pub(super) fn note_edge_write(&mut self, id: usize) {
+        // Parked-waiter index — see the write_sig! twin. The in-place write
+        // paths end here without the old value, so every write is noted.
+        if id < self.event_waiters.watch.len()
+            && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
+        {
+            self.event_waiters.note_write(id);
+        }
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
         if self.in_edge_block || self.in_edge_cont {
             if let Some(&p) = self.sig_to_edge_pos.get(id) {
@@ -2406,8 +2413,13 @@ impl Simulator {
             .module
             .input_port_actuals
             .iter()
-            .filter(|(formal, ..)| scopes.contains(Self::port_formal_inst(formal)))
-            .map(|(formal, actual, _)| (Self::port_formal_inst(formal).to_string(), actual.clone()))
+            .filter(|port| scopes.contains(Self::port_formal_inst(port.formal())))
+            .map(|port| {
+                (
+                    Self::port_formal_inst(port.formal()).to_string(),
+                    port.actual().clone(),
+                )
+            })
             .collect();
         let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
         for (inst, actual) in &actuals {
@@ -2516,7 +2528,8 @@ impl Simulator {
                 .then_some(cur)
         };
         let mut ports = Vec::new();
-        for (formal, actual, two_state) in &self.module.input_port_actuals {
+        for port in &self.module.input_port_actuals {
+            let (formal, actual, two_state) = (port.formal(), port.actual(), port.two_state());
             let ExprKind::Ident(h) = &actual.kind else {
                 continue;
             };
@@ -2536,7 +2549,7 @@ impl Simulator {
             };
             let inst = Self::port_formal_inst(formal);
             let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
-            let prev = Self::alias_t0_prev(if *two_state { 2 } else { 1 }, self.signal_widths[id]);
+            let prev = Self::alias_t0_prev(if two_state { 2 } else { 1 }, self.signal_widths[id]);
             if prev != cur {
                 ports.push((inst.to_string(), id, prev, cur));
             }
@@ -2621,8 +2634,8 @@ impl Simulator {
         let ports = std::mem::take(&mut self.time0_port_edges);
         let aliases = std::mem::take(&mut self.time0_alias_edges);
         let top = format!("{}.", self.module.name);
-        let mut rearm: Vec<(usize, usize, (u64, u64))> = Vec::new();
-        for (wi, w) in self.event_waiters.iter().enumerate() {
+        let mut rearm: Vec<(u64, usize, (u64, u64))> = Vec::new();
+        for (wi, w) in self.event_waiters.iter_seq() {
             if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
             {
                 continue;
@@ -2655,7 +2668,7 @@ impl Simulator {
             return;
         }
         for (wi, k, prev) in rearm {
-            self.event_waiters[wi].captured_prev[k] = prev;
+            self.event_waiters.set_captured_prev(wi, k, prev);
         }
         self.edge_forced_fire = fire;
         self.check_edges();

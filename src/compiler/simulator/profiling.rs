@@ -3115,6 +3115,7 @@ impl Simulator {
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",
             Insn::DropXz(..) => "DropXz",
+            Insn::RealToInt(..) => "RealToInt",
             Insn::Nop => "Nop",
             Insn::LoadSignalRange(..) => "LoadSignalRange",
             Insn::LoadSignalBit(..) => "LoadSignalBit",

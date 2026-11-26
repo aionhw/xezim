@@ -13,6 +13,11 @@ fn trace_array_storage(name: &str, cells: usize, width: u32) -> xezim_core::oom_
     scope
 }
 
+/// Scopes `materialize_implicit_contassign_nets` walked while placing
+/// implicit nets, for the profile (`[PROF] implicit_net_scope_steps`).
+pub(super) static IMPLICIT_NET_SCOPE_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
     /// property entries, and the heap bytes of their names.
@@ -601,8 +606,10 @@ impl Simulator {
         for k in keys {
             if let Some(sig) = module.pkg_var_decls.get(&k).cloned() {
                 let (_, base) = k.split_once("::").unwrap();
-                if let Some(ty) = module.var_decl_types.get(base).cloned() {
-                    module.var_decl_types.entry(k.clone()).or_insert(ty);
+                if let Some(ty) = module.var_decl_types.get_shared(base).cloned() {
+                    if !module.var_decl_types.contains_key(&k) {
+                        module.var_decl_types.insert_shared(k.clone(), ty);
+                    }
                 }
                 if module.string_signals.contains(base) {
                     module.string_signals.insert(k.clone());
@@ -813,23 +820,24 @@ impl Simulator {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer {
                 size,
+                signed,
                 base,
                 value,
                 cached_val,
                 ..
             }) => {
-                let w = size.unwrap_or(32);
-                if let Some((vb, xz, cw)) = cached_val.get() {
-                    if cw == w {
-                        return Value::from_inline(vb, xz, w).to_u64();
-                    }
-                }
                 let r = match base {
                     NumberBase::Binary => 2,
                     NumberBase::Octal => 8,
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                let w = size.unwrap_or_else(|| Value::unsized_integer_width(value, r, *signed));
+                if let Some((vb, xz, cw)) = cached_val.get() {
+                    if cw == w {
+                        return Value::from_inline(vb, xz, w).to_u64();
+                    }
+                }
                 Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
@@ -907,24 +915,32 @@ impl Simulator {
 
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
-            existing: &HashSet<&str>,
             parents_by_leaf: &HashMap<&str, Vec<&str>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
+            // A parent's score is the number of leaves it declares. A leaf
+            // has no `.`, so `parent.leaf` exists exactly when `parent` is
+            // in that leaf's list: count the lists instead of formatting
+            // and looking up every (parent, leaf) pair.
+            let mut scores: HashMap<&str, usize> = HashMap::default();
+            let mut steps = 0u64;
+            for leaf in leaves {
+                if let Some(parents) = parents_by_leaf.get(leaf.as_str()) {
+                    steps += parents.len() as u64;
+                    for &parent in parents {
+                        *scores.entry(parent).or_default() += 1;
+                    }
+                }
+            }
+            IMPLICIT_NET_SCOPE_STEPS.fetch_add(steps, std::sync::atomic::Ordering::Relaxed);
             for leaf in leaves {
                 let Some(parents) = parents_by_leaf.get(leaf.as_str()) else {
                     continue;
                 };
                 for parent in parents {
-                    let mut score = 0usize;
-                    for candidate_leaf in leaves {
-                        let candidate = format!("{}.{}", parent, candidate_leaf);
-                        if existing.contains(candidate.as_str()) {
-                            score += 1;
-                        }
-                    }
+                    let score = scores.get(parent).copied().unwrap_or(0);
                     let depth = parent.split('.').count();
                     if score > best_score
                         || (score == best_score && depth > best_depth)
@@ -982,6 +998,7 @@ impl Simulator {
         }
 
         let mut to_create: HashSet<String> = HashSet::default();
+        let mut best_scopes: HashMap<Vec<String>, Option<String>> = HashMap::default();
         for ca in &module.continuous_assigns {
             let mut leaves = HashSet::default();
             let mut reads = HashSet::default();
@@ -998,6 +1015,16 @@ impl Simulator {
             if leaves.is_empty() {
                 continue;
             }
+            // The scope only places a leaf that is not declared yet: with
+            // every leaf declared there is nothing to create.
+            let mut missing = leaves
+                .iter()
+                .filter(|leaf| !existing.contains(leaf.as_str()));
+            let lone_missing = match (missing.next(), missing.next()) {
+                (None, _) => continue,
+                (Some(leaf), None) => Some(leaf.as_str()),
+                _ => None,
+            };
             let lhs_raw = ident_raw(&ca.lhs);
             let rhs_raw = ident_raw(&ca.rhs);
             let lhs_leaf = ident_leaf(&ca.lhs);
@@ -1007,8 +1034,34 @@ impl Simulator {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
             } else if lhs_leaf.is_some() && rhs_leaf.is_none() {
                 rhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
+            } else if lone_missing.is_some_and(|lone| {
+                leaves.iter().all(|leaf| {
+                    leaf.as_str() == lone
+                        || parents_by_leaf
+                            .get(leaf.as_str())
+                            .is_none_or(|p| p.is_empty())
+                })
+            }) {
+                // The search picks a scope among those declaring one of the
+                // leaves. When the one undeclared leaf (an unpacked array's
+                // name has no signal of its own) is also the only one other
+                // scopes declare, whichever scope wins declares it and
+                // nothing is created. The search walks every such scope,
+                // once per assign: it was quadratic in the instance count
+                // for an array element connected to a like-named port of
+                // each instance.
+                None
             } else {
-                best_scope_for_leaves(&leaves, &existing, &parents_by_leaf)
+                // The same leaves in the same order give the same scope.
+                let key: Vec<String> = leaves.iter().cloned().collect();
+                match best_scopes.get(&key) {
+                    Some(scope) => scope.clone(),
+                    None => {
+                        let scope = best_scope_for_leaves(&leaves, &parents_by_leaf);
+                        best_scopes.insert(key, scope.clone());
+                        scope
+                    }
+                }
             };
 
             let Some(scope) = scope else {
@@ -1135,6 +1188,71 @@ impl Simulator {
                 }
             }
         }
+        // The packed-struct vector a member term names, and the member's bit
+        // offset and width in it: `a.clk` with `a` a packed struct (directly,
+        // or under the block's instance scope), or a nested member path.
+        // None for anything else, a name that is a signal of its own included.
+        fn packed_member(
+            module: &ElaboratedModule,
+            e: &Expression,
+            scope: &str,
+        ) -> Option<(String, i64, u32)> {
+            let mut e = e;
+            while let ExprKind::Paren(inner) = &e.kind {
+                e = inner;
+            }
+            let ExprKind::Ident(h) = &e.kind else {
+                return None;
+            };
+            if h.path.len() < 2 || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let full = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let mut spellings: Vec<String> = if scope.is_empty() || h.root.is_some() {
+                vec![full]
+            } else {
+                vec![format!("{}.{}", scope, full), full]
+            };
+            // §23.6: `top.a.clk` names the top module's `a`, stored as `a`.
+            if let Some(rest) = spellings
+                .last()
+                .and_then(|f| f.strip_prefix(module.name.as_str()))
+                .and_then(|r| r.strip_prefix('.'))
+            {
+                spellings.push(rest.to_string());
+            }
+            for name in &spellings {
+                // A nearer standalone signal shadows a packed member of the same
+                // spelling in an outer scope. Its event already has its own signal.
+                if module.signals.contains_key(name.as_str()) {
+                    return None;
+                }
+                let mut cut = name.len();
+                while let Some(pos) = name[..cut].rfind('.') {
+                    let (base, field) = (&name[..pos], &name[pos + 1..]);
+                    if module.signals.contains_key(base) {
+                        // A signal that is no packed structure with this
+                        // member leaves the next spelling to try.
+                        if let Some((_, off, w)) = module
+                            .packed_struct_fields
+                            .get(base)
+                            .and_then(|fields| fields.iter().find(|(m, _, _)| m == field))
+                            .filter(|(_, _, w)| *w > 0)
+                        {
+                            return Some((base.to_string(), *off as i64, *w));
+                        }
+                        break;
+                    }
+                    cut = pos;
+                }
+            }
+            None
+        }
         let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
             Expression::new(
                 ExprKind::Ident(HierarchicalIdentifier {
@@ -1160,7 +1278,7 @@ impl Simulator {
         let mut repl_cache: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
         let mut writer_index: Option<edgesel_writers::WriterIndex> = None;
         let mut new_assigns: Vec<super::elaborate::ContinuousAssignment> = Vec::new();
-        let mut new_signals: Vec<String> = Vec::new();
+        let mut new_signals: Vec<(String, u32)> = Vec::new();
         let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
         // #7 keeps child always blocks PENDING (un-rewritten) until
         // classification — but the select-on-port shape this pass fixes is
@@ -1188,6 +1306,16 @@ impl Simulator {
             }
             deferred.push(DeferredAlways::Eager(Self::materialize_pending_always(p)));
         }
+        // A design may declare a signal with the internal alias spelling.
+        // Allocate a distinct name for every newly watched packed range.
+        let mut next_edge_alias = 0usize;
+        let mut allocate_edge_alias = || loop {
+            let name = format!("__xz_edgesel{next_edge_alias}");
+            next_edge_alias += 1;
+            if !module.signals.contains_key(name.as_str()) {
+                break name;
+            }
+        };
         let params = &module.parameters;
         let headers = always
             .iter_mut()
@@ -1209,33 +1337,108 @@ impl Simulator {
                 }
             }));
         for (stmt, scope, mut patched) in headers {
-            let StatementKind::TimingControl {
-                control: TimingControl::Event(EventControl::EventExpr(exprs)),
-                ..
-            } = &mut stmt.kind
-            else {
-                if dbg {
-                    eprintln!(
-                        "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        scope,
-                        std::mem::discriminant(&stmt.kind)
-                    );
+            let discriminant = std::mem::discriminant(&stmt.kind);
+            // `always begin @(...); ... end` starts with its event control
+            // too (`extract_sensitivity`); only the member rewrite below
+            // applies to that shape.
+            let (exprs, wrapped) = match &mut stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } => (exprs, false),
+                StatementKind::SeqBlock { stmts, .. } => {
+                    match stmts.first_mut().map(|s| &mut s.kind) {
+                        Some(StatementKind::TimingControl {
+                            control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                            ..
+                        }) => (exprs, true),
+                        _ => continue,
+                    }
                 }
-                continue;
+                _ => {
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
+                            scope, discriminant
+                        );
+                    }
+                    continue;
+                }
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
                 // Port substitution leaves `@(dq[3])` as a select of the
                 // connection (`bus[15:8][3]`); spell such a term as the net
                 // bit it reads first (see `event_bits`).
-                if let Some(f) =
-                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                if !wrapped
+                    && let Some(f) =
+                        event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
                 {
                     ee.expr = f;
                     if let Some(p) = patched.as_mut() {
                         p.push(term);
                     }
                 }
-                if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
+                // §7.2.1, §9.4.2: a term on a member of a packed struct
+                // (`@(posedge a.clk)`, also what `.clk(a.clk)` substitutes into
+                // a child's `@(posedge clk)`) is an event on that member: an
+                // edge on its LSB, a change of its bits. The struct is one
+                // vector, so the base-name fallback watched the vector's LSB,
+                // another member, and woke on every member's change. Watch an
+                // alias net driven by the member's bits instead.
+                if let Some((vector, off, width)) = packed_member(module, &ee.expr, &scope) {
+                    let span = ee.expr.span;
+                    let canon = format!("{}|member {}+{}", vector, off, width);
+                    let alias = aliases.entry(canon).or_insert_with(|| {
+                        let lit = |v: i64| {
+                            Box::new(Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: NumberBase::Decimal,
+                                    value: v.to_string(),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                                }),
+                                span,
+                            ))
+                        };
+                        let rhs = Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(mk_ident(&vector, span)),
+                                kind: RangeKind::Constant,
+                                left: lit(off + width as i64 - 1),
+                                right: lit(off),
+                            },
+                            span,
+                        );
+                        let alias = allocate_edge_alias();
+                        new_signals.push((alias.clone(), width));
+                        new_assigns.push(super::elaborate::ContinuousAssignment {
+                            gate_delay_fall: None,
+                            delay_select: None,
+                            origin: None,
+                            lhs: mk_ident(&alias, span),
+                            rhs,
+                            delay_exprs: None,
+                            delay: 0,
+                            rhs_parent_scoped: false,
+                            delay_fall: None,
+                            delay_off: None,
+                        });
+                        alias
+                    });
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] scope='{}' member {}[{}+:{}] -> {}",
+                            scope, vector, off, width, alias
+                        );
+                    }
+                    ee.expr = mk_ident(alias, span);
+                    if let Some(p) = patched.as_mut() {
+                        p.push(term);
+                    }
+                    continue;
+                }
+                if wrapped || !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
@@ -1368,9 +1571,10 @@ impl Simulator {
                     );
                 }
                 let alias = aliases.entry(canon).or_insert_with(|| {
-                    let alias = format!("__xz_edgesel{}", new_signals.len());
-                    new_signals.push(alias.clone());
+                    let alias = allocate_edge_alias();
+                    new_signals.push((alias.clone(), 1));
                     new_assigns.push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
                         gate_delay_fall: None,
                         delay_select: None,
                         origin: None,
@@ -1395,17 +1599,17 @@ impl Simulator {
                 }
             }
         }
-        for name in new_signals {
+        for (name, width) in new_signals {
             module.signals.insert(
                 name.clone(),
                 Signal {
                     name: name.into(),
-                    width: 1,
+                    width,
                     is_signed: false,
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(width),
                     type_name: None,
                 },
             );
@@ -1724,13 +1928,8 @@ impl Simulator {
         // targets). Eliminating the bulk-populate saves ~150–250 MB on
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
-        let signals = SignalMap {
-            map: HashMap::default(),
-            elems: HashMap::default(),
-            elem_gens: HashMap::default(),
-            elem_gen_counter: 0,
-        };
-        let widths: HashMap<String, u32> = HashMap::default();
+        let signals = SignalMap::new();
+        let widths = SignalWidths::default();
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
 
@@ -1918,18 +2117,42 @@ impl Simulator {
                 let pkgs: std::collections::HashSet<String> =
                     module.packages.iter().cloned().collect();
                 let flat = |items: &[Statement]| -> Vec<Statement> {
-                    items
-                        .iter()
-                        .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
-                        .collect()
+                    crate::ast::cache::without_scope_caches(|| {
+                        items
+                            .iter()
+                            .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                            .collect()
+                    })
                 };
-                for td in module.tasks.values_mut() {
-                    td.items = flat(&td.items).into();
+                let mut flat_cache: HashMap<usize, crate::ast::shared_vec::SharedVec<Statement>> =
+                    HashMap::default();
+                for (key, td) in module.tasks.iter_mut() {
+                    if module.deferred_task_bodies.contains_key(key) {
+                        continue;
+                    }
+                    let ptr = std::sync::Arc::as_ptr(td.items.as_arc()) as usize;
+                    td.items = flat_cache
+                        .entry(ptr)
+                        .or_insert_with(|| flat(&td.items).into())
+                        .clone();
                 }
                 let fnames: Vec<String> = module.functions.keys().cloned().collect();
                 for n in fnames {
+                    if module.deferred_function_bodies.contains_key(&n) {
+                        continue;
+                    }
+                    let Some(ptr) = module
+                        .functions
+                        .get(&n)
+                        .map(|fd| std::sync::Arc::as_ptr(fd.items.as_arc()) as usize)
+                    else {
+                        continue;
+                    };
                     if let Some(mut fd) = module.functions.remove(&n) {
-                        fd.items = flat(&fd.items).into();
+                        fd.items = flat_cache
+                            .entry(ptr)
+                            .or_insert_with(|| flat(&fd.items).into())
+                            .clone();
                         module.functions.insert(n, fd);
                     }
                 }
@@ -2002,101 +2225,166 @@ impl Simulator {
                     );
                 }
                 drop(bodies);
-                let wrap = |items: &[Statement], span| Statement {
-                    kind: StatementKind::SeqBlock {
-                        name: None,
-                        stmts: items.to_vec().into(),
-                    },
-                    span,
+                fn body_has_typeref_decl(items: &[Statement]) -> bool {
+                    items.iter().any(|st| match &st.kind {
+                        StatementKind::VarDecl { data_type, .. } => {
+                            matches!(data_type, DataType::TypeReference { .. })
+                        }
+                        StatementKind::SeqBlock { stmts, .. }
+                        | StatementKind::ParBlock { stmts, .. } => body_has_typeref_decl(stmts),
+                        StatementKind::If {
+                            then_stmt,
+                            else_stmt,
+                            ..
+                        } => {
+                            body_has_typeref_decl(std::slice::from_ref(then_stmt.as_ref()))
+                                || else_stmt
+                                    .as_deref()
+                                    .is_some_and(|e| body_has_typeref_decl(std::slice::from_ref(e)))
+                        }
+                        StatementKind::Case { items, .. } => items
+                            .iter()
+                            .any(|it| body_has_typeref_decl(std::slice::from_ref(&it.stmt))),
+                        StatementKind::For { body, .. }
+                        | StatementKind::While { body, .. }
+                        | StatementKind::DoWhile { body, .. }
+                        | StatementKind::Repeat { body, .. }
+                        | StatementKind::Forever { body }
+                        | StatementKind::Foreach { body, .. }
+                        | StatementKind::TimingControl { stmt: body, .. }
+                        | StatementKind::Wait { stmt: body, .. } => {
+                            body_has_typeref_decl(std::slice::from_ref(body.as_ref()))
+                        }
+                        _ => false,
+                    })
+                }
+                let wrap = |items: &[Statement], span| {
+                    crate::ast::cache::without_scope_caches(|| Statement {
+                        kind: StatementKind::SeqBlock {
+                            name: None,
+                            stmts: items.to_vec().into(),
+                        },
+                        span,
+                    })
                 };
                 // §6.21: the variables of a static task or function keep
                 // their values between calls.
                 // (A class method, here when defined out of its class, is
                 // automatic, §8.6.)
-                for td in module.tasks.values_mut() {
-                    if td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
-                        && td.name.scopes.is_empty()
-                    {
-                        Self::mark_static_locals(&mut td.items);
+                let mut static_mark_cache: HashMap<usize, (bool, bool)> = HashMap::default();
+                let mut needs_static_mark =
+                    |items: &crate::ast::shared_vec::SharedVec<Statement>,
+                     dctx: Option<&std::rc::Rc<super::elaborate::CallableRewriteCtx>>|
+                     -> bool {
+                        let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                        let (mark, has_typeref) =
+                            *static_mark_cache.entry(ptr).or_insert_with(|| {
+                                (
+                                    Self::static_locals_to_mark(items),
+                                    body_has_typeref_decl(items),
+                                )
+                            });
+                        mark || (has_typeref && dctx.is_some_and(|c| !c.ctx.type_binds.is_empty()))
+                    };
+                let tkeys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(k, td)| {
+                        td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+                            && td.name.scopes.is_empty()
+                            && needs_static_mark(&td.items, module.deferred_task_bodies.get(*k))
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in tkeys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut td.items)
+                        });
                     }
                 }
                 let fkeys: Vec<String> = module
                     .functions
                     .iter()
-                    .filter(|(_, fd)| {
+                    .filter(|(k, fd)| {
                         fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
                             && fd.name.scopes.is_empty()
-                            && Self::static_locals_to_mark(&fd.items)
+                            && needs_static_mark(&fd.items, module.deferred_function_bodies.get(*k))
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
                 for key in fkeys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
                     if let Some(fd) = module.functions.get(&key) {
                         let mut fd = fd.clone();
-                        Self::mark_static_locals(&mut fd.items);
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut fd.items)
+                        });
                         module.functions.insert(key, fd);
                     }
                 }
-                let mut tdone = Vec::new();
-                for (key, td) in module.tasks.iter() {
-                    if !td
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&td.items, td.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        tdone.push((key.clone(), st));
-                    }
-                }
-                let mut fdone = Vec::new();
-                for (key, fd) in module.functions.iter() {
-                    if !fd
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&fd.items, fd.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        fdone.push((key.clone(), st));
+                let mut shadow_cache: HashMap<usize, bool> = HashMap::default();
+                let mut needs_shadow = |items: &crate::ast::shared_vec::SharedVec<Statement>| -> bool {
+                    let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                    *shadow_cache.entry(ptr).or_insert_with(|| {
+                        items.iter().any(|s| Self::shadow_rename_possible(s, &claims))
+                    })
+                };
+                let t_shadow_keys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(_, td)| needs_shadow(&td.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in t_shadow_keys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        let mut st = wrap(&td.items, td.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            td.items = stmts.into();
+                        }
                     }
                 }
-                for (key, st) in tdone {
-                    if let (Some(td), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.tasks.get_mut(&key), st.kind)
-                    {
-                        td.items = stmts.into();
-                    }
-                }
-                for (key, st) in fdone {
-                    if let (Some(fd), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.functions.get(&key), st.kind)
-                    {
-                        let mut fd = fd.clone();
-                        fd.items = stmts.into();
-                        module.functions.insert(key, fd);
+                let f_shadow_keys: Vec<String> = module
+                    .functions
+                    .iter()
+                    .filter(|(_, fd)| needs_shadow(&fd.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in f_shadow_keys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
+                    if let Some(fd) = module.functions.get(&key) {
+                        let mut st = wrap(&fd.items, fd.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            let mut fd = fd.clone();
+                            fd.items = stmts.into();
+                            module.functions.insert(key, fd);
+                        }
                     }
                 }
             }
@@ -2382,6 +2670,7 @@ impl Simulator {
                 module
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
                         gate_delay_fall: None,
                         delay_select: None,
                         origin: None,
@@ -2625,6 +2914,7 @@ impl Simulator {
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
+        let mut shortreal_signals = HashSet::default();
         let mut signal_type_names: HashMap<usize, String> = HashMap::default();
         let phase_static = std::time::Instant::now();
         // Drain `names` so each String moves into the Arc allocation
@@ -2662,6 +2952,18 @@ impl Simulator {
                 }
                 if sig.is_real {
                     val.is_real = true;
+                    let declared = module.var_decl_types.get(name).or_else(|| {
+                        sig.type_name.as_ref().and_then(|ty| module.typedef_types.get(ty))
+                    });
+                    if sig.type_name.as_deref() == Some("shortreal")
+                        || declared.is_some_and(|dt| matches!(
+                            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                        ))
+                    {
+                        shortreal_signals.insert(id);
+                        val = Value::from_f64(val.to_f64() as f32 as f64);
+                    }
                 }
                 // XEZIM_INIT_ZERO=1: coerce all-X initial values to zero.
                 // Default (off) preserves Verilog 4-state semantics. Industry
@@ -3260,7 +3562,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3500,7 +3806,11 @@ impl Simulator {
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3820,7 +4130,7 @@ impl Simulator {
         let cast_widths: HashMap<String, (u32, bool)> = {
             let mut m: HashMap<String, (u32, bool)> = HashMap::default();
             for (name, dt) in &module.typedef_types {
-                if super::elaborate::is_type_real(dt) {
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     continue;
                 }
                 let w = super::elaborate::resolve_type_width(
@@ -3851,6 +4161,45 @@ impl Simulator {
                     .map(|depth| (p.clone(), depth))
             })
             .collect();
+        let packed_named_signed_types = module.typedef_types.values().any(|dt| {
+            matches!(
+                dt,
+                DataType::IntegerAtom { .. }
+                    | DataType::IntegerVector { .. }
+                    | DataType::Enum(_)
+                    | DataType::Struct(_)
+            ) && super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+        });
+        // §7.2, §7.4.1: the names of structure members that are packed
+        // arrays of a named signed type, in any structure type the design
+        // declares. A select of a member path consults the member's declared
+        // type only when its last name is one of these.
+        let packed_named_signed_members: HashSet<String> = {
+            let types = &module.typedef_types;
+            let mut names: HashSet<String> = HashSet::default();
+            let class_props = module
+                .classes
+                .values()
+                .flat_map(|cd| cd.property_types.values());
+            for dt in types
+                .values()
+                .chain(module.var_decl_types.values())
+                .chain(class_props)
+            {
+                let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types)
+                else {
+                    continue;
+                };
+                for member in &su.members {
+                    if super::bytecode::signed_named_packed_elem_depth(&member.data_type, types)
+                        .is_some()
+                    {
+                        names.extend(member.declarators.iter().map(|d| d.name.name.clone()));
+                    }
+                }
+            }
+            names
+        };
         let packed_named_signed: HashMap<String, usize> = {
             let types = &module.typedef_types;
             let mut m: HashMap<String, usize> = HashMap::default();
@@ -3884,7 +4233,13 @@ impl Simulator {
             module
                 .input_port_actuals
                 .iter()
-                .map(|(f, _, ts)| (f.strip_prefix(top.as_str()).unwrap_or(f).to_string(), *ts))
+                .map(|port| {
+                    let f = port.formal();
+                    (
+                        f.strip_prefix(top.as_str()).unwrap_or(f).to_string(),
+                        port.two_state(),
+                    )
+                })
                 .collect()
         };
         let class_real_props = Self::collect_class_real_props(&module);
@@ -3918,6 +4273,7 @@ impl Simulator {
             has_coll_rows: false,
             partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
+            comb_writer_index: None,
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
@@ -3989,6 +4345,7 @@ impl Simulator {
             port_formal_two_state,
             collapse_settled: None,
             deferred_always,
+            shortreal_signals,
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -4029,6 +4386,7 @@ impl Simulator {
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
+            clocking_in_indexed_scope: false,
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
@@ -4038,9 +4396,11 @@ impl Simulator {
             clocking_mirror_dirty: false,
             clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
+            clocking_select_due: Vec::new(),
             clocking_sig_alias: HashMap::default(),
             clocking_output_stages: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
+            clocking_sig_bound_expr: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
             clocking_out_edge: HashMap::default(),
@@ -4125,6 +4485,9 @@ impl Simulator {
             has_udp: false,
             timing_checks: Vec::new(),
             timing_watches: Vec::new(),
+            timing_cond_base: Vec::new(),
+            timing_conds: Vec::new(),
+            timing_cond_evals: [0; 2],
             has_timing_checks: false,
             module_paths: None,
             timing_pending: Vec::new(),
@@ -4154,6 +4517,7 @@ impl Simulator {
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
+            scoped_unpacked_leaves: std::cell::OnceCell::new(),
             may_bind_static_vif: true,
             static_vif_array_names: HashSet::default(),
             recv_call_memo: Vec::new(),
@@ -4446,6 +4810,7 @@ impl Simulator {
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             foreach_arena: Vec::new(),
+            vm_regs_pool: Vec::new(),
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),
@@ -4521,7 +4886,7 @@ impl Simulator {
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
-            decl_param_scope_cache: std::cell::RefCell::new(None),
+            decl_param_scope_cache: std::cell::RefCell::default(),
             vif_key_scratch: std::cell::RefCell::new(String::new()),
             spec_frag_fold_cache: RefCell::new(HashMap::default()),
             param_leaf_names: std::cell::OnceCell::new(),
@@ -4574,6 +4939,7 @@ impl Simulator {
             method_plans: std::cell::RefCell::new(HashMap::default()),
             meta_frames: Vec::new(),
             meta_pending: 0,
+            declaration_typedefs: None,
             type_tables_gen: 0,
             formal_struct_layouts: HashMap::default(),
             local_type_pool: Vec::new(),
@@ -4602,11 +4968,13 @@ impl Simulator {
             cond_waiter_conditions: HashMap::default(),
             cond_waiter_gate: HashMap::default(),
             cond_repass_recheck: HashMap::default(),
-            inactive_queue: Vec::new(),
+            inactive_queue: PidVec::default(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
             cond_waiter_rechecks: 0,
             vm_direct_calls: 0,
+            queue_elem_moves: 0,
+            select_store_copies: 0,
             local_meta_reapplies: 0,
             local_meta_swaps: 0,
             local_meta_scans: 0,
@@ -4624,7 +4992,18 @@ impl Simulator {
             intra_saved_next: 0,
             vc_saved: HashMap::default(),
             event_triggered_time: EventStampStore::default(),
-            event_waiters: Vec::new(),
+            event_waiters: Default::default(),
+            // The index is told of a write where the dirty-driven edge scan
+            // is, so it needs that scan's write notes.
+            waiter_index_on: std::env::var("XEZIM_WAITER_INDEX")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+                && std::env::var("XEZIM_DIRTY_EDGE")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(true),
+            waiter_index_shadow: std::env::var("XEZIM_WAITER_INDEX_SHADOW")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             instance_event_waiters: InstanceEventWaiters::default(),
             late_resume_epoch: 0,
             fe_trusted_types: HashSet::default(),
@@ -4692,7 +5071,10 @@ impl Simulator {
             cast_widths,
             packed_named_signed,
             packed_named_signed_props,
+            packed_named_signed_types,
+            packed_named_signed_members,
             packed_named_sign_guard: 0,
+            shift_free_operand: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             class_handle_member_types_cache: None,
@@ -4736,6 +5118,7 @@ impl Simulator {
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
+            comb_time0_held: Vec::new(),
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),
@@ -4823,6 +5206,7 @@ impl Simulator {
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
             proc_depth: 0,
+            stmts_depth: 0,
             deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
@@ -5052,6 +5436,7 @@ impl Simulator {
             edge_t0_pending: Vec::new(),
             edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
+            comb_direct_eval: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
         sim.has_coll_rows = !sim.module.coll_shapes.is_empty()

@@ -59,6 +59,46 @@ fn c14_5_clocking_expr_iface() {
     );
 }
 
+// §14.5, §14.13: a clocking input bound to an expression samples the value
+// the expression takes from its operands' samples: arithmetic, a
+// concatenation with a select, signed, wide, X, conditional and comparison
+// roots, at #1step, #0 and #2 skews, at the expression's width, and
+// `@(cb.sum)` fires on a changed sample; a same-named outer variable is
+// not sampled instead.
+#[test]
+fn c14_5_clockvar_expression_binding() {
+    check(
+        "14.5_clockvar_expression_binding",
+        include_str!("sv/14.5_clockvar_expression_binding.sv"),
+        "c145e",
+        Order::Exact,
+        &[
+            "T|ev|t=5 sum=4",
+            "T|a|sum=4 ins=2d7 cat=00110 s0=13 s2=23",
+            "T|b|ng=4 sgx=-2 wide=00000000000000000000 xx=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx cnd=5 un=a red=0",
+            "T|c|bits sum=32 ins=11 cat=5",
+            "T|ev|t=15 sum=8",
+            "T|d|t=16 sum=8 s0=18 s2=23",
+        ],
+        &[],
+    );
+}
+
+// §14.5: an input bound to an expression with a unary root samples it.
+// (Expected values from §11.4; the reference simulator does not parse a
+// unary root here.)
+#[test]
+fn c14_5_clockvar_expression_unary_root() {
+    check(
+        "14.5_clockvar_expression_unary",
+        include_str!("sv/14.5_clockvar_expression_unary.sv"),
+        "c145u",
+        Order::Exact,
+        &["T|u|un=a red=0 ng=4"],
+        &[],
+    );
+}
+
 // §14.4: Output skew (default output #2)
 #[test]
 fn c14_16_clocking_output_skew() {
@@ -250,6 +290,65 @@ fn c14_16_2_clocking_last_wins_no_glitch() {
         "c14lg",
         Order::Multiset,
         &["T|end a=0 b=0 c=0 d=0"],
+        &[],
+    );
+}
+
+// §14.16.2: of two select drives of the same bits maturing together, only
+// the last reaches the output, so a 1-then-0 pair never wakes the output's
+// waiters; the same value twice changes the bits once.
+#[test]
+fn c14_16_2_clocking_select_last_wins_no_glitch() {
+    check(
+        "c14_select_lastwins_glitch",
+        include_str!("sv/c14_select_lastwins_glitch.sv"),
+        "c14slg",
+        Order::Exact,
+        &["T|g|t=7000 g=0100", "T|end e=0000 f=0000 g=0100 h=0"],
+        &[],
+    );
+}
+
+// §14.16.2: a whole drive replaces a select of the same output issued
+// before it in the same cycle, at the clocking event, between events, and
+// from a class task.
+#[test]
+fn c14_16_2_clocking_select_then_whole_drive() {
+    check(
+        "c14_select_then_whole",
+        include_str!("sv/c14_select_then_whole.sv"),
+        "c14sw",
+        Order::Exact,
+        &[
+            "T|a|t=7000 a=1010",
+            "T|b|t=17000 b=1010",
+            "T|c|t=27000 c=1010",
+        ],
+        &[],
+    );
+}
+
+// §14.16.2: select and whole drives of one output that mature together take
+// effect in issue order, and the output changes once, at a `#0` skew (at
+// the clocking event and between events), at a `#2` skew, and for `##1`
+// drives.
+#[test]
+fn c14_16_2_clocking_drive_order_across_skews() {
+    check(
+        "c14_drive_order_skews",
+        include_str!("sv/c14_drive_order_skews.sv"),
+        "c14do",
+        Order::Multiset,
+        &[
+            "T|za|t=5000 za=1010",
+            "T|zb|t=5000 zb=1011",
+            "T|yh|t=7000 yh=0011",
+            "T|yg|t=7000 yg=1011",
+            "T|zc|t=15000 zc=1010",
+            "T|zd|t=15000 zd=1011",
+            "T|ye|t=17000 ye=1011",
+            "T|yf|t=17000 yf=1010",
+        ],
         &[],
     );
 }

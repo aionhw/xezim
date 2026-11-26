@@ -580,6 +580,47 @@ impl Simulator {
         )
     }
 
+    /// §13.5, §25.9: append to `formals`, with no actual, the names a
+    /// subroutine declares for itself under which a `__vif_local__` key may
+    /// already exist: its formals that cannot carry an interface and the
+    /// variables declared at the top level of its body. The keys are flat by
+    /// name, so a caller's virtual-interface formal or local `v` leaves one,
+    /// and inside a callee with an `int v` of its own that `v` read as the
+    /// caller's interface (`data = v;` stored a handle token). Entering with
+    /// no actual clears the key for the call; the exit puts it back.
+    pub(super) fn vif_own_names<'a>(
+        &self,
+        ports: &'a [crate::ast::decl::FunctionPort],
+        items: &'a [crate::ast::stmt::Statement],
+        formals: &mut Vec<(&'a str, Option<&'a Expression>)>,
+    ) {
+        let ports = ports
+            .iter()
+            .filter(|p| !Self::formal_may_carry_vif(&p.data_type))
+            .map(|p| p.name.name.as_str());
+        for name in ports.chain(Self::body_decl_names(items)) {
+            if self.vif_local_names.contains(name) && !formals.iter().any(|f| f.0 == name) {
+                formals.push((name, None));
+            }
+        }
+    }
+
+    /// The variables declared at the top level of a subroutine body.
+    pub(super) fn body_decl_names(
+        items: &[crate::ast::stmt::Statement],
+    ) -> impl Iterator<Item = &str> {
+        use crate::ast::stmt::StatementKind;
+        items
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => Some(declarators),
+                _ => None,
+            })
+            .flatten()
+            .map(|d| d.name.name.as_str())
+    }
+
     /// §25.9 `__vif_local__` keys on call entry: each formal takes its
     /// actual's interface binding, or none. The keys are flat by formal
     /// name, so the caller's values are returned for `vif_formals_exit` to
@@ -1151,25 +1192,46 @@ impl Simulator {
                     // virtual-interface element is an independent alias to the
                     // corresponding structural interface instance.
                     if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
-                        if let ExprKind::Ident(rhs_h) = &rvalue.kind {
-                            if rhs_h.path.len() == 1 && rhs_h.path[0].selects.is_empty() {
-                                let rhs_base = &rhs_h.path[0].name.name;
-                                let targets: Vec<String> = (lo..=hi)
-                                    .map(|idx| format!("{}[{}]", rhs_base, idx))
-                                    .collect();
-                                if targets
-                                    .iter()
-                                    .all(|target| self.is_interface_instance(target))
+                        let lhs_dims = self.module.unpacked_decl_dims.get(name)
+                            .and_then(|dims| dims.first()).copied()
+                            .unwrap_or_else(|| if self.module.descending_arrays.contains(name) {
+                                (hi, lo)
+                            } else { (lo, hi) });
+                        let rhs = match &rvalue.kind {
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                                let base = &h.path[0].name.name;
+                                let bounds = self.module.unpacked_decl_dims.get(base)
+                                    .and_then(|dims| dims.first()).copied().unwrap_or(lhs_dims);
+                                Some((base, bounds))
+                            }
+                            ExprKind::RangeSelect { expr, kind: RangeKind::Constant, left, right } => {
+                                if let ExprKind::Ident(h) = &expr.kind
+                                    && h.path.len() == 1 && h.path[0].selects.is_empty()
                                 {
-                                    for (idx, target) in (lo..=hi).zip(targets) {
-                                        self.vif_tokens_stored = true;
-                                        self.set_signal_value_by_name(
-                                            &format!("{}[{}]", name, idx),
-                                            Value::from_u64(Self::iface_handle_token(&target), 32),
-                                        );
-                                    }
-                                    return true;
+                                    let l = self.eval_expr(left).to_i64();
+                                    let r = self.eval_expr(right).to_i64();
+                                    l.zip(r).map(|dims| (&h.path[0].name.name, dims))
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some((base, (left, right))) = rhs
+                            && left.abs_diff(right) == lo.abs_diff(hi)
+                        {
+                            let targets: Vec<_> = (lo..=hi).map(|idx| {
+                                let offset = idx.abs_diff(lhs_dims.0) as i64;
+                                let actual = if left <= right { left + offset } else { left - offset };
+                                format!("{base}[{actual}]")
+                            }).collect();
+                            if targets.iter().all(|target| self.is_interface_instance(target)) {
+                                for (idx, target) in (lo..=hi).zip(targets) {
+                                    self.vif_tokens_stored = true;
+                                    self.set_signal_value_by_name(
+                                        &format!("{name}[{idx}]"),
+                                        Value::from_u64(Self::iface_handle_token(&target), 32),
+                                    );
                                 }
+                                return true;
                             }
                         }
                     }
@@ -2360,6 +2422,181 @@ impl Simulator {
             }),
             span,
         ))
+    }
+
+    /// §14.3, §27.6: the segments of `h` as a clocking key spells them. A
+    /// constant select of a segment before the last names a generate copy or
+    /// an instance-array element, so it is part of the scope's name
+    /// (`gen[1].cb`), as it is in signal keys. `None` when no such segment
+    /// has a select, or one is not constant (no scope is named then).
+    pub(super) fn clocking_scoped_segs(h: &HierarchicalIdentifier) -> Option<Vec<String>> {
+        let n = h.path.len();
+        if n < 2 || h.path[..n - 1].iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for (i, s) in h.path.iter().enumerate() {
+            let mut name = s.name.name.clone();
+            if i + 1 < n {
+                for sel in &s.selects {
+                    use std::fmt::Write as _;
+                    let _ = write!(name, "[{}]", Self::try_const_u64(sel)?);
+                }
+            }
+            out.push(name);
+        }
+        Some(out)
+    }
+
+    /// `clocking_scoped_segs` of a path in any of its shapes: the parser
+    /// writes `gen[1].cb` as a member access of an element select.
+    pub(super) fn clocking_term_segs(e: &Expression) -> Option<Vec<String>> {
+        // Only a chain that selects before its last segment names an indexed
+        // scope; any other chain is left before a segment is copied.
+        fn selects_a_scope(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                    ExprKind::Index { .. } => true,
+                    _ => selects_a_scope(expr),
+                },
+                ExprKind::Index { expr, .. } => selects_a_scope(expr),
+                ExprKind::Ident(h) => {
+                    h.path.len() > 1
+                        && h.path[..h.path.len() - 1]
+                            .iter()
+                            .any(|s| !s.selects.is_empty())
+                }
+                _ => false,
+            }
+        }
+        if !matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            || !selects_a_scope(e)
+        {
+            return None;
+        }
+        let mut path = Vec::new();
+        if !Self::fold_hier_path_segments(e, &mut path) {
+            return None;
+        }
+        Self::clocking_scoped_segs(&HierarchicalIdentifier {
+            root: None,
+            path,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        })
+    }
+
+    /// Whether `s` is the name of a clocking block (the last segment of a
+    /// key in `clocking_meta`). A key whose last byte differs is passed over
+    /// before any comparison: this runs for every member read of an element
+    /// in a design that has a clocking block.
+    pub(super) fn names_clocking_block(&self, s: &str) -> bool {
+        let s = s.as_bytes();
+        let Some(&end) = s.last() else {
+            return false;
+        };
+        self.clocking_meta.keys().any(|k| {
+            let k = k.as_bytes();
+            k.last() == Some(&end)
+                && (k.len() == s.len() || (k.len() > s.len() && k[k.len() - s.len() - 1] == b'.'))
+                && k.ends_with(s)
+        })
+    }
+
+    /// The clocking-key segments of a hierarchical name read as a clockvar
+    /// (`gen[1].cb.a`, `cb.a`): `clocking_scoped_segs` when a select names a
+    /// scope and the last or the second-last segment names a clocking
+    /// block, else `None` (the plain names). The names are checked before
+    /// the path is copied: a read of a member of an element (`s[0].i.x`)
+    /// comes here on every evaluation.
+    pub(super) fn clocking_scoped_read_segs(
+        &self,
+        h: &HierarchicalIdentifier,
+    ) -> Option<Vec<String>> {
+        let n = h.path.len();
+        if n < 2
+            || !self.clocking_in_indexed_scope
+            || h.path[..n - 1].iter().all(|s| s.selects.is_empty())
+            || !h.path[n - 2..]
+                .iter()
+                .any(|s| self.names_clocking_block(&s.name.name))
+        {
+            return None;
+        }
+        Self::clocking_scoped_segs(h)
+    }
+
+    /// §14.3, §27.6: a clocking block, or a clockvar of one, named through
+    /// an indexed scope (`@(gen[2].cb)`, `gen[1].cb.a`, `u[0].cb`), as the
+    /// flat identifier the clocking arms resolve: its segments spell the
+    /// index (`gen[2]`). `None` for any other expression.
+    pub(super) fn clocking_indexed_term_as_ident(&self, e: &Expression) -> Option<Expression> {
+        if !self.clocking_in_indexed_scope {
+            return None;
+        }
+        // The block is the last segment, or the one before a clockvar. This
+        // is checked on the names as written, before the path is copied: it
+        // runs for every member read of an element (`s[0].i.x`).
+        fn tail_name(e: &Expression) -> Option<&str> {
+            match &e.kind {
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                ExprKind::Index { expr, .. } => tail_name(expr),
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                _ => None,
+            }
+        }
+        let (last, prev) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (Some(member.name.as_str()), tail_name(expr))
+            }
+            ExprKind::Ident(h) if h.path.len() > 1 => (
+                h.path.last().map(|s| s.name.name.as_str()),
+                Some(h.path[h.path.len() - 2].name.name.as_str()),
+            ),
+            _ => return None,
+        };
+        let block = |s: &str| self.names_clocking_block(s);
+        if !last.is_some_and(block) && !prev.is_some_and(block) {
+            return None;
+        }
+        let segs = Self::clocking_term_segs(e)?;
+        let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        if self.resolve_clocking_key(&refs).is_none()
+            && self.resolve_clocking_key(&refs[..refs.len() - 1]).is_none()
+        {
+            return None;
+        }
+        Some(Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: segs
+                    .into_iter()
+                    .map(|name| crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier { name, span: e.span },
+                        selects: Vec::new(),
+                    })
+                    .collect(),
+                span: e.span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            e.span,
+        ))
+    }
+
+    /// `h`'s path as clocking-key segments: `scoped` (from
+    /// `clocking_scoped_segs`) when it has one, else the plain names.
+    pub(super) fn clocking_segs<'h>(
+        h: &'h HierarchicalIdentifier,
+        scoped: &'h Option<Vec<String>>,
+    ) -> Vec<&'h str> {
+        match scoped {
+            Some(v) => v.iter().map(String::as_str).collect(),
+            None => h.path.iter().map(|s| s.name.name.as_str()).collect(),
+        }
     }
 
     pub(super) fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
@@ -3575,6 +3812,131 @@ impl Simulator {
         self.vif_rebase_chain(e)
     }
 
+    /// The last name of every unpacked variable (array, queue, dynamic or
+    /// associative array, unpacked structure) declared below a scope.
+    fn scoped_unpacked_leaves(&self) -> &HashSet<String> {
+        self.scoped_unpacked_leaves.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            let mut add = |name: &str| {
+                if let Some((_, leaf)) = name.rsplit_once('.') {
+                    let leaf = leaf.split('[').next().unwrap_or(leaf);
+                    if !set.contains(leaf) {
+                        set.insert(leaf.to_string());
+                    }
+                }
+            };
+            let m = &self.module;
+            m.arrays.keys().for_each(|n| add(n));
+            m.arrays_2d.keys().for_each(|n| add(n));
+            m.arrays_nd.keys().for_each(|n| add(n));
+            m.dynamic_arrays.iter().for_each(|n| add(n));
+            m.queue_vars.iter().for_each(|n| add(n));
+            m.associative_arrays.keys().for_each(|n| add(n));
+            for (name, dt) in m.var_decl_types.as_map() {
+                if name.contains('.') && self.unpacked_struct_of(dt).is_some() {
+                    add(name);
+                }
+            }
+            set
+        })
+    }
+
+    /// §25.9, §7.6: the bound instance's variable for a member chain through
+    /// a virtual interface that names an unpacked aggregate (an array, a
+    /// queue, a dynamic or associative array, an unpacked structure), so the
+    /// whole-aggregate copy, read and comparison paths, which resolve their
+    /// operands by name, take the same variable a hierarchical reference
+    /// does. `None` for any other expression, a scalar member included.
+    pub(super) fn vif_aggregate_canon(&mut self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {}
+            ExprKind::MemberAccess { .. } => {}
+            _ => return None,
+        }
+        // No virtual interface is bound (the gate of `vif_rebase_expr`), or
+        // no name in the chain is an unpacked variable of any scope: the
+        // common scalar access (`vif.valid = 1`) stops here.
+        if !self.iface_alias_possible()
+            && self.virtual_iface_bindings.is_empty()
+            && self.static_vif_bindings.is_empty()
+            && !self.vif_tokens_stored
+            && self.recv_call_memo.is_empty()
+        {
+            return None;
+        }
+        let leaves = self.scoped_unpacked_leaves();
+        let mut cur = e;
+        let mut possible = false;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    possible |= leaves.contains(member.name.as_str());
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } | ExprKind::Paren(expr) => cur = expr,
+                ExprKind::Ident(h) => {
+                    possible |= h.path[1..]
+                        .iter()
+                        .any(|s| leaves.contains(s.name.name.as_str()));
+                    break;
+                }
+                _ => break,
+            }
+            if possible {
+                break;
+            }
+        }
+        if !possible {
+            return None;
+        }
+        // §26.3: a handle held in a package (`pkg::vh.arr`) is stored under
+        // its own name, as `vif_recv_target` reads it.
+        let unqualified = if self.module.packages.is_empty() {
+            None
+        } else {
+            self.strip_package_lvalue(e).or_else(|| match &e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    let recv = self.strip_package_lvalue(expr)?;
+                    Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(recv),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ))
+                }
+                _ => None,
+            })
+        };
+        let rebased = self.vif_rebase_expr(unqualified.as_ref().unwrap_or(e))?;
+        // An array or collection of the instance under its stored name, one
+        // flat identifier: the whole-array paths look their operand up by
+        // it, and a one-segment name is not rebound through a property
+        // again. (An associative array is none of the shapes
+        // `is_unpacked_aggregate_operand` probes.)
+        if let ExprKind::Ident(h) = &rebased.kind
+            && h.path.iter().all(|s| s.selects.is_empty())
+        {
+            let flat = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if self.module.associative_arrays.contains_key(&flat)
+                || self.module.dynamic_arrays.contains(&flat)
+                || self.module.queue_vars.contains(&flat)
+                || self.module.arrays.contains_key(&flat)
+                || self.module.arrays_2d.contains_key(&flat)
+                || self.module.arrays_nd.contains_key(&flat)
+            {
+                return Some(Self::flat_name_ident(flat, rebased.span));
+            }
+        }
+        self.is_unpacked_aggregate_operand(&rebased)
+            .then_some(rebased)
+    }
+
     /// A flattened path: the first prefix `path[..=i]` (with at least one
     /// segment after it) that is a bound vif is replaced by the bound
     /// instance's path.
@@ -4320,6 +4682,97 @@ impl Simulator {
         }
     }
 
+    /// §6.18, §8.23, A.2.2.1 `[ class_scope ] type_identifier`: the target of
+    /// a virtual-interface typedef reached through a class scope —
+    /// `C::vif_t`, `C#(8)::vif_t`, `cfg_t::vif_t` (a typedef of a
+    /// specialization), `pkg::C::vif_t`, or a base class's typedef through a
+    /// derived class. Elaboration keys a class typedef `<class>::<leaf>` and
+    /// the bare leaf only when one class declares it, so the scope as written
+    /// reached nothing and the declaration was not a virtual interface. None
+    /// for a leaf no class declares as a virtual-interface typedef.
+    pub(super) fn class_scope_vif_typedef(
+        &self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<&DataType> {
+        if name.scopes.is_empty()
+            || !self
+                .class_member_names()
+                .vif_typedef_leaves
+                .contains(name.name.name.as_str())
+        {
+            return None;
+        }
+        self.class_scope_typedef_target(name)
+    }
+
+    /// The class a scope names and that class's typedef `name.name`, walking
+    /// its bases. Not gated: `class_scope_vif_typedef` is the cheap entry.
+    pub(super) fn class_scope_typedef_target(
+        &self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<&DataType> {
+        let leaf = name.name.name.as_str();
+        if let Some(dt) = self.module.typedef_types.get(&name.qualified()) {
+            return Some(dt);
+        }
+        let n = name.scopes.len();
+        let link = &name.scopes.last()?.name.name;
+        let class = (n >= 2)
+            .then(|| format!("{}::{}", name.scopes[n - 2].name.name, link))
+            .and_then(|q| self.resolve_class_scope_prefix(&q))
+            .or_else(|| self.resolve_class_scope_prefix(link))
+            .map(|(c, _)| c)?;
+        let mut cur = Some(class);
+        for _ in 0..64 {
+            let c = cur?;
+            let base = c.split('#').next().unwrap_or(&c);
+            let cd = self.module.classes.get(base)?;
+            let qualified = format!("{base}::{leaf}");
+            if let Some(dt) = cd
+                .typedef_targets
+                .get(leaf)
+                .or_else(|| cd.typedef_targets.get(&qualified))
+                .or_else(|| self.module.typedef_types.get(&qualified))
+            {
+                return Some(dt);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// `resolve_typedef_chain`, following a class-scoped virtual-interface
+    /// typedef through the class its scope names first (see
+    /// `class_scope_vif_typedef`): the qualified key alone missed it, and
+    /// the bare leaf may be another scope's typedef.
+    pub(super) fn typedef_chain_scoped<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
+        for _ in 0..64 {
+            let DataType::TypeReference { name, .. } = cur else {
+                break;
+            };
+            let next = self
+                .class_scope_vif_typedef(name)
+                .or_else(|| super::elaborate::lookup_scoped_type(name, &self.module.typedef_types));
+            match next {
+                Some(n) if !std::ptr::eq(n, cur) => cur = n,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// `dt_is_virtual_iface`, also through a class scope.
+    pub(super) fn decl_is_virtual_iface(&self, dt: &DataType) -> bool {
+        match self.typedef_chain_scoped(dt) {
+            DataType::Interface { .. } => true,
+            DataType::TypeReference { name, .. } => {
+                self.module.interfaces.contains(&name.name.name)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn dt_is_virtual_iface(dt: &DataType, module: &ElaboratedModule) -> bool {
         match super::elaborate::resolve_typedef_chain(dt, &module.typedef_types) {
             DataType::Interface { .. } => true,
@@ -4336,7 +4789,8 @@ impl Simulator {
         use crate::ast::types::DataType;
         // §6.18 / §25.9: package variables retain their declared typedef;
         // its resolved interface type carries the binding semantics too.
-        match super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types) {
+        // §8.23: so does a class-scoped one (`cfg_t::vif_t`).
+        match self.typedef_chain_scoped(dt) {
             DataType::Interface { .. } => true,
             DataType::TypeReference { name, .. } => {
                 let n = &name.name.name;

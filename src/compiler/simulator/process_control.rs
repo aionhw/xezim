@@ -14,7 +14,7 @@ impl Simulator {
         if self.event_queue.has_pid(pid) {
             return true;
         }
-        if self.event_waiters.iter().any(|w| w.pid == pid) {
+        if self.event_waiters.contains_pid(pid) {
             return true;
         }
         if self.condition_waiters.contains_pid(pid) {
@@ -26,7 +26,7 @@ impl Simulator {
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
         // is suspended, not finished — its continuation resumes after the
         // NBA region of the current tick.
-        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+        if self.inactive_queue.contains_pid(pid) {
             return true;
         }
         if self.nba_region_waiters.iter().any(|(p, _)| *p == pid) {
@@ -196,7 +196,7 @@ impl Simulator {
         for &p in &to_kill {
             self.event_queue.remove_pid(p);
         }
-        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.event_waiters.remove_pids(&to_kill);
         self.instance_event_waiters.remove_pids(to_kill.iter());
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         self.ready_condition_waiters
@@ -271,8 +271,7 @@ impl Simulator {
             return;
         }
         // 2) Event control (event_waiters)
-        if let Some(idx) = self.event_waiters.iter().position(|w| w.pid == pid) {
-            let waiter = self.event_waiters.remove(idx);
+        if let Some(waiter) = self.event_waiters.take_first_of_pid(pid) {
             self.suspended_pids.insert(pid);
             self.suspended_proc_info.insert(
                 pid,

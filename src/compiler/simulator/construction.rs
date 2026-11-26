@@ -101,6 +101,9 @@ impl Simulator {
             for (prop, &(w, max)) in &cd.queue_properties {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
+                if cd.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(n_name.clone());
+                }
                 self.module.dynamic_arrays.insert(n_name.clone());
                 if let Some(&t) = self.module.arrays_2d.get(&s_name) {
                     self.module.arrays_2d.insert(n_name.clone(), t);
@@ -497,7 +500,27 @@ impl Simulator {
             .map(|(_, d)| d.clone())
     }
 
-    pub(super) fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
+    /// The design parameters with `spec` (`class_spec_value_params`) laid
+    /// over them, borrowed: copying the design's whole parameter table on
+    /// every evaluation inside a class method cost time linear in the
+    /// design's parameter count (#1276).
+    pub(super) fn spec_param_env<'a>(
+        &'a self,
+        spec: &'a Option<HashMap<String, Value>>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        match spec {
+            Some(top) => super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top,
+            },
+            None => super::elaborate::ParamEnv::Single(&self.module.parameters),
+        }
+    }
+
+    /// Just the active specialization's value parameters, which
+    /// `spec_param_env` lays over `module.parameters` instead of copying
+    /// every design parameter.
+    pub(super) fn class_spec_value_params(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;
         let names: Vec<String> = {
             let cd = self.module.classes.get(&base)?;
@@ -510,13 +533,96 @@ impl Simulator {
         if names.is_empty() {
             return None;
         }
-        let mut m = self.module.parameters.clone();
+        let mut m = HashMap::default();
         for n in names {
             if let Some(v) = self.resolve_value_param_from_spec(&n) {
                 m.insert(n, v);
             }
         }
         Some(m)
+    }
+
+    /// §8.5, §6.20.4: the parameters that size a type written inside a class
+    /// method: the active specialization's value parameters
+    /// (`class_spec_value_params`) plus the class-body constants the packed
+    /// dimensions of `dt` name (`localparam int W = 4;` ...
+    /// `$bits(logic [W-1:0])`), own or inherited. The design parameter map
+    /// holds a class constant only under its class-qualified name, so the
+    /// dimension was dropped and the type came out one bit wide (#1273).
+    pub(super) fn class_type_env(&mut self, dt: &DataType) -> Option<HashMap<String, Value>> {
+        let mut env = self.class_spec_value_params();
+        let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
+            return env;
+        };
+        let mut names: Vec<String> = Vec::new();
+        Self::type_dim_idents(dt, 0, &mut names);
+        for n in names {
+            if env.as_ref().is_some_and(|m| m.contains_key(&n)) || !self.class_body_const(&ctx, &n)
+            {
+                continue;
+            }
+            let v = self.eval_expr(&super::vpi_model::ident_expr(&n));
+            env.get_or_insert_with(HashMap::default).insert(n, v);
+        }
+        env
+    }
+
+    /// Whether `name` is a body constant (`parameter` / `localparam`, not a
+    /// header parameter) of class `cls` or of a class it extends.
+    fn class_body_const(&self, cls: &str, name: &str) -> bool {
+        let mut cur = self.module.classes.get(cls);
+        let mut depth = 0;
+        while let Some(cd) = cur {
+            if cd.param_defaults.iter().any(|(n, _)| n == name) {
+                return !cd.param_order.iter().any(|p| p == name);
+            }
+            depth += 1;
+            if depth > 64 {
+                break;
+            }
+            cur = cd.extends.as_ref().and_then(|e| self.module.classes.get(e));
+        }
+        false
+    }
+
+    /// The plain identifiers the packed dimensions of `dt` read.
+    fn type_dim_idents(dt: &DataType, depth: u32, out: &mut Vec<String>) {
+        use crate::ast::types::PackedDimension;
+        if depth > 8 {
+            return;
+        }
+        let dims = |dimensions: &[PackedDimension], out: &mut Vec<String>| {
+            for d in dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    for e in [left, right] {
+                        Self::walk_operands(e, &mut |x| {
+                            if let ExprKind::Ident(h) = &x.kind
+                                && h.path.len() == 1
+                                && !out.contains(&h.path[0].name.name)
+                            {
+                                out.push(h.path[0].name.name.clone());
+                            }
+                        });
+                    }
+                }
+            }
+        };
+        match dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => dims(dimensions, out),
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    Self::type_dim_idents(&m.data_type, depth + 1, out);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(bt) = &et.base_type {
+                    Self::type_dim_idents(bt, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Resolve a value parameter `name` against the ACTIVE specialization,
@@ -1876,12 +1982,76 @@ impl Simulator {
                 return Some(ta.clone());
             }
         }
+        if let Some(ta) = self.member_target_type_args(lvalue) {
+            return Some(ta);
+        }
         if let ExprKind::Ident(lh) = &lvalue.kind {
             if let Some(leaf) = lh.path.last() {
                 if let Some(ta) = self.this_property_type_args(&leaf.name.name) {
                     return Some(ta);
                 }
             }
+        }
+        None
+    }
+
+    /// §8.8, §8.25: `obj.m = new` (or `this.m = new`) where the class of
+    /// `obj` declares `C #(args) m;` constructs that specialization, as a
+    /// bare `m = new` in a method of `obj` would. Only where `args` mean the
+    /// same in the running scope: `obj` is `this`, or the declaring class
+    /// has no parameters (a parameterized owner's member specialization is
+    /// `receiver_member_spec`'s).
+    fn member_target_type_args(&self, lvalue: &Expression) -> Option<Vec<Expression>> {
+        let (owner, cn, prop) = self.member_target_decl(lvalue)?;
+        let cd = self.module.classes.get(&cn)?;
+        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
+        if !is_this && self.class_is_parameterized(&cn) {
+            return None;
+        }
+        cd.property_type_args
+            .get(&prop)
+            .filter(|ta| !ta.is_empty())
+            .cloned()
+    }
+
+    /// For a `new` target naming a member through an object (`obj.m`,
+    /// `this.m`): the object, the class in its chain that declares the
+    /// member, and the member's name. `None` for any other target, a null
+    /// object, or a collection member (an element of one is constructed on
+    /// the element path of `exec_stmt_blocking_assign_body`).
+    fn member_target_decl(&self, lvalue: &Expression) -> Option<(usize, String, String)> {
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        let mut cur = Some(self.heap.get(owner)?.as_ref()?.class_name.clone());
+        for _ in 0..64 {
+            let cn = cur?;
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll {
+                    return None;
+                }
+                return Some((owner, cn, prop.to_string()));
+            }
+            cur = cd.extends.clone();
         }
         None
     }
@@ -1902,6 +2072,15 @@ impl Simulator {
     /// `this`-instance inheritance chain so a base-class property (e.g.
     /// `uvm_component.event_pool`) resolves from a derived component.
     pub(super) fn this_member_typedef_spec(&self, lvalue: &Expression) -> Option<(String, String)> {
+        // §8.8: `obj.m = new` through another object (or an element of its
+        // member array) declares `m` in `obj`'s class, not in `this`'s.
+        if let Some((owner, cn, prop)) = self.member_target_decl(lvalue)
+            && self.this_stack.last().copied().flatten() != Some(owner)
+            && !self.class_is_parameterized(&cn)
+        {
+            let raw = self.module.classes.get(&cn)?.properties.get(&prop)?.type_name.as_ref()?;
+            return self.resolve_typedef_spec(raw);
+        }
         let leaf = match &lvalue.kind {
             ExprKind::Ident(h) => h.path.last()?.name.name.clone(),
             ExprKind::MemberAccess { member, .. } => member.name.clone(),
@@ -2841,6 +3020,9 @@ impl Simulator {
                 }) {
                     self.signed_class_colls.insert(scoped.clone());
                 }
+                if cdef.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(scoped.clone());
+                }
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters
                 // are read from the instance being built.
@@ -2881,6 +3063,18 @@ impl Simulator {
                 // An unpacked-struct element keeps its member cells in the
                 // instance (`sta[1].f`), where member reads and writes go.
                 let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
+                // Consecutive scalar elements share the same key prefix.
+                // Keep their Values in the existing dense run while preserving
+                // every indexed cell, its declared width and its typed default.
+                let dense = elem_su.is_none() && lo < hi && (0..1_000_000_000).contains(&lo);
+                if dense {
+                    self.signals.register_element_run(&scoped, false);
+                }
+                // Width ranges use the same canonical indices as dense values.
+                let shared_width = dense && hi < 1_000_000_000;
+                if shared_width {
+                    self.widths.declare_fixed(&scoped, lo as u64, hi as u64, width);
+                }
                 for i in lo..=hi {
                     let elem = format!("{}[{}]", scoped, i);
                     if let Some(su) = &elem_su {
@@ -2895,8 +3089,10 @@ impl Simulator {
                             instance.properties.insert(k, v);
                         }
                     }
-                    self.signals.insert(elem.clone(), fill.clone());
-                    self.widths.insert(elem, width);
+                    if !shared_width {
+                        self.widths.insert(elem.clone(), width);
+                    }
+                    self.signals.insert(elem, fill.clone());
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
@@ -3244,7 +3440,7 @@ impl Simulator {
                 let raw = self.eval_expr_ctx(&init, w);
                 let two_state =
                     super::elaborate::is_type_two_state_resolved(&mdt, &self.module.typedef_types);
-                let is_real = super::elaborate::is_type_real(&mdt);
+                let is_real = self.dt_is_real(&mdt);
                 let signed = self.type_is_signed_concrete(&mdt);
                 let v = Self::fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {

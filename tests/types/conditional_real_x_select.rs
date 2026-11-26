@@ -1,8 +1,5 @@
-//! §11.3.1/§11.4.11 — a conditional `cond ? a : b` whose result is REAL and
-//! whose `cond` is X/Z must return a defined real value, NOT a per-bit merge of
-//! the operands' IEEE-754 bit patterns (which produced garbage like `4.65e18`
-//! for `1000.0`). Surfaced by a PLL model: `sel ? vcofbperiod : vcofb*mult_out`
-//! with `sel`=X made `plloutperiod` a nonsense clock period.
+//! §11.4.11, Table 7-1: an ambiguous real conditional keeps equal arms
+//! and returns 0.0 for unequal arms.
 
 use xezim::simulate;
 
@@ -16,23 +13,25 @@ fn out(src: &str) -> String {
 }
 
 #[test]
-fn real_conditional_with_x_condition_is_a_branch_not_garbage() {
+fn real_conditional_with_ambiguous_condition() {
     let o = out(r#"
 module t;
+  localparam real P = 1'bx ? 5.0 : 6.0;
   reg sel; real a = 1000.0, mout = 2.0, r;
   initial begin
-    sel = 1'bx; r = sel ? a : a*mout; $display("X=%g", r);   // else branch -> 2000
+    $display("P=%g", P);
+    sel = 1'bz; r = sel ? a : 1000; $display("Z=%g", r);
+    r = 2'b1x ? a : a*mout; $display("M=%g", r);
+    sel = 1'bx; r = sel ? a : a*mout; $display("X=%g", r);   // unequal arms
     sel = 1'b1; r = sel ? a : a*mout; $display("T=%g", r);   // 1000
     sel = 1'b0; r = sel ? a : a*mout; $display("F=%g", r);   // 2000
     $finish;
   end
 endmodule
 "#);
-    assert!(
-        o.contains("X=2000"),
-        "x-select real must be a defined branch (2000), not bit-garbage; got: {}",
-        o
-    );
+    for expected in ["P=0", "X=0", "Z=1000", "M=1000"] {
+        assert!(o.lines().any(|line| line == expected), "{o}");
+    }
     assert!(
         o.contains("T=1000") && o.contains("F=2000"),
         "known selects still correct; got: {}",

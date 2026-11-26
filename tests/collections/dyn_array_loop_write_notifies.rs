@@ -129,37 +129,8 @@ module tb;
 endmodule
 "#;
 
-/// A NON-BLOCKING write to a dynamic-array or queue ELEMENT must notify
-/// readers. (Audit rounds 4-6; FIXED.)
-///
-/// It was a different path from the loop bug above: it reproduced with no loop
-/// at all.
-/// This is a DIFFERENT path from the loop bug fixed above: it reproduces with
-/// no loop at all, so the compile-gate guard does not reach it, and the
-/// interpreter's own NBA-to-collection commit is what fails to mark dirty.
-/// The value lands (a direct read returns it) and a later BLOCKING write does
-/// notify, so a reader silently serves stale data indefinitely:
-///
-/// ```text
-/// A after NBA : direct n1[0]=11 comb r1=x   <- never notified
-/// B after blk : direct n1[0]=55 comb r1=55  <- blocking DOES notify
-/// C after NBA2: direct n1[0]=77 comb r1=55  <- stuck on the stale value
-/// ```
-///
-/// A dynamic-array / queue element carries a signal TWIN, so the NBA fast
-/// path resolved it and `apply_nba_entry` wrote (and dirtied) THAT id — but a
-/// reader of the COLLECTION does not depend on it, so nothing re-evaluated.
-/// The value landed while readers served stale data, and a later BLOCKING
-/// write did notify, which made it look intermittent.
-///
-/// Fixed by returning None from `resolve_nba_target` for these two kinds, so
-/// they commit through the queued-lvalue path (`assign_value`) — the same
-/// route ASSOCIATIVE arrays already took, which is why assoc was always
-/// correct. Edge blocks needed the matching compiler-side gate
-/// (`collection_store_denied`), since they emit array-store insns directly.
-///
-/// Assoc and static are kept in the same case as positive controls.
-const NBA_TO_DYNAMIC_ELEMENT: &str = r#"
+/// §10.4.2: dynamic elements use blocking writes; the fixed array is the NBA control.
+const ELEMENT_WRITE_NOTIFICATION: &str = r#"
 module tb;
   logic [7:0] n1 [];
   logic [7:0] q1 [$];
@@ -175,9 +146,9 @@ module tb;
     n1 = new[4];
     q1.delete(); for (int z = 0; z < 4; ++z) q1.push_back(8'd0);
     for (int z = 0; z < 4; ++z) a1[z] = 8'd0;
-    n1[0] <= 8'd11;
-    q1[0] <= 8'd22;
-    a1[0] <= 8'd33;   // associative: already correct
+    n1[0] = 8'd11;
+    q1[0] = 8'd22;
+    a1[0] = 8'd33;   // associative: already correct
     s1[0] <= 8'd44;   // static: already correct
     #1;
     ok = (r1 == 8'd11) && (r2 == 8'd22) && (r3 == 8'd33) && (r4 == 8'd44);
@@ -231,10 +202,10 @@ fn dynamic_array_sibling_shapes_and_non_comb_readers_notify() {
 }
 
 #[test]
-fn nba_to_dynamic_array_or_queue_element_notifies_readers() {
+fn dynamic_array_or_queue_element_write_notifies_readers() {
     assert_eq!(
-        ok_flag(NBA_TO_DYNAMIC_ELEMENT),
+        ok_flag(ELEMENT_WRITE_NOTIFICATION),
         1,
-        "a non-blocking write to a dynamic array or queue element did not reach its reader"
+        "a write to a dynamic array or queue element did not reach its reader"
     );
 }

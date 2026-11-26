@@ -153,6 +153,10 @@ mod init_reg_seed;
 mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
+#[path = "misc/integral_time.rs"]
+mod integral_time;
+#[path = "misc/review_exact_time_reads.rs"]
+mod review_exact_time_reads;
 #[path = "misc/interconnect_and_var_ports.rs"]
 mod interconnect_and_var_ports;
 #[path = "misc/issue30_runner.rs"]
@@ -257,10 +261,16 @@ mod part_select_constant_bounds;
 mod part_select_negative_bound_compiled;
 #[path = "misc/placeholder_parameter_replication.rs"]
 mod placeholder_parameter_replication;
+#[path = "misc/port_conn_width_after_index.rs"]
+mod port_conn_width_after_index;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
+#[path = "misc/readmem_associative_array.rs"]
+mod readmem_associative_array;
 #[path = "misc/readmem_hierarchical_target.rs"]
 mod readmem_hierarchical_target;
+#[path = "misc/readmem_multidim.rs"]
+mod readmem_multidim;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
 #[path = "misc/reduce_loop_unroll.rs"]
@@ -281,8 +291,12 @@ mod shadow_name_matrix;
 mod simulation_version_banner;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
+#[path = "misc/struct_member_unselected_generate.rs"]
+mod struct_member_unselected_generate;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
+#[path = "misc/subroutine_body_port_packed_user_type.rs"]
+mod subroutine_body_port_packed_user_type;
 #[path = "misc/subroutine_port_redeclaration.rs"]
 mod subroutine_port_redeclaration;
 #[path = "misc/subroutine_port_type.rs"]
@@ -295,6 +309,8 @@ mod svtb_suite;
 mod system_task_value;
 #[path = "misc/time0_x_defaults.rs"]
 mod time0_x_defaults;
+#[path = "misc/unelaborated_top_port_connections.rs"]
+mod unelaborated_top_port_connections;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]
@@ -414,6 +430,8 @@ mod void_cast_operand;
 mod warm_cache_diag_replay;
 #[path = "misc/wildcard_import_conflict.rs"]
 mod wildcard_import_conflict;
+#[path = "misc/writemem_data_lines.rs"]
+mod writemem_data_lines;
 #[path = "misc/x_warn_switch.rs"]
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
@@ -609,6 +627,8 @@ mod artifact_with_sources_738;
 mod checkpoint_save_restore;
 #[path = "misc/checkpoint_forked_process_bodies.rs"]
 mod checkpoint_forked_process_bodies;
+#[path = "misc/checkpoint_jit_display.rs"]
+mod checkpoint_jit_display;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
@@ -664,9 +684,18 @@ mod replication_signedness_1095;
 mod localparam_self_determined_1143;
 #[path = "misc/comb_timescale.rs"]
 mod comb_timescale;
+#[path = "misc/comb_batch_branches_1284.rs"]
+mod comb_batch_branches_1284;
 
 #[path = "misc/declaration_order_snapshots.rs"]
 mod declaration_order_snapshots;
 
 #[path = "misc/shared_procedural_bodies.rs"]
 mod shared_procedural_bodies;
+#[path = "misc/deferred_assertion_counts.rs"]
+mod deferred_assertion_counts;
+
+#[path = "misc/stringify_macro_chain.rs"]
+mod stringify_macro_chain;
+#[path = "misc/continuous_assign_time_scope.rs"]
+mod continuous_assign_time_scope;

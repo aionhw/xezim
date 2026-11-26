@@ -1234,9 +1234,17 @@ impl Simulator {
                         .iter()
                         .filter(|(p, _)| !cd.virtual_iface_properties.contains_key(p.as_str()))
                         .filter_map(|(p, dt)| {
-                            if !matches!(dt, DataType::TypeReference { .. }) {
+                            let DataType::TypeReference { name, .. } = dt else {
                                 return None;
-                            }
+                            };
+                            // §8.23: through a class scope (`cfg_t::vif_t pv;`)
+                            // the typedef is the scope's class's, not a
+                            // same-named bare one.
+                            let dt = if name.scopes.is_empty() {
+                                dt
+                            } else {
+                                self.class_scope_typedef_target(name).unwrap_or(dt)
+                            };
                             match Self::resolve_type_ref(dt, &self.module.typedef_types) {
                                 DataType::Interface { name, modport, .. } => {
                                     Some((p.clone(), (name.name.clone(), modport.map(|m| m.name))))
@@ -2578,6 +2586,35 @@ impl Simulator {
         super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
     }
 
+    /// §8.25, §6.20.2: a constant expression over the ACTIVE specialization's
+    /// value parameters (`W/4` in a typedef of `outer_c #(16)`), folded to
+    /// the number it names there. `fold_package_const_expr` knows only
+    /// literals and package parameters, so the argument was dropped and the
+    /// parameter took its default.
+    pub(super) fn fold_enclosing_param_expr(&self, e: &Expression) -> Option<String> {
+        if !matches!(
+            e.kind,
+            ExprKind::Binary { .. }
+                | ExprKind::Unary { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Conditional { .. }
+        ) {
+            return None;
+        }
+        let (b, s) = self.current_spec.as_ref()?;
+        let cd = self.get_class_def(b)?;
+        let bound: Vec<String> = Self::split_spec_args(s)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let names = &cd.param_order[..cd.param_order.len().min(bound.len())];
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(e, names, &bound, &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
     /// `pkg::NAME` when `pkg` is a package of the design: the key
     /// `module.parameters` holds that package's parameter under. None for a
     /// bare name or any other scope.
@@ -3075,6 +3112,17 @@ impl Simulator {
     /// instance method lands in the SAME shared store the static-method path
     /// (and any `ClassName::m[...]` spelling) uses.
     pub(super) fn spec_static_coll_key_in_class(&self, name: &str, ctx: &str) -> String {
+        self.spec_static_coll_key_in_class_with(name, ctx, None)
+    }
+
+    /// `spec_static_coll_key_in_class` under the specialization `spec`
+    /// (an object's own, §8.25) instead of the active one, when given.
+    pub(super) fn spec_static_coll_key_in_class_with(
+        &self,
+        name: &str,
+        ctx: &str,
+        spec: Option<&(String, String)>,
+    ) -> String {
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
         // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
@@ -3085,7 +3133,7 @@ impl Simulator {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(ctx, name) {
+                    if let Some(key) = self.static_prop_key_spec(ctx, name, spec) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically
@@ -4233,6 +4281,18 @@ impl Simulator {
             .is_some_and(|l| l.contains_key(name))
         {
             return true;
+        }
+        // §13.5, §25.9: the running frame does not declare `name`, so it
+        // reads the enclosing scope (a module, interface or package
+        // variable). The key a CALLER's virtual-interface formal of that name
+        // made does not speak for it: no caller frame is visible here. The
+        // running subroutine's own formal (its alias frame is the last one,
+        // read from a nested scope such as an inline constraint) still is.
+        if let Some((own, callers)) = self.local_iface_aliases.split_last()
+            && !own.contains_key(name)
+            && callers.iter().any(|f| f.contains_key(name))
+        {
+            return false;
         }
         let Some(th) = self.this_stack.last().copied().flatten() else {
             return true;

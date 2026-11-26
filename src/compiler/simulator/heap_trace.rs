@@ -86,6 +86,36 @@ impl HandleTrace {
     pub fn trace<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), TraceError> {
         value.serialize(&mut *self)
     }
+    /// Trace the keys `name[first]` .. `name[first + count - 1]`, as tracing
+    /// each key's text does, without spelling the keys out.
+    pub fn elem_keys(&mut self, name: &str, first: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(rest) = name.strip_prefix("\u{2}inst")
+            && let Some((owner, _)) = rest.split_once('#')
+            && let Ok(handle) = owner.parse::<u64>()
+        {
+            self.candidate(handle);
+        }
+        // A key with a bracket is no number in any radix; its pieces are
+        // the name's and the index.
+        self.text_pieces(name);
+        for i in first..first + count as u64 {
+            self.candidate(i);
+        }
+    }
+    fn text_pieces(&mut self, text: &str) {
+        for piece in text.split(['.', '[', ']', ':']) {
+            let number = piece
+                .split_once('#')
+                .map(|(owner, _)| owner)
+                .unwrap_or(piece);
+            if let Ok(n) = number.parse::<u64>() {
+                self.candidate(n);
+            }
+        }
+    }
     fn text(&mut self, text: &str) {
         if let Some(rest) = text.strip_prefix("\u{2}inst")
             && let Some((owner, _)) = rest.split_once('#')
@@ -116,15 +146,7 @@ impl HandleTrace {
         if !text.bytes().any(|b| b.is_ascii_digit()) {
             return;
         }
-        for piece in text.split(['.', '[', ']', ':']) {
-            let number = piece
-                .split_once('#')
-                .map(|(owner, _)| owner)
-                .unwrap_or(piece);
-            if let Ok(n) = number.parse::<u64>() {
-                self.candidate(n);
-            }
-        }
+        self.text_pieces(text);
     }
     fn finish_value(&mut self) {
         // SV event queues encode the owning object in a packed string. Match

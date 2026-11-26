@@ -437,6 +437,195 @@ impl Simulator {
         ) || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
     }
 
+    /// §7.4.1/§11.5.1: the declared range `(left, right)` of `name` when the
+    /// innermost call frame holds it as a plain one-dimensional packed vector
+    /// (a task or function local, formal or return variable): the leftmost
+    /// bound labels the most significant bit, so `n[0]` of `reg [0:7] n` is
+    /// bit 7 and `n[1]` of `reg [8:1] n` is bit 0. A declaration that
+    /// registered no range is `[w-1:0]`. None for a name the frame does not
+    /// hold and for a real, string, collection, packed array or struct,
+    /// whose selects keep their own paths. The frame's variable hides a
+    /// design variable of its name, whose range belongs to the design.
+    pub(super) fn frame_vector_range(&self, name: &str) -> Option<(i64, i64)> {
+        let cur = self.local_stack.last()?.get(name)?;
+        if cur.is_real || cur.width == 0 {
+            return None;
+        }
+        let m = &self.module;
+        if m.packed_signal_elem_widths.contains_key(name)
+            || m.packed_struct_fields.contains_key(name)
+            || m.arrays.contains_key(name)
+            || m.dynamic_arrays.contains(name)
+            || m.associative_arrays.contains_key(name)
+            || m.queue_vars.contains(name)
+            || self.dyn_name_lookup(name).is_some()
+            || self.frame_name_is_string(name)
+        {
+            return None;
+        }
+        match m.packed_full_dims.get(name).map(Vec::as_slice) {
+            None => Some((cur.width as i64 - 1, 0)),
+            Some(&[(l, r)]) if l.abs_diff(r) + 1 == u64::from(cur.width) => Some((l, r)),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether the frame variable `name` has a 2-state declared type
+    /// (§6.11.2: it stores and reads x/z bits as 0).
+    fn frame_var_two_state(&self, name: &str) -> bool {
+        self.module.var_decl_types.get(name).is_some_and(|dt| {
+            super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
+    }
+
+    /// The physical bits `[lo, hi]` a bit-select (`right` is None) or a
+    /// part-select of a vector declared `range` names, from its labels
+    /// (§11.5.1: `b +: w` is labels b..b+w-1, `b -: w` is b-w+1..b); bits
+    /// outside the vector are included, to be dropped by the caller. None
+    /// when a bound is x/z or an indexed width is not positive: the select
+    /// then names no bits.
+    fn frame_select_bits(
+        &mut self,
+        range: (i64, i64),
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+    ) -> Option<(i64, i64)> {
+        let a = self.eval_expr(left).to_index()?;
+        let b = match (kind, right) {
+            (Some(kind), Some(right)) => {
+                let n = self.eval_expr(right).to_index()?;
+                match kind {
+                    RangeKind::Constant => n,
+                    RangeKind::IndexedUp if n > 0 => a.checked_add(n - 1)?,
+                    RangeKind::IndexedDown if n > 0 => a.checked_sub(n - 1)?,
+                    _ => return None,
+                }
+            }
+            _ => a,
+        };
+        let (pa, pb) = (
+            super::event_bits::label_to_phys(range, a),
+            super::event_bits::label_to_phys(range, b),
+        );
+        Some((pa.min(pb), pa.max(pb)))
+    }
+
+    /// §7.4.1/§11.5.1: read a bit-select (`right` is None) or a part-select
+    /// of a plain vector the innermost call frame holds, at the bits its
+    /// declared range labels (`frame_vector_range`). Bits outside the vector
+    /// read x, or 0 in a 2-state variable. None when `base` is not such a
+    /// variable.
+    pub(super) fn frame_vector_select_read(
+        &mut self,
+        base: &Expression,
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+    ) -> Option<Value> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let name = self.frame_bound_bare_name(h)?;
+        let range = self.frame_vector_range(name)?;
+        let w = match self.frame_select_bits(range, kind, left, right) {
+            Some((lo, hi)) => {
+                let cur = self.frame_get(name)?;
+                let v = cur.range_select_signed(hi, lo);
+                if v.has_xz() && (lo < 0 || hi >= i64::from(cur.width)) {
+                    // Out-of-range bits read as the variable's default.
+                    if self.frame_var_two_state(name) {
+                        let cur = self.local_stack.last()?.get(name)?;
+                        let mut z = Value::zero(v.width);
+                        let first = lo.max(0);
+                        let last = hi.min(i64::from(cur.width) - 1);
+                        if first <= last {
+                            z.copy_bits_from(
+                                (first - lo) as usize,
+                                cur,
+                                first as usize,
+                                (last - first + 1) as usize,
+                            );
+                        }
+                        return Some(z);
+                    }
+                }
+                return Some(v);
+            }
+            None => match (kind, right) {
+                // §11.5.1: an x/z bound reads x at the select's width; an
+                // indexed width is a constant expression.
+                (Some(RangeKind::Constant), _) | (None, _) => 1,
+                (Some(_), Some(r)) => self
+                    .eval_expr(r)
+                    .to_index()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1),
+                (Some(_), None) => 1,
+            },
+        };
+        Some(if self.frame_var_two_state(name) {
+            Value::zero(w)
+        } else {
+            Value::new(w)
+        })
+    }
+
+    /// §7.4.1/§11.5.1: write `val` through a bit-select (`right` is None) or
+    /// a part-select of a plain vector the innermost call frame holds, at the
+    /// bits its declared range labels (`frame_vector_range`). The write arms
+    /// below resolve the label against the design's range tables, which hold
+    /// module variables only, so `n[0] = 1'b1` on a local `reg [0:7] n` set
+    /// bit 0 instead of bit 7, and a local beside a same-named design
+    /// variable wrote that variable. Bits outside the vector, and a select
+    /// with an x/z bound, write nothing. None when `base` is not such a
+    /// variable.
+    pub(super) fn frame_vector_select_write(
+        &mut self,
+        base: &Expression,
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+        val: &Value,
+    ) -> Option<bool> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let name = self.frame_bound_bare_name(h)?;
+        let range = self.frame_vector_range(name)?;
+        let Some((lo, hi)) = self.frame_select_bits(range, kind, left, right) else {
+            return Some(false);
+        };
+        let n = u32::try_from(hi - lo + 1).ok()?;
+        let mut v = if val.is_real {
+            Self::real_to_int(val.to_f64(), n)
+        } else {
+            val.resize_for_assign(n)
+        };
+        // §6.11.2: a 2-state variable stores x/z bits as 0.
+        if v.has_xz() && self.frame_var_two_state(name) {
+            v = v.to_two_state();
+        }
+        let width = i64::from(self.local_stack.last()?.get(name)?.width);
+        let (first, last) = (lo.max(0), hi.min(width - 1));
+        if first > last {
+            return Some(false);
+        }
+        let changed = self.local_stack.last_mut()?.get_mut(name)?.copy_bits_from(
+            first as usize,
+            &v,
+            (first - lo) as usize,
+            (last - first + 1) as usize,
+        );
+        // §6.21: a static local's live cell takes the write too.
+        if changed && let Some(key) = self.packed_local_static_key(name) {
+            let cur = self.local_stack.last()?.get(name)?.clone();
+            self.static_local_vars.insert(key, cur);
+        }
+        Some(changed)
+    }
+
     /// A select of a select of a variable the innermost call frame owns (a
     /// task or function local, formal or return value): `p[1][3:0]`,
     /// `p[0][7]`, `p[i][j][k +: 2]`, `a[i].f[3]`, `s.m[1][7:4]`. Returns the
@@ -1046,39 +1235,125 @@ impl Simulator {
         name: &str,
     ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
         let (prefix, _) = name.rsplit_once('.')?;
-        if let Some((cached, scope)) = self.decl_param_scope_cache.borrow().as_ref()
-            && cached == prefix
+        let mut cache = self.decl_param_scope_cache.borrow_mut();
+        let cache = &mut *cache;
+        if let Some((last, owns)) = &cache.last
+            && last == prefix
         {
-            return scope.clone();
+            return if *owns {
+                cache.tables.last().map(|t| t.table.clone())
+            } else {
+                None
+            };
         }
         // Every enclosing scope of the prefix, outermost first: `u.g.par`
         // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
+        // Their groups go on in that order, so the innermost binding of a
+        // name wins over an outer same-named one.
         let scopes: Vec<&str> = prefix
             .match_indices('.')
             .map(|(i, _)| &prefix[..i])
             .chain(std::iter::once(prefix))
             .collect();
-        let mut overlay: Vec<(usize, &str, &Value)> = Vec::new();
-        for (k, v) in &self.module.parameters {
-            for (depth, scope) in scopes.iter().enumerate() {
-                if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
-                    overlay.push((depth, rest, v));
+        let mut groups = Vec::with_capacity(scopes.len());
+        for scope in &scopes {
+            let group = match cache.groups.get(*scope) {
+                Some(group) => group.clone(),
+                None => {
+                    let group = self.decl_param_group(scope);
+                    cache.groups.insert(scope.to_string(), group.clone());
+                    group
+                }
+            };
+            groups.push(group);
+        }
+        if groups.iter().all(|g| g.is_empty()) {
+            cache.last = Some((prefix.to_string(), false));
+            return None;
+        }
+        // An overlaid table is moved between prefixes: the groups of the
+        // scopes the old and new prefix share stay on, the old prefix's
+        // other groups come off and the new prefix's go on. Of the tables
+        // nothing else holds, the one sharing the most outer scopes with the
+        // new prefix is moved; a prefix that shares none with any of them
+        // gets a fresh copy while there is room, else the least recently
+        // used one. A caller that still holds a table (a select whose index
+        // reads another instance's signal) keeps it untouched.
+        let shared = |t: &DeclParamTable| {
+            t.applied
+                .iter()
+                .zip(&scopes)
+                .take_while(|((applied, _), scope)| applied == *scope)
+                .count()
+        };
+        let unshared = |t: &DeclParamTable| std::rc::Rc::strong_count(&t.table) == 1;
+        let best = cache
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| unshared(t))
+            .map(|(i, t)| (shared(t), i))
+            .filter(|&(keep, _)| keep > 0)
+            .max_by_key(|&(keep, i)| (keep, i));
+        let fresh = || DeclParamTable {
+            table: std::rc::Rc::new(self.module.parameters.clone()),
+            applied: Vec::new(),
+            undo: Vec::new(),
+        };
+        let pick = if let Some((_, i)) = best {
+            i
+        } else if cache.tables.len() < DECL_PARAM_TABLES {
+            cache.tables.push(fresh());
+            cache.tables.len() - 1
+        } else if let Some(i) = cache.tables.iter().position(|t| unshared(t)) {
+            i
+        } else {
+            // Every table is held by a caller: replace the least recently
+            // used one; its holder keeps its own copy.
+            cache.tables[0] = fresh();
+            0
+        };
+        let mut t = cache.tables.remove(pick);
+        let keep = shared(&t);
+        // Nothing else holds `t.table` here, so this never copies it.
+        let table = std::rc::Rc::make_mut(&mut t.table);
+        if let Some(&(_, mark)) = t.applied.get(keep) {
+            for (k, prev) in t.undo.drain(mark..).rev() {
+                match prev {
+                    Some(v) => {
+                        table.insert(k, v);
+                    }
+                    None => {
+                        table.remove(&k);
+                    }
                 }
             }
+            t.applied.truncate(keep);
         }
-        let scope = if overlay.is_empty() {
-            None
-        } else {
-            // Innermost last, so its binding wins over an outer same-named one.
-            overlay.sort_by_key(|(depth, ..)| *depth);
-            let mut params = self.module.parameters.clone();
-            for (_, bare, v) in overlay {
-                params.insert(bare.to_string(), v.clone());
+        for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
+            t.applied.push((scope.to_string(), t.undo.len()));
+            for (rest, v) in group.iter() {
+                let prev = table.insert(rest.clone(), v.clone());
+                t.undo.push((rest.clone(), prev));
             }
-            Some(std::rc::Rc::new(params))
-        };
-        *self.decl_param_scope_cache.borrow_mut() = Some((prefix.to_string(), scope.clone()));
-        scope
+        }
+        let handed = t.table.clone();
+        cache.tables.push(t);
+        cache.last = Some((prefix.to_string(), true));
+        Some(handed)
+    }
+
+    /// The parameters named `<scope>.<rest>` in the design-wide table, as
+    /// `(rest, value)` in table order.
+    fn decl_param_group(&self, scope: &str) -> std::rc::Rc<[(String, Value)]> {
+        self.module
+            .parameters
+            .iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix(scope)?.strip_prefix('.')?;
+                Some((rest.to_string(), v.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn declared_packed_type_in(
@@ -1227,6 +1502,34 @@ impl Simulator {
         })
     }
 
+    /// §23.2.2.3, §7.4.1: the type of a packed vector whose declaration is
+    /// not on file, from the dimensions elaboration recorded for it. An ANSI
+    /// port of an instantiated module (`output logic [0:0][31:1] f`) is
+    /// registered with its dimensions and width but no declared type, so its
+    /// nested selects missed the declaration walk below and took the generic
+    /// select path. For a plain vector those dimensions are all the type has.
+    fn recorded_vector_type(&self, name: &str) -> Option<DataType> {
+        let dims = self.module.packed_full_dims.get(name)?;
+        let id = *self.signal_name_to_id.get(name)?;
+        let mut total: u64 = 1;
+        for &(l, r) in dims {
+            total = total.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        if dims.len() < 2 || total != u64::from(self.signal_widths[id]) {
+            return None;
+        }
+        Some(DataType::IntegerVector {
+            kind: if self.module.two_state_signals.contains(name) {
+                crate::ast::types::IntegerVectorType::Bit
+            } else {
+                crate::ast::types::IntegerVectorType::Logic
+            },
+            signing: self.signal_signed[id].then_some(crate::ast::types::Signing::Signed),
+            dimensions: Vec::new(),
+            span: crate::ast::Span::dummy(),
+        })
+    }
+
     pub(super) fn declared_packed_access(
         &mut self,
         expr: &Expression,
@@ -1286,7 +1589,38 @@ impl Simulator {
                 if self.is_associative_array(&name) {
                     return None;
                 }
-                let dt = self.module.var_decl_types.get(&name)?;
+                // §7.2.1, §7.4.3: a packed struct member spelled as one
+                // hierarchical name (`s.m`) has no declaration of its own;
+                // walk it as the member access it is, so a slice below an
+                // index into it (`s.m[1][2:1]`) selects whole elements. It
+                // fell to the generic select, which read the labels as bits.
+                if h.path.len() >= 2 && !self.module.var_decl_types.contains_key(&name) {
+                    let mut head = h.clone();
+                    head.path.truncate(1);
+                    head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let mut chain = Expression::new(ExprKind::Ident(head), expr.span);
+                    for seg in &h.path[1..] {
+                        chain = Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(chain),
+                                member: seg.name.clone(),
+                            },
+                            expr.span,
+                        );
+                    }
+                    if let Some(access) = self.declared_packed_access(&chain) {
+                        return Some(access);
+                    }
+                }
+                let recorded_type;
+                let dt = match self.module.var_decl_types.get(&name) {
+                    Some(dt) => dt,
+                    None => {
+                        recorded_type = self.recorded_vector_type(&name)?;
+                        &recorded_type
+                    }
+                };
                 // §23.10: a declaration inside an instantiated module sizes its
                 // dimensions with THAT instance's parameters, which the
                 // design-wide table keys as `<inst>.N`. Evaluated against that
@@ -1663,7 +1997,9 @@ impl Simulator {
     }
 
     pub(super) fn read_declared_packed_access(&mut self, expr: &Expression) -> Option<Value> {
-        let access = self.declared_packed_access(expr)?;
+        let Some(access) = self.declared_packed_access(expr) else {
+            return self.read_partial_packed_range(expr);
+        };
         if access.unpacked != 0 || access.width == 0 {
             return None;
         }
@@ -1686,17 +2022,32 @@ impl Simulator {
         expr: &Expression,
         value: &Value,
     ) -> Option<bool> {
-        let access = self.declared_packed_access(expr)?;
-        if access.unpacked != 0 || access.width == 0 {
+        // Each piece is (bit in the stored vector, bit in the fitted value,
+        // width); a select inside its dimension is one piece.
+        let (access, fit_w, partial) = match self.declared_packed_access(expr) {
+            Some(access) => {
+                let w = access.width;
+                (access, w, None)
+            }
+            None => {
+                let (access, w, pieces) = self.partial_packed_range_pieces(expr)?;
+                (access, w, Some(pieces))
+            }
+        };
+        if access.unpacked != 0 || fit_w == 0 {
             return None;
         }
+        let single = [(access.offset, 0, access.width)];
+        let pieces: &[(u32, u32, u32)] = partial.as_deref().unwrap_or(&single);
         let mut stored = if let Some((class, spec, member)) = &access.static_target {
             self.static_read_in(class, spec.clone(), member)?
         } else {
             self.packed_local_value(&access.storage)?
         };
-        if access.offset.checked_add(access.width)? > stored.width {
-            return None;
+        for &(dst, _, w) in pieces {
+            if dst.checked_add(w)? > stored.width {
+                return None;
+            }
         }
         let before = stored.clone();
         if access.static_target.is_none() && self.forced_names.contains(&access.storage) {
@@ -1707,12 +2058,14 @@ impl Simulator {
                 &access.element_type,
                 &self.module.typedef_types,
             ) {
-            value.to_two_state().resize_for_assign(access.width)
+            value.to_two_state().resize_for_assign(fit_w)
         } else {
-            value.resize_for_assign(access.width)
+            value.resize_for_assign(fit_w)
         };
-        for bit in 0..access.width {
-            stored.set_bit((access.offset + bit) as usize, fitted.get_bit(bit as usize));
+        for &(dst, src, w) in pieces {
+            for bit in 0..w {
+                stored.set_bit((dst + bit) as usize, fitted.get_bit((src + bit) as usize));
+            }
         }
         let changed = stored != before;
         if let Some((class, spec, member)) = access.static_target {
@@ -1726,7 +2079,146 @@ impl Simulator {
         Some(changed)
     }
 
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension reads x for its elements outside it; the
+    /// generic read placed it as bits (`a[0][k +: 2]` with `k = 5` read 0).
+    fn read_partial_packed_range(&mut self, expr: &Expression) -> Option<Value> {
+        let (access, fit_w, pieces) = self.partial_packed_range_pieces(expr)?;
+        if fit_w == 0 {
+            return None;
+        }
+        let stored = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
+        } else {
+            self.packed_local_value(&access.storage)?
+        };
+        let mut out = Value::new(fit_w);
+        for (src, dst, w) in pieces {
+            if src.checked_add(w)? > stored.width {
+                return None;
+            }
+            for bit in 0..w {
+                out.set_bit((dst + bit) as usize, stored.get_bit((src + bit) as usize));
+            }
+        }
+        // A two-state element reads its missing bits as 0 (§7.4.6).
+        if super::elaborate::is_type_two_state_resolved(
+            &access.element_type,
+            &self.module.typedef_types,
+        ) {
+            out = out.to_two_state();
+        }
+        Some(out)
+    }
+
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension writes only its elements inside it. The
+    /// declaration walk declines such a select, and the generic store then
+    /// placed it wrongly: `a[0][k +: 2] = 16'hbbaa` on
+    /// `logic [3:0][5:0][7:0] a` with `k = 5` wrote nothing, and
+    /// `a[1][k -: 2]` with `k = 0` wrote one bit. Returns the access of the
+    /// select's base, the width of the value the select stands for, and the
+    /// pieces of it that land inside the dimension.
+    #[allow(clippy::type_complexity)]
+    fn partial_packed_range_pieces(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(DeclaredPackedAccess, u32, Vec<(u32, u32, u32)>)> {
+        let ExprKind::RangeSelect {
+            expr: base,
+            left,
+            right,
+            kind,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        if !matches!(
+            base.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) || !Self::cond_expr_is_effect_free(left, false)
+            || !Self::cond_expr_is_effect_free(right, false)
+        {
+            return None;
+        }
+        let access = self.declared_packed_access(base)?;
+        if access.unpacked != 0 {
+            return None;
+        }
+        let &(dl, dr) = access.dimensions.first()?;
+        let a = self.eval_expr(left).to_index()?;
+        let b = self.eval_expr(right).to_index()?;
+        let (l, r) = match kind {
+            RangeKind::Constant => (a, b),
+            RangeKind::IndexedUp if b > 0 => {
+                if dl >= dr {
+                    (a.checked_add(b - 1)?, a)
+                } else {
+                    (a, a.checked_add(b - 1)?)
+                }
+            }
+            RangeKind::IndexedDown if b > 0 => {
+                if dl >= dr {
+                    (a, a.checked_sub(b - 1)?)
+                } else {
+                    (a.checked_sub(b - 1)?, a)
+                }
+            }
+            _ => return None,
+        };
+        if l != r && (l > r) != (dl > dr) {
+            return None;
+        }
+        let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
+        if access.width % count != 0 {
+            return None;
+        }
+        let stride = access.width / count;
+        let n = u32::try_from(l.abs_diff(r) + 1).ok()?;
+        let fit_w = n.checked_mul(stride)?;
+        // Element `k` of the value (from its least significant end) has
+        // label `r + k*step`.
+        let step: i64 = if l >= r { 1 } else { -1 };
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let mut pieces = Vec::new();
+        for k in 0..n {
+            let label = r + i64::from(k) * step;
+            if label < lo || label > hi {
+                continue;
+            }
+            let slot = if dl >= dr { label - dr } else { dr - label };
+            let dst = access
+                .offset
+                .checked_add(u32::try_from(slot).ok()?.checked_mul(stride)?)?;
+            pieces.push((dst, k * stride, stride));
+        }
+        Some((access, fit_w, pieces))
+    }
+
     pub(super) fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        dims.get(level).copied()
+    }
+
+    /// §7.4.3, §11.5.1: width in bits of one element of the dimension a
+    /// part-select on the index chain `base` addresses, when it is not the
+    /// last one — `a[0][5:0]` on `logic [3:0][5:0][7:0] a` counts six 8-bit
+    /// elements. None for a select of bits.
+    pub(super) fn select_base_elem_stride(&self, base: &Expression) -> Option<u32> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        if level + 1 >= dims.len() {
+            return None;
+        }
+        let stride: u64 = dims[level + 1..]
+            .iter()
+            .map(|&(l, r)| (l - r).unsigned_abs() + 1)
+            .product();
+        u32::try_from(stride).ok().filter(|&w| w > 1)
+    }
+
+    /// The packed dimensions of the element an index chain `base` lands in,
+    /// and which of them a select on `base` addresses.
+    fn select_base_elem_level(&self, base: &Expression) -> Option<(&Vec<(i64, i64)>, usize)> {
         let mut cur = base;
         let mut layers = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &cur.kind {
@@ -1775,7 +2267,7 @@ impl Simulator {
             // An unpacked SLICE (a row of a 2-D array), not a packed element.
             return None;
         }
-        dims.get(layers - udepth).copied()
+        Some((dims, layers - udepth))
     }
 
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
@@ -1889,6 +2381,37 @@ impl Simulator {
     /// re-stamp the declared signedness (`struct packed { int s; ... } x;`
     /// printed `x.s` as 4294967276 instead of -20). Resolves through the
     /// root's declared struct type; nested paths use the leaf member name.
+    /// §7.3: `field` is a `real` or `realtime` member of the unpacked
+    /// untagged union variable `root`. The union is one piece of storage, so
+    /// the member holds the real's IEEE 754 bits: a write stores them
+    /// (`$realtobits`) and a read takes them back (`$bitstoreal`).
+    pub(super) fn union_real_member(&self, root: &str, field: &str) -> bool {
+        let Some(dt) = self.module.var_decl_types.get(root) else {
+            return false;
+        };
+        let crate::ast::types::DataType::Struct(su) =
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        else {
+            return false;
+        };
+        if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+            return false;
+        }
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|d| d.name.name == field)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(&m.data_type, &self.module.typedef_types),
+                    crate::ast::types::DataType::Real { kind, .. }
+                        if !matches!(kind, crate::ast::types::RealType::ShortReal)
+                )
+        })
+    }
+
+    /// The value read from a `union_real_member`: its bits as a real.
+    pub(super) fn union_real_read(v: Value) -> Value {
+        Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
+    }
+
     pub(super) fn struct_member_signed(&self, root: &str, field: &str) -> bool {
         let Some(dt) = self.module.var_decl_types.get(root) else {
             return false;
@@ -1925,6 +2448,98 @@ impl Simulator {
 
     /// Leaf identifier name of an expression, if it is a plain (possibly
     /// scoped/dotted) identifier.
+    /// §8.23, §8.25.1: the width of a typedef named through a class
+    /// specialization or a typedef of one, nested classes included —
+    /// `C#(6)::td`, `C#(.W(6))::Inner::td`, `alias_t::td`,
+    /// `alias_t::Inner::td`. None for any other member chain.
+    pub(super) fn spec_scoped_type_width(&mut self, e: &Expression) -> Option<u32> {
+        let mut links: Vec<&str> = Vec::new();
+        let mut root = e;
+        while let ExprKind::MemberAccess { expr, member } = &root.kind {
+            links.push(member.name.as_str());
+            root = expr;
+        }
+        links.reverse();
+        // `alias_t::td` also parses as one scoped identifier.
+        if let ExprKind::Ident(h) = &root.kind
+            && links.is_empty()
+            && h.path.len() >= 2
+            && h.root.is_none()
+            && h.path.iter().all(|s| s.selects.is_empty())
+            && self
+                .module
+                .typedef_types
+                .contains_key(h.path[0].name.name.as_str())
+            && !self
+                .signal_name_to_id
+                .contains_key(h.path[0].name.name.as_str())
+        {
+            let n = h.path.len();
+            let tn = crate::ast::types::TypeName {
+                scopes: h.path[..n - 1]
+                    .iter()
+                    .map(|s| crate::ast::types::TypeScope {
+                        name: s.name.clone(),
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name: h.path[n - 1].name.clone(),
+                span: crate::ast::Span::dummy(),
+                bound: Default::default(),
+            };
+            return super::elaborate::specialized_class_scope_width(&tn, &self.module);
+        }
+        let leaf = links.pop()?;
+        match &root.kind {
+            ExprKind::Specialization { .. } => {
+                let (base, sig) = self
+                    .resolve_call_spec_params(Self::extract_call_spec(root), &self.current_spec)?;
+                if !self.module.classes.contains_key(&base) {
+                    return None;
+                }
+                let saved = self.current_spec.replace((base.clone(), sig));
+                let bound = self.class_spec_value_params().unwrap_or_default();
+                self.current_spec = saved;
+                super::elaborate::class_scope_typedef_width(
+                    &base,
+                    &bound,
+                    &links,
+                    leaf,
+                    &self.module,
+                )
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self
+                        .module
+                        .typedef_types
+                        .contains_key(h.path[0].name.name.as_str()) =>
+            {
+                let ident = |n: &str| crate::ast::Identifier {
+                    name: n.to_string(),
+                    span: crate::ast::Span::dummy(),
+                };
+                let mut scopes = vec![crate::ast::types::TypeScope {
+                    name: h.path[0].name.clone(),
+                    type_args: Vec::new(),
+                }];
+                scopes.extend(links.iter().map(|l| crate::ast::types::TypeScope {
+                    name: ident(l),
+                    type_args: Vec::new(),
+                }));
+                let tn = crate::ast::types::TypeName {
+                    scopes,
+                    name: ident(leaf),
+                    span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
+                };
+                super::elaborate::specialized_class_scope_width(&tn, &self.module)
+            }
+            _ => None,
+        }
+    }
+
     /// `std::randomize(targets) with {items}` through the joint solver
     /// (`rand_csp_solve_scope`): plain integral scalars and 1-D arrays (at
     /// their current size) are its variables. NotApplicable when a target
@@ -3022,13 +3637,13 @@ impl Simulator {
                         // resolve a bare TYPE-PARAMETER name through its
                         // declared default AST (`parameter type T = logic
                         // [W-1:0]`), which likewise sizes from W.
-                        let spec = self.params_with_class_spec();
-                        let params = spec.as_ref().unwrap_or(&self.module.parameters);
                         let resolved_dt = self.class_type_param_default(dt);
                         let target = resolved_dt.as_ref().unwrap_or(dt);
-                        let w = super::elaborate::resolve_type_width(
+                        let spec = self.class_type_env(target);
+                        let params = self.spec_param_env(&spec);
+                        let w = super::elaborate::resolve_type_width_env(
                             target,
-                            Some(params),
+                            Some(&params),
                             Some(&self.module.typedefs),
                         )
                         .max(1);
@@ -3040,6 +3655,13 @@ impl Simulator {
                     // FULL qualified key (no suffix fallback: `$bits(s.m)` on
                     // a real struct member must keep falling through to the
                     // member paths below).
+                    if matches!(
+                        &arg.kind,
+                        ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    ) && let Some(w) = self.spec_scoped_type_width(arg)
+                    {
+                        return Value::from_u64(w as u64, 32);
+                    }
                     if matches!(&arg.kind, ExprKind::MemberAccess { .. }) {
                         if let Some(key) = Self::expr_scoped_chain_key(arg) {
                             if let Some(&w) = self.module.typedefs.get(&key) {
@@ -3073,11 +3695,11 @@ impl Simulator {
                                 span: arg.span,
                             };
                             if let Some(dflt) = self.class_type_param_default(&as_ty) {
-                                let spec = self.params_with_class_spec();
-                                let params = spec.as_ref().unwrap_or(&self.module.parameters);
-                                let w = super::elaborate::resolve_type_width(
+                                let spec = self.class_spec_value_params();
+                                let params = self.spec_param_env(&spec);
+                                let w = super::elaborate::resolve_type_width_env(
                                     &dflt,
-                                    Some(params),
+                                    Some(&params),
                                     Some(&self.module.typedefs),
                                 )
                                 .max(1);
@@ -3176,8 +3798,10 @@ impl Simulator {
                             && !self.module.typedef_unpacked_dims.contains_key(&*name)
                             && let Some(dt) = self.module.typedef_types.get(&*name).cloned()
                         {
-                            let params = self.instance_param_scope(this_h);
-                            let w = super::elaborate::resolve_type_width(
+                            let values: HashMap<String, Value> =
+                                self.instance_value_params(this_h).into_iter().collect();
+                            let params = self.instance_param_env(&values);
+                            let w = super::elaborate::resolve_type_width_env(
                                 &dt,
                                 Some(&params),
                                 Some(&self.module.typedefs),
@@ -3605,6 +4229,7 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
+                v.is_fill = false;
                 v.is_signed = true;
                 v
             }
@@ -3613,36 +4238,36 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
+                v.is_fill = false;
                 v.is_signed = false;
                 v
             }
-            "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+            "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
             // §3.14.2.3: $time/$realtime from a body whose DECLARING
             // scope has its own timescale (CU/class/package subroutine
             // bodies are rewritten to this at elaboration; the literal
-            // argument is the scope's unit exponent).
-            "$__xz_time_at" | "$__xz_realtime_at" => {
+            // argument is the scope's unit exponent). §20.3.2: `$stime`
+            // keeps the low 32 bits there too.
+            "$__xz_time_at" | "$__xz_stime_at" | "$__xz_realtime_at" => {
                 let ue = args
                     .first()
                     .map(|a| self.eval_expr(a).to_f64() as i32)
                     .unwrap_or(self.module.timeunit_exp);
+                match name.as_str() {
+                    "$__xz_time_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 64),
+                    "$__xz_stime_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 32),
+                    _ => {}
+                }
                 let diff = ue - Self::secs_to_exp(self.tick_s);
                 let t = if diff >= 0 {
                     self.time as f64 / 10f64.powi(diff)
                 } else {
                     self.time as f64 * 10f64.powi(-diff)
                 };
-                if name == "$__xz_realtime_at" {
-                    Value::from_f64(t)
-                } else {
-                    Value::from_u64(t.round() as u64, 64)
-                }
+                Value::from_f64(t)
             }
             "$realtime" => Value::from_f64(self.time_in_current_unit()),
-            "$stime" => Value::from_u64(
-                (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                32,
-            ),
+            "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
             "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                 Value::from_u64(0, 1)
             }
@@ -4194,8 +4819,11 @@ impl Simulator {
                 ) {
                     return Self::sv_string_cast(&v);
                 }
-                if super::elaborate::is_type_real(&dt) {
-                    return Value::from_f64(v.to_f64());
+                if self.dt_is_real(&dt) {
+                    let f = v.to_f64();
+                    return Value::from_f64(if matches!(self.resolve_dt(&dt), crate::ast::types::DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) { f as f32 as f64 } else { f });
                 }
                 // §6.24.1: a type cast to an UNPACKED ARRAY / QUEUE target
                 // (e.g. `bit_q_t'(stream)`) yields an unpacked collection.
@@ -4246,6 +4874,20 @@ impl Simulator {
                 }
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                // §6.24.1: a field of a struct parameter (`pt.DEPTH'(x)`) is
+                // a SIZE cast, its value the operand's context width. Looked
+                // up by its leaf (`DEPTH`) below it named nothing, and the
+                // operand passed through at its self-determined width:
+                // `pt.BHT_ARRAY_DEPTH'(en << addr)` in the VeeR branch
+                // predictor shifted a 1-bit value and read 0.
+                if let Some(w) = args.first().and_then(|a| self.member_cast_size(a)) {
+                    let v = match args.get(1) {
+                        Some(a) if !inner_is_call => self.eval_expr_ctx(a, w),
+                        Some(a) => self.eval_expr(a),
+                        None => Value::zero(w),
+                    };
+                    return v.resize(w);
+                }
                 // §6.24.1: an integral target (typedef, enum, or a constant
                 // size) is the operand's context width — see the type-cast
                 // arm above.
@@ -4323,7 +4965,7 @@ impl Simulator {
                 if let Some(nm) = target {
                     // (a) Full typedef (carries signedness / real-ness).
                     if let Some(dt) = self.module.typedef_types.get(&nm).cloned() {
-                        if super::elaborate::is_type_real(&dt) {
+                        if self.dt_is_real(&dt) {
                             return Value::from_f64(inner_v.to_f64());
                         }
                         // §6.24.1 cast to an UNPACKED ARRAY / QUEUE typedef
@@ -4853,7 +5495,7 @@ impl Simulator {
                 // $set_randstate.
                 Value::from_string(&self.rng.to_state_string())
             }
-            "$typename" => {
+            "$typename" | "$__xz_scoped_typename" => {
                 // §20.6.1: a typed pattern has the type that prefixes it.
                 if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
                     return Value::from_string(&self.typename_of_dt(ty));
@@ -4890,6 +5532,11 @@ impl Simulator {
                                 return Value::from_string(kw);
                             }
                         }
+                    }
+                    // §6.20.2: a typed parameter can be real, shortreal or
+                    // integral independently of its initializer's type.
+                    if let Some(t) = self.typename_parameter_text(arg, name == "$__xz_scoped_typename") {
+                        return Value::from_string(&t);
                     }
                     // §20.6.1: an expression of type real — a real or time
                     // literal (§5.8: `1ns` is realtime), real arithmetic, a
@@ -4937,6 +5584,10 @@ impl Simulator {
                         let bn = self.expr_type_leaf_name(base);
                         let parts = self.typename_args_text_parts(type_args_text);
                         return Value::from_string(&self.class_typename_with_args(&bn, parts));
+                    }
+                    // A class property declared with a specialization.
+                    if let Some(t) = self.prop_decl_class_typename(arg) {
+                        return Value::from_string(&t);
                     }
                     // A class-typed variable: "class <name> #(<args>)".
                     if let Some((base, ta)) = self.class_declared_type_of(arg) {

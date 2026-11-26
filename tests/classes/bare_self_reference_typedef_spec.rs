@@ -1,12 +1,6 @@
-//! IEEE 1800-2017 §8.25: inside a parameterized class, the unadorned class
-//! name denotes the specialization being elaborated — `typedef registry#(item)
-//! type_id;` written in `class item #(type T)` is `registry#(item#(T))`
-//! (`uvm_object_utils(C)` writes `uvm_object_registry#(C, "C")` this way). A
-//! static method entered through a null `item#(byte)` handle must therefore
-//! key the registry on `item#(byte)`, not on the default `item`. The rewrite
-//! that does this (#545) is gated on the code running inside `item`'s own
-//! declaration: a non-parameterized class whose typedef names `item` bare
-//! means the default specialization and keeps it.
+//! IEEE 1800-2023 §8.25: a bare class name used as a type argument denotes
+//! the default specialization, including inside the class's own declaration.
+//! Both registry calls therefore share the static counter for item#(int).
 
 fn lines(src: &str, top: &str) -> Vec<String> {
     xezim::simulate_multi(
@@ -60,7 +54,7 @@ class registry #(type T = base) extends wrapper;
   endfunction
 endclass
 class item #(type T = int) extends base;
-  // Bare self-reference: `item` here is `item#(T)`.
+  // As a type argument, bare item denotes item#().
   typedef registry#(item) type_id;
   static function wrapper get_type();
     return type_id::get();
@@ -79,12 +73,10 @@ module tb;
     item#(byte) b;
     base obj;
     obj = v.get_type().create("it");
-    if (!$cast(b, obj)) $display("T|cast FAIL");
+    $display("T|byte_cast %0d", $cast(b, obj));
     void'(other::get_type());
-    if (registry#(item#(byte))::hits !== 1)
-      $display("T|byte_hits %0d", registry#(item#(byte))::hits);
-    if (registry#(item#(int))::hits !== 1)
-      $display("T|int_hits %0d", registry#(item#(int))::hits);
+    $display("T|byte_hits %0d", registry#(item#(byte))::hits);
+    $display("T|int_hits %0d", registry#(item#(int))::hits);
     $display("T|done");
     $finish;
   end
@@ -92,10 +84,13 @@ endmodule
 "#;
 
 #[test]
-fn bare_self_reference_in_a_parameterized_class_is_the_current_specialization() {
+fn bare_class_type_argument_denotes_the_default_specialization() {
     let out: Vec<String> = lines(SRC, "tb")
         .into_iter()
         .filter(|l| l.starts_with("T|"))
         .collect();
-    assert_eq!(out, ["T|done"], "{out:?}");
+    assert_eq!(
+        out,
+        ["T|byte_cast 0", "T|byte_hits 0", "T|int_hits 2", "T|done"]
+    );
 }

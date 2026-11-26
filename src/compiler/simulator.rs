@@ -372,19 +372,46 @@ fn method_boost_enabled() -> bool {
 // Explicit event expressions retain function-call operands and result guards.
 // Net typedef metadata and virtual-interface specialization identities.
 // Class-local shadowing keeps numeric comparisons out of string-member admission.
-// Module helper reads and queue operations retain their lexical ownership.
-// Refresh compiled methods after combining VHDL and main compiler changes.
-// Module helper fallbacks retain callee frames independently of tracing.
-// Refresh helper layouts after pending-only VHDL driver lowering.
-// Refresh generated process calls and selected VHDL activity tracking.
-// Refresh proven single-leaf pending driver layouts.
-// Refresh cached procedural bodies after copy-on-write block storage.
-// Refresh task frames after restoring private nested contextual caches.
-// Refresh cached AST bodies after boxing optional timing payloads.
-// Refresh cached AST bodies after compact declaration and name-cache storage.
-// Refresh cached AST bodies after boxing optional case-arm payloads.
-// Bind static leaves of generated VHDL records to their signal slots.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
+// integral input actuals by their formals; a method with a vif local declines (§25.9).
+// §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
+// §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
+// fill and negative-member `inside` and non-constant `case inside` items run interpreted.
+// §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
+// §26.3: package code reads its own package's parameters, variables and imports, and an
+// inlined package callee its own, ahead of the design's same-named declarations.
+// §13.5.2: a call that declines its output or inout write-back leaves no compiled call
+// behind its interpreter fallback.
+// §6.21, §13.4.2, §7.4.1: a static local that constant selects write whole before a read
+// carries nothing between calls, so its subroutine inlines; a subroutine selecting a variable
+// declared with an ascending or offset range does not inline.
+// §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
+// site, and boxed optional delays, initializers and case item patterns (#721).
+// §12.5: an unsigned item makes the entire case comparison unsigned.
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
+// and a subroutine or block selecting a packed array of a named signed type does not compile.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
+// §6.24.1: a signing conversion consumes an unsized fill literal.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
+// §6.12.1, §6.24.1, §12.5: `RealToInt` rounds a value that may be real fitted to 64 integral
+// bits; a value stored into a real target converts first; a real `case` runs interpreted.
+// §20.3, §3.14.2.3: a scoped `$realtime` read is a real that is not a constant, and a
+// scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
+// sizes its cast, and a part-select after a packed index selects whole elements, clipped to
+// its dimension.
+// Packed word selects inherit the declared dimensions of their bank.
+// §7.4.5: member collection reads that yield unpacked rows use their row storage.
+// §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
+// Preserve lexical helper frames and bind generated VHDL record leaves.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_f017;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -736,7 +763,7 @@ pub fn set_delay_mode(mode: u8) {
     DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn delay_mode() -> u8 {
+pub(crate) fn delay_mode() -> u8 {
     DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -909,6 +936,10 @@ fn dpi_trampoline_cc_command(
     cmd
 }
 
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
@@ -1011,6 +1042,96 @@ macro_rules! vcd_mark {
     }};
 }
 
+/// The bookkeeping of a completed store into `signal_table[id]` (`changed`:
+/// whether the stored value differs from the one it replaced): what
+/// `write_sig!` does once the new value is in the table. A store that edits
+/// the table value in place ends with this, so it leaves the same marks as a
+/// whole-value `write_sig!`.
+macro_rules! write_sig_done {
+    ($self:ident, $id:expr_2021, $changed:expr_2021) => {{
+        let __wsig_id = $id;
+        let __wsig_changed = $changed;
+        // Expression-backed procedural assignments use per-signal
+        // generations as their sensitivity set. Keep the usual no-active-
+        // assignment path to one branch; only real value changes advance
+        // the generation.
+        if __wsig_changed
+            && !$self.active_force_exprs.is_empty()
+            && __wsig_id < $self.active_force_signal_epochs.len()
+        {
+            $self.active_force_signal_epochs[__wsig_id] =
+                $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+            $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
+        }
+        // Incremental VCD: mark this write dirty (no-op when the dump is off
+        // or the full scan is forced). Superset-safe — the flush re-checks
+        // prev vs cur, so marking an unchanged write costs only a skip.
+        vcd_mark!($self, __wsig_id);
+        // O1 measurement: stamp the signal's last-change phase.
+        if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
+            $self.sig_last_change[__wsig_id] = $self.event_phase;
+        }
+        // Arm only gateable edge blocks that actually read this signal.
+        // The dense bitmap keeps unrelated writes a single cheap branch;
+        // positive hits use the sparse CSR fanout built after compile.
+        if $self.armed_edge
+            && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
+            && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
+        {
+            let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+            for __k in lo as usize..hi as usize {
+                let __bi = $self.armed_input_blocks[__k] as usize;
+                $self.edge_block_armed[__bi] |= EDGE_ARMED;
+            }
+        }
+        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+        // the borrow stays a direct field access in macro-expanded contexts.
+        if ($self.dirty_edge || $self.dirty_edge_shadow)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                $self.edge_pos_seen[__ep as usize] = true;
+                $self.changed_edge_pos.push(__ep as usize);
+            }
+        }
+        // Parked-waiter index: queue a watched signal that changed, for
+        // the next waiter drain and the next snapshot. One length
+        // compare while no waiter is indexed.
+        if __wsig_changed
+            && __wsig_id < $self.event_waiters.watch.len()
+            && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
+        {
+            $self.event_waiters.note_write(__wsig_id);
+        }
+        // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+        // made WHILE an edge block executes must re-run edge detection
+        // for that signal (drain_edge_exec_rescan) — record its position.
+        // One bool load when not inside an edge block.
+        if ($self.in_edge_block || $self.in_edge_cont)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                $self.edge_exec_seen[__ep as usize] = true;
+                $self.edge_exec_wrote.push(__ep as usize);
+            }
+        }
+        // §38.36.1 cbValueChange: report the change right away, in the
+        // region of the write. One emptiness check while nothing is
+        // watched. Writes that bypass this macro are caught by the poll
+        // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
+        // The dispatcher takes the raw self-pointer: this macro expands
+        // under live borrows of other fields.
+        if !$self.dpi_value_change_cbs.is_empty()
+            && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
+        {
+            vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
@@ -1026,15 +1147,11 @@ macro_rules! write_sig {
         }
         // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
-        // keeps every bit. Only a REAL write pays the type-name lookup.
-        if __wsig_val.is_real
-            && $self
-                .signal_type_names
-                .get(&__wsig_id)
-                .is_some_and(|tn| tn == "shortreal")
-        {
+        // keeps every bit. Only a real write checks destination precision.
+        if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
@@ -1106,75 +1223,7 @@ macro_rules! write_sig {
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
-            // Expression-backed procedural assignments use per-signal
-            // generations as their sensitivity set. Keep the usual no-active-
-            // assignment path to one branch; only real value changes advance
-            // the generation.
-            if __wsig_changed
-                && !$self.active_force_exprs.is_empty()
-                && __wsig_id < $self.active_force_signal_epochs.len()
-            {
-                $self.active_force_signal_epochs[__wsig_id] =
-                    $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
-                $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
-            }
-            // Incremental VCD: mark this write dirty (no-op when the dump is off
-            // or the full scan is forced). Superset-safe — the flush re-checks
-            // prev vs cur, so marking an unchanged write costs only a skip.
-            vcd_mark!($self, __wsig_id);
-            // O1 measurement: stamp the signal's last-change phase.
-            if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
-                $self.sig_last_change[__wsig_id] = $self.event_phase;
-            }
-            // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap keeps unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compile.
-            if $self.armed_edge
-                && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
-                && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
-            {
-                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
-                for __k in lo as usize..hi as usize {
-                    let __bi = $self.armed_input_blocks[__k] as usize;
-                    $self.edge_block_armed[__bi] |= EDGE_ARMED;
-                }
-            }
-            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-            // the borrow stays a direct field access in macro-expanded contexts.
-            if ($self.dirty_edge || $self.dirty_edge_shadow)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                    $self.edge_pos_seen[__ep as usize] = true;
-                    $self.changed_edge_pos.push(__ep as usize);
-                }
-            }
-            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
-            // made WHILE an edge block executes must re-run edge detection
-            // for that signal (drain_edge_exec_rescan) — record its position.
-            // One bool load when not inside an edge block.
-            if ($self.in_edge_block || $self.in_edge_cont)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
-                    $self.edge_exec_seen[__ep as usize] = true;
-                    $self.edge_exec_wrote.push(__ep as usize);
-                }
-            }
-            // §38.36.1 cbValueChange: report the change right away, in the
-            // region of the write. One emptiness check while nothing is
-            // watched. Writes that bypass this macro are caught by the poll
-            // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
-            // The dispatcher takes the raw self-pointer: this macro expands
-            // under live borrows of other fields.
-            if !$self.dpi_value_change_cbs.is_empty()
-                && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
-            {
-                vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
-            }
+            write_sig_done!($self, __wsig_id, __wsig_changed);
         }
     }};
 }
@@ -1217,6 +1266,8 @@ enum CombItem {
         /// §10.3.3 / §28.16: the original target before driver widening,
         /// boxed like the ASTs so the entry stays cache compact.
         delay_target: Option<Box<DelayTarget>>,
+        // §10.3.3: expressions are evaluated when the right-hand side changes.
+        delay_exprs: Option<Box<[Option<Expression>; 3]>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1620,14 +1671,43 @@ mod edgesel_writers {
             {
                 proc_cont_targets(&b.stmt, &mut forced);
             }
-            for t in module.tasks.values() {
-                for x in &t.items {
-                    proc_cont_targets(x, &mut forced);
+            let mut routine_forced: HashMap<usize, Vec<String>> = HashMap::default();
+            for (k, t) in &module.tasks {
+                let ptr = std::sync::Arc::as_ptr(t.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut f: Vec<&Expression> = Vec::new();
+                    for x in &t.items {
+                        proc_cont_targets(x, &mut f);
+                    }
+                    f.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_task_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
-            for f in module.functions.values() {
-                for x in &f.items {
-                    proc_cont_targets(x, &mut forced);
+            for (k, f) in module.functions.iter() {
+                let ptr = std::sync::Arc::as_ptr(f.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut fv: Vec<&Expression> = Vec::new();
+                    for x in &f.items {
+                        proc_cont_targets(x, &mut fv);
+                    }
+                    fv.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_function_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
             for e in forced {
@@ -1710,6 +1790,18 @@ struct CombEntry {
 }
 
 impl CombEntry {
+    /// §20.3: time calls in a continuous RHS belong to its authoring
+    /// instance. Procedural comb bodies use their own instance scope.
+    fn ts_scope(&self) -> Option<String> {
+        let scope = match self.item {
+            CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
+                self.cold.rhs_time_scope.as_deref()
+            }
+            _ => self.cold.scope_hint.as_deref(),
+        };
+        Simulator::ts_scope_of(scope)
+    }
+
     /// A procedural block that reads a signal it also writes, whose own writes
     /// must not re-queue it. A continuous assignment re-runs until it settles.
     fn reads_own_writes(&self) -> bool {
@@ -1723,14 +1815,11 @@ impl CombEntry {
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {
+    /// Lexical instance of a continuous RHS that may enter the interpreter.
+    /// An empty scope selects the top module independently of the waking process.
+    rhs_time_scope: Option<Arc<str>>,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
-    /// §20.3: the instance the entry's SOURCE sits in, when it differs from
-    /// `scope_hint` (`None` = the hint, or the top module without one).
-    /// A continuous assign elaborated with fully qualified names carries no
-    /// resolution hint, yet its `$time` must still count its own module's
-    /// timeunit. Read through `CombEntryCold::ts_scope`.
-    ts_scope: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
     read_signal_ids: Vec<usize>,
     /// Pre-resolved signal IDs for writes. The original layout
@@ -1752,15 +1841,11 @@ struct CombEntryCold {
     /// entry's reads in `deferred_proc_entries`: recorded once per epoch.
     #[serde(skip)]
     deferred_epoch: std::cell::Cell<u64>,
+    /// §9.2.2.2: evaluating the entry is observable beyond its outputs
+    /// (see `time0_effects`); it waits for the time-0 start batch.
+    time0_effects: bool,
 }
 
-impl CombEntryCold {
-    /// The timescale scope to install while the entry evaluates (see
-    /// `Simulator::ts_scope_of`): its source instance, `""` for the top.
-    fn ts_scope(&self) -> Option<String> {
-        Simulator::ts_scope_of(self.ts_scope.as_deref().or(self.scope_hint.as_deref()))
-    }
-}
 
 // §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
 // sensitivity exclusion; their layout is readable but their edges are stale.
@@ -1781,8 +1866,48 @@ impl CombEntryCold {
 // §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
 // §23.3.2, §7.4: elements of a multidimensional array member of an instance-array
 // element are read and written by the interpreter and depend on their own signals.
-// 039: retain per-entry VHDL timescale scope with current dependency lowering.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB039";
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §12.5.4, §11.4.13: `case inside` with a wildcard, range or real item and `inside` with a
+// real operand, a fill or a negative member run on the interpreter's matcher.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional
+// packed range nonblocking writes are left to the interpreter.
+// §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
+// tables, chain fusion relocates branches within one process class, and an instance's
+// read of an unnamed memory cell stays unresolved.
+// §13.4.1, §26.3: a scope-qualified function's return variable and the name of a callee
+// called through a package or `$unit` are not reads; its body's reads are.
+// §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
+// selects write whole before a read compile; a call selecting an ascending or offset-range
+// variable of its callee stays interpreted.
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §6.24.1: a cast to a typedef of real is a real operand of a continuous assignment.
+// §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
+// not a read of its caller.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+// §6.24.1: compiled sign conversions use the self-determined operand width.
+// §10.9.1: packed array default drivers retain their element type.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
+// not fold still maps its label to a physical bit.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
+// §6.12.1, §6.24.1, §12.5: `RealToInt` (a new opcode) rounds a value that may be real fitted
+// to 64 integral bits, continuous assignments see which signals are real, a value stored into
+// a real target converts first, and a real `case` runs interpreted.
+// §10.3, §10.10: a continuous assignment of an unpacked concatenation to a fixed array
+// drives each element. §3.14.2.3: scoped time reads of continuous assignments are typed
+// by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
+// §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
+// packed index, and alias nets for event controls on packed-struct members.
+// Packed word selects inherit the declared dimensions of their bank.
+// §9.4.2: a selected member can require a value waiter instead of a comb block.
+// §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
+// tries every scope spelling for its alias net.
+// Retain per-entry timescale scopes and current VHDL dependency lowering.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMBV01";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -2056,17 +2181,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it. Boxed, like
-    /// `value_of`: almost every term has neither, and an inline
+    /// block edge paths carry it but do not yet evaluate it. Shared with
+    /// the other operands of this event expression. An inline
     /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
     /// sensitivity lists on a 64k-cell DRAM).
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -2090,9 +2215,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -2283,7 +2408,7 @@ pub(super) struct LocalMeta {
     class: Option<String>,
     container: Option<String>,
     type_args: Option<Vec<Expression>>,
-    decl_types: Vec<(String, DataType)>,
+    decl_types: Vec<(String, Rc<DataType>)>,
     struct_members: Vec<(String, Vec<String>)>,
     packed_fields: Vec<(String, Vec<(String, u32, u32)>)>,
     elem_widths: Vec<(String, u32)>,
@@ -2482,6 +2607,10 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+/// §14.5: the hidden clocking names of the operand samples of a clockvar
+/// bound to an expression (`__xz_cbop.sum.0`), and the unresolvable net name
+/// the clockvar itself is registered under. Unreachable from SV source.
+const CB_OPERAND_PREFIX: &str = "__xz_cbop.";
 
 /// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
 /// declared skew samples with 1step too (§14.3 default), so the default-input
@@ -3121,6 +3250,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;
+mod event_waiters;
 mod event_loop;
 mod stall_progress;
 mod expression_types;
@@ -3145,9 +3275,12 @@ mod sensitivity;
 mod settling;
 mod setup;
 mod signal_commits;
+mod signal_width_table;
+pub use signal_width_table::SignalWidths;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
+mod time0_effects;
 mod two_state;
 mod type_metadata;
 mod udp;
@@ -3177,6 +3310,9 @@ mod ts_x;
 mod typename;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_value;
+use vpi_value::fill_vpi_value;
+pub use vpi_value::{vpi_get_value, vpi_put_value};
 mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
@@ -3930,12 +4066,6 @@ fn signal_key_bits(k: &str) -> u64 {
     if bits == 0 { u64::MAX } else { bits }
 }
 
-/// A write to the string-keyed stores that does not name its target.
-#[inline]
-fn bump_store_gen() {
-    note_store_write(u64::MAX);
-}
-
 /// The names written since the last call.
 fn take_store_writes() -> u64 {
     STORE_WRITE_MASK.with(|m| m.replace(0))
@@ -4072,6 +4202,8 @@ struct ClassMemberNames {
     /// Typedef names (module or class scope) whose target is a class-scoped
     /// type (`typedef R::elem_t et_t;`).
     scoped_typedefs: HashSet<String>,
+    /// Class typedef names whose target is a virtual interface (§25.9).
+    vif_typedef_leaves: HashSet<String>,
     /// Names that may prefix a class-scope reference without being a
     /// class: class parameters and typedef names.
     scope_prefixes: HashSet<String>,
@@ -4185,6 +4317,12 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    /// §16.4.2: the `assertion_stats` entry the outcome is counted in when
+    /// the report matures, with its kind tag (0 assert, 1 assume, 2 cover)
+    /// and location. A flushed or superseded report is no attempt.
+    stat_key: usize,
+    stat_kind: u8,
+    stat_loc: (Option<u32>, usize),
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -4837,6 +4975,8 @@ const CG_HANDLE_TAG: usize = 1 << 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CovergroupInstance {
+    /// Coverpoints whose declared expression or sample formal is real (§19.5).
+    real_points: HashSet<String>,
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
     /// covergroup): coverpoint expressions read ITS properties, so sampling
@@ -5011,6 +5151,9 @@ enum FsmWait {
 
 type ClockingOutputDrive = (String, String, Value, Option<Expression>);
 type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+/// §14.5: an expression a clockvar is bound to and its operand nets, each
+/// with the hidden clocking name of its sample.
+type ClockingBoundExpr = (Expression, Vec<(String, String)>);
 type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
 
 /// One clocking block's per-tick poll state: its clock resolved to a
@@ -5123,7 +5266,7 @@ struct FormalMetadataSnapshot {
 /// `snapshot_formal_parts`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FormalMetaParts {
-    declared_type: Option<DataType>,
+    declared_type: Option<Rc<DataType>>,
     packed_fields: Option<Vec<(String, u32, u32)>>,
     packed_element_widths: Vec<(String, u32)>,
     packed_dimensions: Option<Vec<(i64, i64)>>,
@@ -5270,8 +5413,9 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
@@ -5308,6 +5452,38 @@ struct DeclShadow {
     real: bool,
     string: bool,
     meta: FormalMetadataSnapshot,
+}
+
+/// `Simulator::decl_param_scope`'s state (§23.10).
+#[derive(Default)]
+struct DeclParamScopeCache {
+    /// The prefix asked for last, and whether it owns parameters (when it
+    /// does, the last of `tables` holds its overlay).
+    last: Option<(String, bool)>,
+    /// Per scope: the parameters declared in it or below it, by their name
+    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
+    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
+    /// Overlaid copies of the design-wide table, least recently used first,
+    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
+    /// with different outermost scopes (a testbench component and the design
+    /// under test) each keep a copy, instead of taking one hierarchy's groups
+    /// off a single copy and putting the other's on at every move.
+    tables: Vec<DeclParamTable>,
+}
+
+/// How many overlaid parameter tables `decl_param_scope` keeps.
+const DECL_PARAM_TABLES: usize = 4;
+
+/// One overlaid copy of the design-wide parameter table (§23.10).
+struct DeclParamTable {
+    /// The design-wide parameter table with the groups of `applied` on it.
+    table: std::rc::Rc<HashMap<String, Value>>,
+    /// The scopes whose groups `table` holds, outermost first, each with the
+    /// length `undo` had before its group went on.
+    applied: Vec<(String, usize)>,
+    /// What each group write replaced in `table`, in write order, so a group
+    /// comes off again in reverse.
+    undo: Vec<(String, Option<Value>)>,
 }
 
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
@@ -6771,101 +6947,531 @@ impl VcdVarKind {
 /// without scanning the whole map. The `starts_with` full-map scans in the
 /// queue-frame save/restore were 25%+ of a UVM AVIP run.
 ///
-/// Reads go through `Deref<Target = HashMap<..>>`; every mutation that can
-/// add or drop a KEY must go through the inherent `insert`/`remove` below
-/// (inherent methods shadow the deref'd HashMap ones), keeping the index
-/// exact. `get_mut`-style value edits need no index work.
+/// The elements `name[i]` of a queue or dynamic array (a name with a
+/// `name.size` entry) are held in one dense run per name (`ElemRun`) instead
+/// of one map entry each, so removing or inserting an element at the front
+/// moves no other element (§7.10.2). The run is an implementation detail of
+/// the map: every accessor below serves `name[i]` from it exactly as if the
+/// key were a map entry.
+///
+/// There is no `Deref` to the inner map: every read and every mutation goes
+/// through the inherent methods below, which keep the index and the runs
+/// exact.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SignalMap {
     map: HashMap<String, Value>,
+    /// The map-held keys containing `[`, by base name. Run-held elements are
+    /// not listed here.
     elems: HashMap<String, std::collections::HashSet<String>>,
     /// Per base name, a stamp that changes whenever an element key is added
-    /// to or removed from `elems[base]` (absent = no element keys), so a
-    /// derived view of a base's key set can be cached until it changes.
+    /// to or removed from the base (absent = no element keys), so a derived
+    /// view of a base's key set can be cached until it changes.
     elem_gens: HashMap<String, u64>,
     elem_gen_counter: u64,
+    /// The dense element runs, by collection name (`q`, `12#m_q`, `@q#3`,
+    /// `u.q`, a row `aq[3]`).
+    runs: HashMap<String, ElemRun>,
+    /// Elements held in `runs`, so `len()` counts them as keys.
+    run_keys: usize,
+    /// The names in `runs` that contain `[` themselves, by base name: the
+    /// runs whose keys the element index files under another name.
+    nested_runs: HashMap<String, Vec<String>>,
+}
+
+/// The elements `name[start]`, `name[start + 1]`, ... of one collection.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ElemRun {
+    /// Index of `items[0]` (meaningless while `items` is empty).
+    start: u64,
+    items: VecDeque<Value>,
+    /// `name.size` is stored: the name is a queue or dynamic array, and the
+    /// run is kept while empty.
+    sized: bool,
+    /// Map-held keys `name[<index>]` outside the run.
+    strays: u32,
+}
+
+impl ElemRun {
+    #[inline]
+    fn end(&self) -> u64 {
+        self.start + self.items.len() as u64
+    }
+
+    #[inline]
+    fn slot(&self, i: u64) -> Option<usize> {
+        (i >= self.start && i < self.end()).then(|| (i - self.start) as usize)
+    }
+}
+
+/// `name[<n>]` with `<n>` a canonical decimal index: the collection name and
+/// the index. Any other spelling (`a[01]`, `a[-1]`, `a["k"]`, `a[1].f`) is
+/// not an element of a run.
+#[inline]
+fn split_elem_key(k: &str) -> Option<(&str, u64)> {
+    let b = k.as_bytes();
+    let n = b.len();
+    if n < 4 || b[n - 1] != b']' {
+        return None;
+    }
+    let mut i = n - 1;
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    let digits = n - 1 - i;
+    if digits == 0 || digits > 9 || i < 2 || b[i - 1] != b'[' {
+        return None;
+    }
+    if digits > 1 && b[i] == b'0' {
+        return None;
+    }
+    let mut v = 0u64;
+    for &d in &b[i..n - 1] {
+        v = v * 10 + (d - b'0') as u64;
+    }
+    Some((&k[..i - 1], v))
 }
 
 impl SignalMap {
+    pub fn new() -> Self {
+        SignalMap {
+            map: HashMap::default(),
+            elems: HashMap::default(),
+            elem_gens: HashMap::default(),
+            elem_gen_counter: 0,
+            runs: HashMap::default(),
+            run_keys: 0,
+            nested_runs: HashMap::default(),
+        }
+    }
+
     fn base_of(k: &str) -> Option<&str> {
         k.find('[').map(|i| &k[..i])
     }
 
+    /// The base name the element index files `name`'s elements under.
+    #[inline]
+    fn outer_of(name: &str) -> &str {
+        Self::base_of(name).unwrap_or(name)
+    }
+
+    #[inline]
+    pub fn get(&self, k: &str) -> Option<&Value> {
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&run.items[s]);
+        }
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.get(k).is_some()
+    }
+
+    /// Stored keys, run-held elements included.
+    pub fn len(&self) -> usize {
+        self.map.len() + self.run_keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every stored key with its value, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &Value)> + '_ {
+        self.map
+            .iter()
+            .map(|(k, v)| (std::borrow::Cow::Borrowed(k.as_str()), v))
+            .chain(self.runs.iter().flat_map(|(name, run)| {
+                run.items.iter().enumerate().map(move |(s, v)| {
+                    (
+                        std::borrow::Cow::Owned(format!("{}[{}]", name, run.start + s as u64)),
+                        v,
+                    )
+                })
+            }))
+    }
+
+    /// The entries the map itself holds: every key but a run's elements
+    /// (`elem_runs`).
+    pub fn map_entries(&self) -> impl Iterator<Item = (&String, &Value)> + '_ {
+        self.map.iter()
+    }
+
+    /// The element runs: a collection name, the index of its first held
+    /// element and the elements `name[first]`, `name[first + 1]`, ...
+    pub fn elem_runs(&self) -> impl Iterator<Item = (&str, u64, &VecDeque<Value>)> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| !run.items.is_empty())
+            .map(|(name, run)| (name.as_str(), run.start, &run.items))
+    }
+
+    /// Every stored key, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// A key was added under or removed from base `outer`: move its stamp,
+    /// or drop it with the base's last key.
+    fn stamp_base(&mut self, outer: &str) {
+        if self.elems.contains_key(outer) || self.base_has_run_keys(outer) {
+            self.elem_gen_counter += 1;
+            match self.elem_gens.get_mut(outer) {
+                Some(g) => *g = self.elem_gen_counter,
+                None => {
+                    self.elem_gens
+                        .insert(outer.to_string(), self.elem_gen_counter);
+                }
+            }
+        } else {
+            self.elem_gens.remove(outer);
+        }
+    }
+
+    fn base_has_run_keys(&self, outer: &str) -> bool {
+        self.runs.get(outer).is_some_and(|r| !r.items.is_empty())
+            || self.nested_runs.get(outer).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|n| self.runs.get(n).is_some_and(|r| !r.items.is_empty()))
+            })
+    }
+
+    /// File map-held key `k` in the element index.
+    fn index_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            match self.elems.get_mut(b) {
+                Some(set) => {
+                    set.insert(k.to_string());
+                }
+                None => {
+                    self.elems
+                        .entry(b.to_string())
+                        .or_default()
+                        .insert(k.to_string());
+                }
+            }
+            self.stamp_base(b);
+        }
+    }
+
+    /// Drop map-held key `k` from the element index.
+    fn unindex_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            self.unlist_key(k, b);
+            self.stamp_base(b);
+        }
+    }
+
+    /// Take map-held key `k` off base `b`'s list, leaving the stamp alone.
+    fn unlist_key(&mut self, k: &str, b: &str) {
+        if let Some(set) = self.elems.get_mut(b) {
+            set.remove(k);
+            if set.is_empty() {
+                self.elems.remove(b);
+            }
+        }
+    }
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
         note_store_write(signal_key_bits(&k));
-        if let Some(b) = Self::base_of(&k) {
-            if !self.map.contains_key(&k) {
-                self.elems
-                    .entry(b.to_string())
-                    .or_default()
-                    .insert(k.clone());
-                self.elem_gen_counter += 1;
-                self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(&k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                return Some(std::mem::replace(&mut run.items[s], v));
+            }
+            // A key the map already holds stays there.
+            if run.strays == 0 || !self.map.contains_key(&k) {
+                let adopted = if run.items.is_empty() {
+                    run.start = i;
+                    run.items.push_back(v);
+                    None
+                } else if i == run.end() {
+                    run.items.push_back(v);
+                    None
+                } else if i + 1 == run.start {
+                    run.start = i;
+                    run.items.push_front(v);
+                    None
+                } else {
+                    Some(v)
+                };
+                match adopted {
+                    None => {
+                        let absorb = run.strays > 0;
+                        self.run_keys += 1;
+                        let name = name.to_string();
+                        if absorb {
+                            self.absorb_strays(&name);
+                        }
+                        self.stamp_base(Self::outer_of(&name));
+                        return None;
+                    }
+                    Some(v) => {
+                        run.strays += 1;
+                        self.index_key(&k);
+                        return self.map.insert(k, v);
+                    }
+                }
+            }
+            return self.map.insert(k, v);
+        }
+        if !self.map.contains_key(&k) {
+            self.index_key(&k);
+            if let Some(name) = k.strip_suffix(".size") {
+                let name = name.to_string();
+                let prev = self.map.insert(k, v);
+                self.register_element_run(&name, true);
+                return prev;
             }
         }
         self.map.insert(k, v)
     }
 
+    /// Store contiguous elements in a run. Only a queue or dynamic array
+    /// with a `.size` key keeps its run after the last element is removed.
+    fn register_element_run(&mut self, name: &str, sized: bool) {
+        if let Some(run) = self.runs.get_mut(name) {
+            run.sized |= sized;
+            return;
+        }
+        let outer = Self::outer_of(name);
+        let mut held: Vec<u64> = match self.elems.get(outer) {
+            Some(set) => set
+                .iter()
+                .filter_map(|k| {
+                    split_elem_key(k)
+                        .filter(|(n, _)| *n == name)
+                        .map(|(_, i)| i)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        held.sort_unstable();
+        let mut run = ElemRun {
+            sized,
+            strays: held.len() as u32,
+            ..ElemRun::default()
+        };
+        if let Some(&first) = held.first() {
+            run.start = first;
+        }
+        if outer.len() != name.len() {
+            self.nested_runs
+                .entry(outer.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+        self.runs.insert(name.to_string(), run);
+        if !held.is_empty() {
+            self.absorb_strays(name);
+        }
+    }
+
+    /// Move the map-held keys adjacent to `name`'s run into it.
+    fn absorb_strays(&mut self, name: &str) {
+        loop {
+            let Some(run) = self.runs.get(name) else {
+                return;
+            };
+            if run.strays == 0 {
+                return;
+            }
+            // An empty run restarts at the index it last began at.
+            let empty = run.items.is_empty();
+            let above = if empty { run.start } else { run.end() };
+            let below = if empty {
+                None
+            } else {
+                run.start.checked_sub(1)
+            };
+            let mut took = false;
+            for (back, i) in [(true, Some(above)), (false, below)] {
+                let Some(i) = i else { continue };
+                let key = format!("{}[{}]", name, i);
+                if let Some(v) = self.map.remove(&key) {
+                    // The key stays stored: the base's stamp does not move.
+                    self.unlist_key(&key, Self::outer_of(name));
+                    let run = self.runs.get_mut(name).unwrap();
+                    if back {
+                        if run.items.is_empty() {
+                            run.start = i;
+                        }
+                        run.items.push_back(v);
+                    } else {
+                        run.start = i;
+                        run.items.push_front(v);
+                    }
+                    run.strays -= 1;
+                    self.run_keys += 1;
+                    took = true;
+                }
+            }
+            if !took {
+                return;
+            }
+        }
+    }
+
+    /// Forget `name`'s run once it holds nothing and `name.size` is gone.
+    fn drop_idle_run(&mut self, name: &str) {
+        if self
+            .runs
+            .get(name)
+            .is_some_and(|r| r.items.is_empty() && !r.sized && r.strays == 0)
+        {
+            self.runs.remove(name);
+            let outer = Self::outer_of(name);
+            if outer.len() != name.len()
+                && let Some(names) = self.nested_runs.get_mut(outer)
+            {
+                names.retain(|n| n != name);
+                if names.is_empty() {
+                    self.nested_runs.remove(outer);
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, k: &str) -> Option<Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                let last = run.items.len() - 1;
+                let v = if s == last {
+                    run.items.pop_back()
+                } else if s == 0 {
+                    run.start += 1;
+                    run.items.pop_front()
+                } else {
+                    // A hole: the shorter side leaves the run for the map.
+                    let v = run.items.remove(s);
+                    let (lo, moved): (u64, Vec<Value>) = if s <= last / 2 {
+                        let lo = run.start;
+                        run.start = i + 1;
+                        (lo, run.items.drain(..s).collect())
+                    } else {
+                        (i + 1, run.items.drain(s..).collect())
+                    };
+                    run.strays += moved.len() as u32;
+                    self.run_keys -= moved.len();
+                    for (j, mv) in moved.into_iter().enumerate() {
+                        let key = format!("{}[{}]", name, lo + j as u64);
+                        self.index_key(&key);
+                        self.map.insert(key, mv);
+                    }
+                    v
+                };
+                self.run_keys -= 1;
+                self.drop_idle_run(name);
+                self.stamp_base(Self::outer_of(name));
+                return v;
+            }
+            let r = self.map.remove(k);
+            if r.is_some() {
+                run.strays -= 1;
+                self.unindex_key(k);
+                self.drop_idle_run(name);
+            }
+            return r;
+        }
         let r = self.map.remove(k);
         if r.is_some() {
-            if let Some(b) = Self::base_of(k) {
-                if let Some(set) = self.elems.get_mut(b) {
-                    set.remove(k);
-                    if set.is_empty() {
-                        self.elems.remove(b);
-                        self.elem_gens.remove(b);
-                    } else {
-                        self.elem_gen_counter += 1;
-                        self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
-                    }
-                }
+            self.unindex_key(k);
+            if let Some(name) = k.strip_suffix(".size")
+                && let Some(run) = self.runs.get_mut(name)
+            {
+                run.sized = false;
+                self.drop_idle_run(name);
             }
         }
         r
     }
 
-    /// An in-place edit of one stored value, noted under its key's names
-    /// (other `&mut` access through `DerefMut` notes every name).
+    /// An in-place edit of one stored value, noted under its key's names.
     pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&mut run.items[s]);
+        }
         self.map.get_mut(k)
+    }
+
+    /// The runs whose keys the element index files under `outer`.
+    fn runs_under<'a>(&'a self, outer: &'a str) -> impl Iterator<Item = (&'a str, &'a ElemRun)> {
+        self.runs
+            .get(outer)
+            .map(|r| (outer, r))
+            .into_iter()
+            .chain(
+                self.nested_runs
+                    .get(outer)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| self.runs.get(n).map(|r| (n.as_str(), r))),
+            )
+            .filter(|(_, r)| !r.items.is_empty())
+    }
+
+    /// Whether every key `name[i]` begins with `prefix`, which ends in `[`.
+    #[inline]
+    fn run_under_prefix(name: &str, prefix: &str) -> bool {
+        name.starts_with(prefix) || (prefix.len() == name.len() + 1 && prefix.starts_with(name))
     }
 
     /// All stored keys beginning with `prefix`, which must end with `[`.
     /// Served from the element index: only the owning base name's keys are
     /// touched, never the whole map. Handles nested-bracket prefixes
     /// (`q[0].f[`) by indexing on the OUTERMOST base and filtering.
+    /// A run's keys come highest index first, so a caller removing them in
+    /// this order shrinks the run from its end.
     pub fn keys_with_elem_prefix(&self, prefix: &str) -> Vec<String> {
         debug_assert!(prefix.ends_with('['));
-        let base = &prefix[..prefix.len() - 1];
-        let outer = Self::base_of(base).unwrap_or(base);
-        self.elems
-            .get(outer)
-            .map(|set| {
-                set.iter()
-                    .filter(|k| k.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.elem_keys_with_prefix(prefix)
+            .map(|k| k.into_owned())
+            .collect()
     }
 
-    /// Keys of every `base[...]` element currently stored, unordered.
+    /// Keys of every `base[...]` element currently stored, unordered (a
+    /// run's keys highest index first, see `keys_with_elem_prefix`).
     pub fn elem_keys(&self, base: &str) -> Vec<String> {
-        self.elems
+        let mut keys: Vec<String> = self
+            .elems
             .get(base)
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The index files nothing under a name with a bracket in it.
+        if !base.contains('[') {
+            for (name, run) in self.runs_under(base) {
+                keys.extend(
+                    (run.start..run.end())
+                        .rev()
+                        .map(|i| format!("{}[{}]", name, i)),
+                );
+            }
+        }
+        keys
     }
 
     /// Borrowing form of `keys_with_elem_prefix`: the element keys under
-    /// `prefix` (which must end in `[`) without cloning them.
+    /// `prefix` (which must end in `[`), cloning none of the map-held ones.
     pub fn elem_keys_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = &'a str> + 'a {
+    ) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
         let base = &prefix[..prefix.len().saturating_sub(1)];
         let outer = Self::base_of(base).unwrap_or(base);
         self.elems
@@ -6873,6 +7479,16 @@ impl SignalMap {
             .into_iter()
             .flat_map(|set| set.iter().map(|k| k.as_str()))
             .filter(move |k| k.starts_with(prefix))
+            .map(std::borrow::Cow::Borrowed)
+            .chain(
+                self.runs_under(outer)
+                    .filter(move |(name, _)| Self::run_under_prefix(name, prefix))
+                    .flat_map(|(name, run)| {
+                        (run.start..run.end())
+                            .rev()
+                            .map(move |i| std::borrow::Cow::Owned(format!("{}[{}]", name, i)))
+                    }),
+            )
     }
 
     /// The element-key stamp of the outermost base of `prefix` (which ends
@@ -6889,26 +7505,124 @@ impl SignalMap {
     /// `obj`; this replaces a scan of the whole map.
     pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
         let Some(outer) = Self::base_of(prefix) else {
-            return self.map.keys().any(|k| k.starts_with(prefix));
+            return self.map.keys().any(|k| k.starts_with(prefix))
+                || self
+                    .runs
+                    .iter()
+                    .any(|(name, run)| !run.items.is_empty() && name.starts_with(prefix));
         };
         self.elems
             .get(outer)
             .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+            || self
+                .runs_under(outer)
+                .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
+    }
+
+    /// Whether a key `name[i]` of the non-empty `run` begins with `prefix`.
+    fn run_has_key_with_prefix(name: &str, run: &ElemRun, prefix: &str) -> bool {
+        if prefix.len() <= name.len() {
+            return name.starts_with(prefix);
+        }
+        let Some(rest) = prefix.strip_prefix(name).and_then(|r| r.strip_prefix('[')) else {
+            return false;
+        };
+        // `rest` has to begin `<index>]`, the whole remainder of a key.
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        match &rest[digits..] {
+            "" => (run.start..run.end()).any(|i| i.to_string().starts_with(rest)),
+            "]" => split_elem_key(prefix).is_some_and(|(_, i)| run.slot(i).is_some()),
+            _ => false,
+        }
+    }
+
+    /// Whether `name`'s run holds every element `name[lo]` .. `name[hi - 1]`
+    /// and nothing else is stored under `name[`: no element outside the run,
+    /// and no member, row or size of an element (`name[i].f`, `name[i][j]`,
+    /// `name[i].size`). Then the collection's elements from `lo` on are
+    /// exactly the run's items, in order.
+    pub fn run_covers(&self, name: &str, lo: u64, hi: u64) -> bool {
+        let Some(run) = self.runs.get(name) else {
+            return false;
+        };
+        if run.strays != 0 || run.items.is_empty() || run.start != lo || run.end() < hi {
+            return false;
+        }
+        let outer = Self::outer_of(name);
+        let below = |k: &str| {
+            k.len() > name.len() && k.as_bytes()[name.len()] == b'[' && k.starts_with(name)
+        };
+        !self
+            .elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| below(k)))
+            && !self
+                .nested_runs
+                .get(outer)
+                .is_some_and(|names| names.iter().any(|n| below(n)))
+    }
+
+    /// Remove element `name[idx]` of a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// above it move down one index. Elements a shrink left behind at or past
+    /// `size` are dropped.
+    pub fn run_remove_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> Option<Value> {
+        note_store_write(signal_key_bits(name));
+        let run = self.runs.get_mut(name)?;
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let v = if idx == lo {
+            run.items.pop_front()
+        } else {
+            run.items.remove((idx - lo) as usize)
+        };
+        self.run_keys -= before - run.items.len();
+        self.stamp_base(Self::outer_of(name));
+        v
+    }
+
+    /// Open a slot at `name[idx]` in a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// from `idx` on move up one index, and `name[idx]` keeps its value until
+    /// it is stored. Elements a shrink left behind at or past `size` are
+    /// dropped.
+    pub fn run_open_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> bool {
+        note_store_write(signal_key_bits(name));
+        let Some(run) = self.runs.get_mut(name) else {
+            return false;
+        };
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let s = (idx - lo) as usize;
+        let keep = run.items[s].clone();
+        if s == 0 {
+            run.items.push_front(keep);
+        } else {
+            run.items.insert(s, keep);
+        }
+        self.run_keys = self.run_keys + run.items.len() - before;
+        self.stamp_base(Self::outer_of(name));
+        true
     }
 }
 
-impl std::ops::Deref for SignalMap {
-    type Target = HashMap<String, Value>;
-    fn deref(&self) -> &Self::Target {
-        &self.map
+impl Default for SignalMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl std::ops::DerefMut for SignalMap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        bump_store_gen();
-        &mut self.map
-    }
+/// The single place a whole variable is stored (`Simulator::whole_var_store`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarStore {
+    /// The innermost call frame.
+    Frame,
+    /// The table signal with this id.
+    Table(usize),
 }
 
 /// Mid-exec ts aborts tolerated per block before demotion.
@@ -6946,11 +7660,10 @@ enum CombPlan {
     /// (forces, X inputs); the plan then falls through JIT-then-interp,
     /// exactly like the unplanned dispatch.
     Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
-    /// Native slot; its function is stored in `comb_jit_fns`.
-    #[cfg(feature = "jit")]
+    /// Native slot; its function is stored in `comb_jit_fns`. Keep the same
+    /// checkpoint discriminants in builds with and without the JIT feature.
     Jit,
     /// Template slot; its function and mapping window are in `comb_tpl_fns`.
-    #[cfg(feature = "jit")]
     Tpl,
     Interp,
 }
@@ -6984,6 +7697,13 @@ pub struct Simulator {
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
+    /// §10.6.2: the comb entries that write each signal, by entry index in
+    /// table order, for re-driving a released net. Built at the first
+    /// release from `comb_entries` (whose read and write lists are fixed once
+    /// compiled) and dropped whenever that table is replaced; `None` until
+    /// then. The length is the table's when it was built.
+    #[serde(skip)]
+    comb_writer_index: Option<(usize, HashMap<usize, Vec<u32>>)>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
@@ -7324,7 +8044,9 @@ pub struct Simulator {
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
     signal_type_names: HashMap<usize, String>,
-    pub widths: HashMap<String, u32>,
+    /// Real signal slots that round writes to binary32.
+    shortreal_signals: HashSet<usize>,
+    pub widths: SignalWidths,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry
     /// `exec_stmt_var_decl` registered in `packed_full_dims` (so a later
@@ -7510,6 +8232,11 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
+    /// §27.6: some clocking block is declared in a generate copy or an
+    /// instance-array element (its key holds a select, `gen[1].cb`), so a
+    /// name with a select (`gen[1].cb.a`) may reach a block. Without one, the
+    /// indexed lookups of member reads are skipped.
+    clocking_in_indexed_scope: bool,
     /// LRM §14.4: pending clocking-output drives. Each drive retains its
     /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
@@ -7546,6 +8273,11 @@ pub struct Simulator {
     /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
     clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
+    /// §14.16.2: clocking select drives waiting for their maturity as
+    /// nonblocking updates: (maturity time, signal). A whole drive of the
+    /// same signal maturing with one queues behind it, so the drives take
+    /// effect in the order they were issued.
+    clocking_select_due: Vec<(u64, usize)>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7563,6 +8295,13 @@ pub struct Simulator {
     /// BASE net; a sample applies the select to the base's sample, a drive
     /// writes through it (#823).
     clocking_sig_bound_sel: HashMap<String, HashMap<String, Expression>>,
+    /// §14.5 a clockvar bound to an expression (`input sum = a + 1;`,
+    /// `input i = {op, ra, rb[3:1]};`): cb → (clocking name → (the bound
+    /// expression, each operand net with the hidden clocking name of its
+    /// sample)). Each operand is sampled as a clocking input of its own, with
+    /// the clockvar's skew; the clockvar's sample is the expression evaluated
+    /// over those samples.
+    clocking_sig_bound_expr: HashMap<String, HashMap<String, ClockingBoundExpr>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
@@ -7618,7 +8357,7 @@ pub struct Simulator {
     /// has sampled — the clocking event, and so its guard, occurs after the
     /// clockvars update. Each entry holds the waiter and the guard of the
     /// term that fired; see `resolve_deferred_clocking_guards`.
-    deferred_clocking_guarded: Vec<(EventWaiter, Box<Expression>)>,
+    deferred_clocking_guarded: Vec<(EventWaiter, Rc<Expression>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -7822,6 +8561,18 @@ pub struct Simulator {
     /// by `CombItem::TimingCheck{idx}`).
     timing_checks: Vec<timing_checks::TimingCheckRt>,
     timing_watches: Vec<timing_checks::TcWatch>,
+    /// The conditions of the timing checks, compiled on first use
+    /// (`timing_checks::TcCond`): check `i`'s start at `timing_cond_base[i]`,
+    /// one per condition it has. They depend on the design only, so a
+    /// checkpoint neither holds nor resets them.
+    #[serde(skip)]
+    timing_cond_base: Vec<u32>,
+    #[serde(skip)]
+    timing_conds: Vec<timing_checks::TcCond>,
+    /// Condition evaluations of the timing checks: compiled, interpreted
+    /// (`[PROF] timing_conds`).
+    #[serde(skip)]
+    timing_cond_evals: [u64; 2],
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,
@@ -7882,6 +8633,10 @@ pub struct Simulator {
     /// before `bind_static_vif` looks at an assignment.
     #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// The leaf names of the unpacked variables declared below a scope
+    /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
+    #[serde(skip)]
+    scoped_unpacked_leaves: std::cell::OnceCell<HashSet<String>>,
     /// False once start-up found no such static (`vif_capable_statics`
     /// empty): the one-byte test every blocking assignment makes.
     may_bind_static_vif: bool,
@@ -8969,6 +9724,14 @@ pub struct Simulator {
     /// The cursor is a `u32` (never `usize::MAX`-sentinel — the executor
     /// compares against `keys.len()`).
     foreach_arena: Vec<(Vec<Value>, u32)>,
+    /// Spare register files for the combinational and continuous-assignment
+    /// bytecode a settle evaluates (`enter_private_regs`). A compiled method
+    /// or process loop waiting in an interpreted call keeps its live
+    /// registers in `vm_regs`; a settle that call starts runs on a file of
+    /// its own (§13.4, §8.11). A stack, so evaluations may nest; the files
+    /// hold stale scratch only.
+    #[serde(skip)]
+    vm_regs_pool: Vec<Vec<Value>>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
     /// Source position of every clock generator, for its time-0 rank:
@@ -9206,12 +9969,13 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// One-entry cache of `decl_param_scope`: the instance prefix last asked
-    /// for and its overlaid parameter table (`None` when the prefix owns no
-    /// parameters). A select loop over one instance's signal rebuilds nothing.
+    /// `decl_param_scope`'s state: the parameters under each scope, and the
+    /// overlaid parameter tables it hands out. A select loop over one
+    /// instance's signal rebuilds nothing, and a move to another instance
+    /// changes only the scopes the two do not share instead of copying the
+    /// table.
     #[serde(skip)]
-    decl_param_scope_cache:
-        std::cell::RefCell<Option<(String, Option<std::rc::Rc<HashMap<String, Value>>>)>>,
+    decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
@@ -9388,6 +10152,12 @@ pub struct Simulator {
     meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Declaration-scope typedefs before a procedural typedef shadows a name.
+    /// The tables share storage until a write (§6.18, §23.9).
+    declaration_typedefs: Option<(
+        super::elaborate::TypedefTable,
+        super::elaborate::SharedMap<DataType>,
+    )>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,
@@ -9536,7 +10306,7 @@ pub struct Simulator {
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, ProcCont)>,
+    inactive_queue: PidVec<ProcCont>,
     /// Processes waiting for the NBA region to commit (e.g.
     /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
     /// procedural variable). Resumed in `run_one_tick` after all active +
@@ -9552,6 +10322,14 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
+    /// Queue elements a `pop_front`, `push_front`, `insert` or `delete`
+    /// moved one at a time by name, because the queue's elements are not a
+    /// single run of plain values (`[PROF] queue_elem_moves`).
+    queue_elem_moves: u64,
+    /// Stores to an element or member of a packed vector wider than 64 bits
+    /// that read the whole vector out and stored it back instead of editing
+    /// it in place (`[PROF] select_store_copies`).
+    select_store_copies: u64,
     /// Checks of the running process's claims for displaced local metadata
     /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
     /// declarations installed again (`[PROF] local_meta_swaps`), and the
@@ -9616,8 +10394,16 @@ pub struct Simulator {
     /// (i.e. the event has been triggered in the same time slot as the
     /// query). EventTrigger handler stamps this.
     event_triggered_time: EventStampStore,
-    /// Processes waiting for signal edge events (@(posedge clk), etc.)
-    event_waiters: Vec<EventWaiter>,
+    /// Processes waiting for signal edge events (@(posedge clk), etc.),
+    /// with the per-signal index a drain picks the ones to examine by.
+    event_waiters: event_waiters::EventWaiters,
+    /// `XEZIM_WAITER_INDEX` (default on, and only with the dirty-driven
+    /// edge scan, whose write notes it shares): a drain examines the
+    /// waiters whose signals were written, not every parked waiter.
+    waiter_index_on: bool,
+    /// `XEZIM_WAITER_INDEX_SHADOW=1`: examine every waiter anyway and stop
+    /// on one the index would have skipped although its signal moved.
+    waiter_index_shadow: bool,
     /// Processes parked on a class-field named event (`@m_event` inside a
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
@@ -9847,6 +10633,21 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// §7.4.1: whether the design declares a signed integral type by name
+    /// at all. Only then can a subroutine or block variable be a packed
+    /// array whose elements are signed, so only then does an element select
+    /// of one consult its declaration.
+    packed_named_signed_types: bool,
+    /// §7.2, §7.4.1: names of structure members that are packed arrays of a
+    /// named signed type (see its construction).
+    packed_named_signed_members: HashSet<String>,
+    /// The arithmetic or bitwise operand (its address) being evaluated
+    /// whose parent operator found no context-determined shift in it
+    /// (`has_context_shift`), so its own operator does not scan its operands
+    /// again: each level of a chain `a ^ b ^ ...` scanned the whole chain
+    /// under it.
+    #[serde(skip)]
+    shift_free_operand: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function
@@ -10001,6 +10802,10 @@ pub struct Simulator {
     comb_time0_deferred: Vec<CombEntry>,
     /// Latches once the deferred empty-sensitivity always_comb blocks fired.
     comb_time0_deferred_done: bool,
+    /// §9.2.2.2: the entries with time-0 effects and the items taken out of
+    /// them (a `Noop` stands in) until every process has started; see
+    /// `hold_time0_effect_entries`.
+    comb_time0_held: Vec<(usize, CombItem)>,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
@@ -10253,6 +11058,11 @@ pub struct Simulator {
     /// While this is non-zero, procedural comb entries triggered mid-process
     /// are parked in `deferred_comb` and run at the process's exit instead.
     proc_depth: u32,
+    /// Nesting of `run_process_stmts` activations on the native stack. A
+    /// process that calls a task which can wait but does not resumes the
+    /// caller from inside the callee's activation, so a call chain that never
+    /// waits nests one level per call (see `process_nesting_exceeded`).
+    stmts_depth: u32,
     /// (comb entry index, outputs it produced) for procedural entries that ran
     /// while a process was mid-flight. Checked for clobbering at process exit.
     deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
@@ -10865,6 +11675,10 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// A combinational entry is being evaluated outside the settle
+    /// (`release_time0_held`): its deferred assertion reports are the
+    /// block's, as in the settle (`queue_deferred_assert`).
+    comb_direct_eval: bool,
     /// Call-site (expression span start) → per activation scope (see
     /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
     /// child module shares the call's span, so the scope tells them apart.
@@ -12870,7 +13684,11 @@ pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_
         info.message = vpi_err_scratch(&msg);
         info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
         info.code = b"\0".as_ptr() as *mut libc::c_char;
-        info.file = std::ptr::null_mut();
+        // §38.3: every string field points at a string. An error has no
+        // source file, so `file` is empty rather than NULL: cocotb logs
+        // `file` and `product` as C strings, and a NULL `file` crashed it
+        // on the first error it checked.
+        info.file = b"\0".as_ptr() as *mut libc::c_char;
         info.line = 0;
     }
     level
@@ -13076,560 +13894,6 @@ fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
         buf.push(0);
         buf.as_mut_ptr() as *mut libc::c_char
     })
-}
-
-/// Read a signal value via VPI.
-///
-/// On any failure — bad handle, out-of-range signal, or a format xezim
-/// cannot supply — sets `value_p->format` to `vpiSuppressVal` and writes
-/// nothing else. IEEE 1800-2017 §38.16 makes that the caller's only way
-/// to detect the failure, and `vpi_get_value` returns `void`, so there is
-/// nowhere else to say so.
-///
-/// This used to handle exactly two formats and silently ignore the rest.
-/// `vpiVectorVal` was among the ignored ones, which is the format
-/// HDL backdoor read routines use: `vpi_get_value` returned success having
-/// written nothing into the caller's buffer.
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
-    if value_p.is_null() {
-        return;
-    }
-    let vp = unsafe { &mut *value_p };
-    let Some(h) = (unsafe { vpi_deref(handle) }) else {
-        vpi_error(vpi::ERROR, "vpi_get_value: null handle".into());
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    };
-    // VPI object model (vpi_model.rs): expressions, constants, and the
-    // objects that have no value.
-    if matches!(h.kind, VpiKind::Obj | VpiKind::Scope) || h.type_code == vpi_model::c::NAMED_EVENT {
-        let _ = try_active_sim("vpi_get_value", |sim| vpi_model::get_value(sim, h, vp));
-        return;
-    }
-    // A constant argument carries its own value and needs no simulator.
-    if h.kind == VpiKind::Constant {
-        let ok = match &h.value {
-            Some(v) => fill_vpi_value(v, 0, Some(h.type_code), vp),
-            None => false,
-        };
-        if !ok {
-            vpi_error(
-                vpi::ERROR,
-                format!(
-                    "vpi_get_value: cannot supply format {} for a constant",
-                    vp.format
-                ),
-            );
-            vp.format = vpi::SUPPRESS_VAL;
-        }
-        return;
-    }
-    // Modules, memories, iterators and call handles have no readable value.
-    if matches!(
-        h.kind,
-        VpiKind::Module
-            | VpiKind::Iterator
-            | VpiKind::Memory
-            | VpiKind::SysTfCall
-            | VpiKind::UserSystf
-            | VpiKind::ModPath
-            | VpiKind::Tchk
-            | VpiKind::InterModPath
-            | VpiKind::Callback
-    ) {
-        vpi_error(
-            vpi::ERROR,
-            "vpi_get_value: this object has no readable value".into(),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    }
-    let sig_id = h.signal_id;
-
-    let ok = try_active_sim("vpi_get_value", |sim| {
-        let val = if h.kind == VpiKind::Slice {
-            match vpi_slice_read(sim, h) {
-                Some(v) => v,
-                None => return false,
-            }
-        } else {
-            match vpi_api::cell_value(sim, sig_id) {
-                Some(v) => v,
-                None => return false,
-            }
-        };
-        let current_time = sim.time;
-        // vpiStrengthVal reports the driving strength of a net.
-        vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
-        let ok = fill_vpi_value(&val, current_time, Some(h.type_code), vp);
-        vpi_api::clear_strength_hint();
-        ok
-    })
-    .unwrap_or(false);
-
-    if !ok {
-        // vpiSuppressVal is the only failure channel this function has, and a
-        // caller that never checks `format` needs vpi_chk_error to notice.
-        vpi_error(
-            vpi::ERROR,
-            format!("vpi_get_value: cannot supply format {}", vp.format),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-    }
-}
-
-/// Render `val` into `vp` using `vp.format`. Returns false when the
-/// format cannot be supplied; the caller then sets `vpiSuppressVal`.
-///
-/// Shared by `vpi_get_value` and the value-change dispatcher, so a
-/// callback sees its trigger object's value in exactly the format a
-/// direct read would have produced.
-fn fill_vpi_value(
-    val: &Value,
-    _current_time: u64,
-    obj_type_code: Option<libc::c_int>,
-    vp: &mut s_vpi_value,
-) -> bool {
-    {
-        // vpiObjTypeVal: the simulator picks the object's natural format
-        // and reports which one it chose in `format` (§38.15).
-        let mut format = vp.format;
-        if format == vpi::OBJ_TYPE_VAL {
-            format = vpi_api::obj_type_format(val, obj_type_code);
-            vp.format = format;
-        }
-        // §38.15: a real object is converted to an integer, rounded as
-        // §6.12.2 specifies, for every format but vpiRealVal and vpiStringVal.
-        let rounded;
-        let val = if val.is_real && !vpi_api::format_keeps_real(format) {
-            rounded = vpi_api::real_to_integer(val);
-            &rounded
-        } else {
-            val
-        };
-
-        match format {
-            vpi::INT_VAL => {
-                // PLI_INT32: the low 32 bits, X/Z read as 0, a signed value
-                // sign-extended. Callers that need the full width must use
-                // vpiVectorVal; vpiSize tells them whether they do.
-                let n = if val.is_signed {
-                    val.to_i64().unwrap_or(0) as u64
-                } else {
-                    val.to_u64().unwrap_or(0)
-                };
-                vp.value.integer = (n & 0xFFFF_FFFF) as u32 as libc::c_int;
-            }
-            vpi::REAL_VAL => vp.value.real = val.to_f64(),
-            vpi::SCALAR_VAL => {
-                vp.value.scalar = match val.get_bit_code(0) {
-                    0 => vpi::SCALAR_0,
-                    1 => vpi::SCALAR_1,
-                    2 => vpi::SCALAR_X,
-                    _ => vpi::SCALAR_Z,
-                };
-            }
-            vpi::VECTOR_VAL => {
-                let ptr = VPI_VEC_SCRATCH.with(|cell| {
-                    let mut buf = cell.borrow_mut();
-                    value_to_vecval(val, &mut buf);
-                    buf.as_mut_ptr()
-                });
-                vp.value.vector = ptr;
-            }
-            vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
-            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 3)),
-            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 4)),
-            vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
-            vpi::STRING_VAL if val.is_real => {
-                vp.value.str = vpi_str_scratch(&vpi_api::real_string(val.to_f64()))
-            }
-            vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
-            vpi::TIME_VAL => {
-                let t = val.to_u64().unwrap_or(0);
-                let ptr = VPI_TIME_SCRATCH.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    *slot = s_vpi_time {
-                        type_: vpi::SIM_TIME,
-                        high: (t >> 32) as u32,
-                        low: (t & 0xFFFF_FFFF) as u32,
-                        // §37 vpiTimeVal: `.real` must describe the SAME value
-                        // as high/low (the value being read, `t`), not the sim
-                        // clock. Using `current_time` made the record
-                        // self-inconsistent (a `time` var holding 42 read at
-                        // tick 5 reported real=5).
-                        real: t as f64,
-                    };
-                    cell.as_ptr()
-                });
-                vp.value.time = ptr;
-            }
-            vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
-            // vpiStrengthVal, the short/long/shortreal formats and the raw
-            // formats; false for anything unknown.
-            other => return vpi_api::fill_extra_format(val, obj_type_code, other, vp),
-        }
-        true
-    }
-}
-
-/// Write a signal value via VPI (supports force/release).
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_put_value(
-    handle: *mut libc::c_void,
-    value_p: *mut s_vpi_value,
-    _time_p: *mut s_vpi_time,
-    flags: libc::c_int,
-) -> *mut libc::c_void {
-    if handle.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    // Depositing into the call handle sets a system function's return value
-    // (IEEE 1800-2017 §38.33). Handled before the simulator lookup because it
-    // touches only the call frame.
-    {
-        let Some(h) = (unsafe { vpi_deref(handle) }) else {
-            return std::ptr::null_mut();
-        };
-        if h.kind == VpiKind::SysTfCall {
-            if value_p.is_null() {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: null value on a $systf call".into(),
-                );
-                return std::ptr::null_mut();
-            }
-            let w = h.width.max(1);
-            let vp = unsafe { &*value_p };
-            let v = match vp.format {
-                vpi::INT_VAL => Value::from_u64(unsafe { vp.value.integer } as i64 as u64, w),
-                vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-                vpi::VECTOR_VAL => {
-                    let ptr = unsafe { vp.value.vector };
-                    if ptr.is_null() {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: null vector on a $systf call".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                    let words = (w as usize).div_ceil(32);
-                    vecval_to_value(unsafe { std::slice::from_raw_parts(ptr, words) }, w, false)
-                }
-                other => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: format {} unsupported on a $systf call",
-                            other
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-            let frame = h.frame;
-            VPI_SYSTF_STACK.with(|st| {
-                if let Some(f) = st.borrow_mut().get_mut(frame) {
-                    if f.tf_type == vpi::SYS_FUNC {
-                        f.ret = Some(v);
-                    } else {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: a $systf TASK has no return value".into(),
-                        );
-                    }
-                }
-            });
-            return std::ptr::null_mut();
-        }
-        if h.kind == VpiKind::Constant {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: a vpiConstant argument is read-only".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // VPI object model (vpi_model.rs): objects with no writable value.
-        if vpi_model::put_value_rejected(h) {
-            return std::ptr::null_mut();
-        }
-    }
-
-    try_active_sim("vpi_put_value", |sim| {
-        let h = unsafe { &*(handle as *const VpiHandle) };
-        if matches!(
-            h.kind,
-            VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::Callback
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // §38.36.2: nothing may be written from a cbReadOnlySynch routine.
-        if sim.vpi_in_read_only() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: writes are not allowed in the read-only synch region; ignored"
-                    .into(),
-            );
-            return std::ptr::null_mut();
-        }
-        let sig_id = h.signal_id;
-        if matches!(
-            h.kind,
-            VpiKind::UserSystf | VpiKind::ModPath | VpiKind::Tchk | VpiKind::InterModPath
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        if flags == vpi::RELEASE_FLAG && is_packed_id(sig_id) {
-            // Nothing can force a packed-arena word, so there is nothing to release.
-            return std::ptr::null_mut();
-        }
-        if flags == vpi::RELEASE_FLAG {
-            // §38.36.1 cbRelease, once the net has been re-driven.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_queue_release(vpi_cb::CB_RELEASE, Some(sig_id));
-            }
-            // Release: remove from forced_signals and trigger settle
-            sim.forced_signals.remove(&sig_id);
-            // Re-evaluate the continuous drivers of the released net.
-            sim.redrive_released_signal(sig_id);
-            // Release invalidates the event-edge assumption that a flop's
-            // output still reflects its last sampled inputs.
-            sim.edge_block_snap_valid
-                .iter_mut()
-                .for_each(|v| *v = false);
-            sim.edge_block_armed
-                .iter_mut()
-                .for_each(|v| *v |= EDGE_ARMED);
-            sim.dirty_any = true;
-            return std::ptr::null_mut();
-        }
-
-        if value_p.is_null() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: null value_p with a write flag; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        // A slice decodes at its own width, then splices back into its parent.
-        let w = if h.kind == VpiKind::Slice {
-            h.width
-        } else {
-            vpi_api::cell_width(sim, sig_id).unwrap_or(32)
-        };
-        let is_signed = vpi_api::cell_signed(sim, sig_id);
-        let vp = unsafe { &*value_p };
-
-        // A format we cannot decode writes NOTHING. The old code fell
-        // through to "read the current value and write it back", which
-        // looks like a successful no-op and hides the unsupported format.
-        let value = match vp.format {
-            vpi::INT_VAL => {
-                // PLI_INT32 is signed; widen through i64 so a negative
-                // integer sign-extends into a wider signal.
-                let ival = unsafe { vp.value.integer } as i64;
-                let mut v = Value::from_u64(ival as u64, w);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-            vpi::SCALAR_VAL => {
-                let mut v = Value::zero(w);
-                let code = match unsafe { vp.value.scalar } {
-                    // vpiL / vpiH are the weak 0 / 1 levels.
-                    vpi::SCALAR_0 | vpi_api::vc::SCALAR_L => 0,
-                    vpi::SCALAR_1 | vpi_api::vc::SCALAR_H => 1,
-                    vpi::SCALAR_X => 2,
-                    vpi::SCALAR_Z => 3,
-                    other => {
-                        vpi_error(
-                            vpi::ERROR,
-                            format!("vpi_put_value: unsupported vpiScalarVal code {}", other),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                v.set_bit_code(0, code);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::VECTOR_VAL => {
-                // Every word of the signal's width, and both aval and
-                // bval, so X and Z survive a deposit. The old code read
-                // only `vec[0].aval` for a signal of 64 bits or fewer —
-                // dropping the upper word of anything wider than 32 —
-                // masked X/Z away as `aval & !bval`, and capped the wide
-                // path at four words (128 bits).
-                let vec_ptr = unsafe { vp.value.vector };
-                if vec_ptr.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        "vpi_put_value: vpiVectorVal with a null vector; ignored".into(),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let num_words = (w as usize).div_ceil(32);
-                let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                vecval_to_value(vec, w, is_signed)
-            }
-            // §38.16 string payloads. cocotb writes 4-state values this way
-            // (a `LogicArray` carrying x/z has no lossless integer form), so
-            // without these every cocotb drive of a clock or reset was
-            // rejected here and silently never reached the signal.
-            vpi::BIN_STR_VAL
-            | vpi::OCT_STR_VAL
-            | vpi::HEX_STR_VAL
-            | vpi::DEC_STR_VAL
-            | vpi::STRING_VAL => {
-                let sp = unsafe { vp.value.str };
-                if sp.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: null string for format {}; ignored",
-                            vp.format
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let text = match unsafe { std::ffi::CStr::from_ptr(sp) }.to_str() {
-                    Ok(t) => t.trim(),
-                    Err(_) => {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: string payload is not valid UTF-8; ignored".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                let mut v = match vp.format {
-                    vpi::BIN_STR_VAL => vpi_value_from_radix_str(text, 1, w),
-                    vpi::OCT_STR_VAL => vpi_value_from_radix_str(text, 3, w),
-                    vpi::HEX_STR_VAL => vpi_value_from_radix_str(text, 4, w),
-                    vpi::DEC_STR_VAL => match text.parse::<i64>() {
-                        Ok(n) => Value::from_u64(n as u64, w),
-                        Err(_) => {
-                            vpi_error(
-                                vpi::ERROR,
-                                format!("vpi_put_value: '{}' is not a decimal; ignored", text),
-                            );
-                            return std::ptr::null_mut();
-                        }
-                    },
-                    // vpiStringVal: the payload is CHARACTERS, packed
-                    // right-aligned one byte per 8 bits.
-                    _ => {
-                        let mut sv = Value::zero(w);
-                        for (i, byte) in text.as_bytes().iter().rev().enumerate() {
-                            for k in 0..8u32 {
-                                let bit = i as u32 * 8 + k;
-                                if bit >= w {
-                                    break;
-                                }
-                                sv.set_bit_code(bit as usize, ((byte >> k) & 1) as u8);
-                            }
-                        }
-                        sv
-                    }
-                };
-                v.is_signed = is_signed;
-                v
-            }
-            // vpiTimeVal, vpiStrengthVal, the short/long/shortreal formats and
-            // the raw formats.
-            other => match vpi_api::decode_extra_put(vp, other, w, is_signed) {
-                Ok(v) => v,
-                Err(msg) => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!("vpi_put_value: {} (nothing written)", msg),
-                    );
-                    return std::ptr::null_mut();
-                }
-            },
-        };
-        // §6.12.2: an integral value put to a real object converts to real, a
-        // real one put to an integral object rounds to an integer.
-        let value = vpi_api::fit_put_value(sim, h, value, w, is_signed);
-
-        // Splice a slice back into its parent before it hits the signal table.
-        let value = if h.kind == VpiKind::Slice {
-            match vpi_slice_write(sim, h, &value) {
-                Some(v) => v,
-                None => return std::ptr::null_mut(),
-            }
-        } else {
-            value
-        };
-
-        // A word of a packed-arena memory has no signal-table slot.
-        if is_packed_id(sig_id) {
-            if flags == vpi::FORCE_FLAG {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: an element of a packed-arena memory cannot be forced".into(),
-                );
-            } else {
-                sim.cell_write(sig_id, &value);
-            }
-            return std::ptr::null_mut();
-        }
-
-        // For force: write value first, THEN add to forced_signals
-        if flags == vpi::FORCE_FLAG {
-            // Write directly to signal_table (bypass write_sig! which would skip)
-            if sig_id < sim.signal_table.len() {
-                sim.signal_table[sig_id] = value.clone();
-                sim.sync_mirror(sig_id);
-                if sig_id < sim.signal_has_xz.len() {
-                    sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
-                }
-                if sig_id < sim.signal_inline_bits.len() {
-                    let (v, x) = value.raw_bits();
-                    sim.signal_inline_bits[sig_id] = [v, x];
-                }
-                sim.after_signal_write(sig_id);
-            }
-            sim.ctl_note_external_write(sig_id);
-            // Now mark as forced (after the write succeeded)
-            sim.forced_signals.insert(sig_id, value);
-            // §38.36.1 cbForce.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_notify_override(vpi_cb::CB_FORCE, Some(sig_id));
-            }
-        } else {
-            // Normal write - write_sig! will skip if signal is forced
-            write_sig!(sim, sig_id, value);
-            sim.ctl_note_external_write(sig_id);
-            // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
-            // it, so nothing else marks the signal dirty or re-snapshots it for
-            // edge detection. Without this a cocotb-driven clock landed in the
-            // signal table and propagated nowhere — `always @(posedge clk)` and
-            // even `always @(clk)` never fired, so the DUT sat at x while the
-            // Python side saw its own writes read back correctly.
-            sim.after_signal_write(sig_id);
-            if sig_id < sim.dirty_signals.len() && !sim.dirty_signals[sig_id] {
-                sim.dirty_signals[sig_id] = true;
-                sim.dirty_list.push(sig_id);
-            }
-            sim.dirty_any = true;
-        }
-
-        std::ptr::null_mut()
-    })
-    .unwrap_or(std::ptr::null_mut())
 }
 
 /// Read the current simulation time.
@@ -14113,6 +14377,8 @@ impl RandColl {
 enum SizeCon {
     /// `a.size() == E` — E already evaluated.
     Eq(u64),
+    /// `a.size() == E` with a negative signed target or one above the trial cap.
+    Impossible,
     /// `a.size() inside {…}` — the ranges already evaluated.
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
@@ -14809,6 +15075,16 @@ fn drop_xz(r: &mut Value) {
     }
 }
 
+/// `Insn::RealToInt`: §6.12.1 — a real rounds to a 64-bit integer, ties
+/// away from zero (a target narrower than 64 bits wraps it at the `Resize`
+/// that follows); any other value is left as it is.
+#[inline]
+fn real_to_int_reg(r: &mut Value) {
+    if r.is_real {
+        *r = Value::from_real_wrapped(r.to_f64(), 64);
+    }
+}
+
 /// The last `.`-separated segment of a hierarchical name and that segment
 /// cut at its first `[` — what `rsplit('.')` / `split('[')` give, in one
 /// pass over the bytes.
@@ -15014,6 +15290,9 @@ mod finished_process_lifetime_tests;
 
 #[cfg(test)]
 mod class_heap_lifetime_tests;
+
+#[cfg(test)]
+mod signal_map_tests;
 
 mod heap_trace;
 

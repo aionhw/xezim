@@ -1,6 +1,6 @@
-//! §10.8, §10.9, §11.4.5, §11.4.6 (#1043): a bare assignment pattern compared
-//! with a PACKED operand takes the operand's type and is one packed value of
-//! it, so the comparison is bit for bit: an x/z bit leaves `==` x, and the
+//! §10.8, §10.9, §11.4.5, §11.4.6 (#1043): a typed assignment pattern produces
+//! a packed value that can be compared bit for bit. An x/z bit can leave
+//! `==` unknown. The other
 //! operand's type comes from wherever it is declared — a class property (also
 //! through implicit `this`), a function result, a packed element of an
 //! unpacked array, a nested or arrayed packed struct, a plain vector, a
@@ -32,7 +32,14 @@ module top;
   typedef logic [2:0] u3_t;
   typedef struct packed { u3_t lo; u3_t hi; } ps_t;
   typedef struct packed { ps_t a; ps_t b; } nest_t;
-  u3_t [0:3] pa, px;
+  typedef u3_t [0:3] vec_t;
+  typedef ps_t [0:1] packed_pair_t;
+  typedef ps_t pair_t[0:1];
+  typedef vec_t vectors_t[0:1];
+  typedef logic [0:1][0:3][2:0] matrix_t;
+  typedef logic [7:0] octet_t;
+  typedef bit [3:0][1:0] pairs_t;
+  vec_t pa, px;
   ps_t ps, psx;
   nest_t nst;
   ps_t [0:1] aps;
@@ -44,13 +51,13 @@ module top;
   class C;
     u3_t [0:3] cp;
     ps_t cs;
-    function bit eq_this(); return cp == '{2,2,2,2}; endfunction
-    function bit eq_cs(); return cs == '{lo:1, hi:2}; endfunction
+    function bit eq_this(); return cp == vec_t'{2,2,2,2}; endfunction
+    function bit eq_cs(); return cs == ps_t'{lo:1, hi:2}; endfunction
   endclass
   C c;
   function automatic u3_t [0:3] f_ret(); return '{2,2,2,2}; endfunction
   function automatic ps_t f_ps(); return '{lo:1, hi:2}; endfunction
-  function automatic bit f_formal(u3_t [0:3] x); return x == '{2,2,2,2}; endfunction
+  function automatic bit f_formal(u3_t [0:3] x); return x == vec_t'{2,2,2,2}; endfunction
   int n;
   initial begin
     pa = '{2,2,2,2}; px = '{2,2,'x,2};
@@ -63,21 +70,21 @@ module top;
     plain = 8'b1010_0101;
     b2 = '{1,2,3,0};
     c = new; c.cp = '{2,2,2,2}; c.cs = '{lo:1, hi:2};
-    $display("X1 %b %b %b %b", pa == '{2,2,'x,2}, pa != '{2,2,'x,2}, pa === '{2,2,'x,2}, pa !== '{2,2,'x,2});
-    $display("X2 %b %b %b %b", px == '{2,2,2,2}, px != '{2,2,2,2}, px === '{2,2,'x,2}, px == '{3,2,2,2});
-    $display("X3 %b %b %b", psx == '{1,2}, psx != '{1,3}, psx === '{'x,2});
-    $display("S1 %b %b %b", f_ret() == '{2,2,2,2}, f_ps() == '{lo:1, hi:2}, f_formal(pa));
-    $display("S2 %b %b %b %b", c.cp == '{2,2,2,2}, c.cs == '{1,2}, c.eq_this(), c.eq_cs());
-    $display("S3 %b %b", aps[1] == '{lo:3, hi:4}, aps == '{'{1,2},'{3,4}});
-    $display("S4 %b %b", uaps[1] == '{lo:3, hi:4}, uaps == '{'{1,2},'{3,4}});
-    $display("S5 %b %b", upe[0] == '{2,2,2,2}, upe == '{'{2,2,2,2}, '{2,2,2,2}});
-    $display("S6 %b %b", plain == '{1,0,1,0,0,1,0,1}, plain == '{default:1});
-    $display("S7 %b %b", b2 == '{1,2,3,0}, b2 == '{3:1, default:0});
-    $display("S8 %b %b", ps == '{u3_t:2}, ps == '{lo:1, default:2});
-    $display("S9 %b %b %b", (pa) == ('{2,2,2,2}), m2 == '{2{2}}, m2 == '{default:2});
-    $display("S10 %b %b", nst == '{a:'{lo:2,hi:2}, b:'{lo:2,hi:2}}, pa ==? '{2,'x,2,2});
+    $display("X1 %b %b %b %b", pa == vec_t'{2,2,'x,2}, pa != vec_t'{2,2,'x,2}, pa === vec_t'{2,2,'x,2}, pa !== vec_t'{2,2,'x,2});
+    $display("X2 %b %b %b %b", px == vec_t'{2,2,2,2}, px != vec_t'{2,2,2,2}, px === vec_t'{2,2,'x,2}, px == vec_t'{3,2,2,2});
+    $display("X3 %b %b %b", psx == ps_t'{1,2}, psx != ps_t'{1,3}, psx === ps_t'{'x,2});
+    $display("S1 %b %b %b", f_ret() == vec_t'{2,2,2,2}, f_ps() == ps_t'{lo:1, hi:2}, f_formal(pa));
+    $display("S2 %b %b %b %b", c.cp == vec_t'{2,2,2,2}, c.cs == ps_t'{1,2}, c.eq_this(), c.eq_cs());
+    $display("S3 %b %b", aps[1] == ps_t'{lo:3, hi:4}, aps == packed_pair_t'{'{1,2},'{3,4}});
+    $display("S4 %b %b", uaps[1] == ps_t'{lo:3, hi:4}, uaps == pair_t'{'{1,2},'{3,4}});
+    $display("S5 %b %b", upe[0] == vec_t'{2,2,2,2}, upe == vectors_t'{'{2,2,2,2}, '{2,2,2,2}});
+    $display("S6 %b %b", plain == octet_t'{1,0,1,0,0,1,0,1}, plain == octet_t'{default:1});
+    $display("S7 %b %b", b2 == pairs_t'{1,2,3,0}, b2 == pairs_t'{3:1, default:0});
+    $display("S8 %b %b", ps == ps_t'{u3_t:2}, ps == ps_t'{lo:1, default:2});
+    $display("S9 %b %b %b", (pa) == (vec_t'{2,2,2,2}), m2 == matrix_t'{2{2}}, m2 == matrix_t'{default:2});
+    $display("S10 %b %b", nst == nest_t'{a:'{lo:2,hi:2}, b:'{lo:2,hi:2}}, pa ==? vec_t'{2,'x,2,2});
     n = 0;
-    foreach (upe[i]) if (upe[i] == '{2,2,2,2}) n++;
+    foreach (upe[i]) if (upe[i] == vec_t'{2,2,2,2}) n++;
     $display("S11 %0d", n);
   end
 endmodule
@@ -110,14 +117,16 @@ fn packed_pattern_compare_in_an_assertion_and_a_continuous_assignment() {
         r#"
 module top;
   typedef logic [2:0] u3_t;
-  u3_t [0:3] v;
+  typedef u3_t [0:3] vec_t;
+  typedef u3_t words_t[0:3];
+  vec_t v;
   u3_t ua [0:3];
   logic clk = 0, w1, w2;
   int nf = 0, np = 0;
-  assign w1 = (v == '{2,2,2,2});
-  assign w2 = (ua == '{2,2,2,2});
-  a_cmp: assert property (@(posedge clk) (v == '{2,2,2,2})) np++; else nf++;
-  a_un: assert property (@(posedge clk) (ua == '{2,2,2,2})) np++; else nf++;
+  assign w1 = (v == vec_t'{2,2,2,2});
+  assign w2 = (ua == words_t'{2,2,2,2});
+  a_cmp: assert property (@(posedge clk) (v == vec_t'{2,2,2,2})) np++; else nf++;
+  a_un: assert property (@(posedge clk) (ua == words_t'{2,2,2,2})) np++; else nf++;
   always #1 clk = ~clk;
   initial begin
     v = '{2,2,2,2}; ua = '{2,2,2,2};

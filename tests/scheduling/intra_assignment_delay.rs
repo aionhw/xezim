@@ -47,18 +47,21 @@ fn blocking_intra_delay_suspends_then_assigns() {
 }
 
 /// §9.4.5 capture semantics: the RHS is evaluated BEFORE the delay, so later
-/// writes to its operands must not leak into the assigned value.
+/// writes to its operands must not leak into the assigned value. §9.3.2: a
+/// `join_none` child starts only when the parent blocks, here at `y = #4`,
+/// so the forked assignment evaluates `w` after the parent wrote 9 and
+/// before it writes 5.
 const RHS_CAPTURED: &str = r#"
 module tb;
   int w, x, y;
   initial begin
     w = 1;
     fork
-      x = #2 w;    // evaluates w NOW (=1), assigns at t=2
+      x = #2 w;    // the child starts at the parent's `#4`: w=9, assigns at t=2
     join_none
-    w = 9;         // must NOT affect the forked assignment
+    w = 9;
     y = #4 w + 10; // in-process capture: w=9 here, assigned at t=4
-    w = 5;
+    w = 5;         // must NOT affect either assignment
   end
 endmodule
 "#;
@@ -68,8 +71,8 @@ fn rhs_is_evaluated_before_the_delay() {
     let sim = simulate(RHS_CAPTURED, 100).expect("simulate failed");
     assert_eq!(
         u(&sim, "x"),
-        1,
-        "forked intra-assignment read the post-fork w"
+        9,
+        "forked intra-assignment did not read w when the child started"
     );
     assert_eq!(
         u(&sim, "y"),

@@ -39,7 +39,11 @@ impl Simulator {
     /// in memory, which cost 0.6% more instructions on a design with 288
     /// named properties.
     pub(super) fn fold_named_sva_members(module: &mut ElaboratedModule) {
-        if !module.property_decls.values().any(Self::has_member_access) {
+        if !module
+            .property_decls
+            .values()
+            .any(|body| Self::has_member_access(body))
+        {
             return;
         }
         // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
@@ -58,7 +62,8 @@ impl Simulator {
                     &HashMap::default(),
                     &unit,
                     &HashMap::default(),
-                );
+                )
+                .into();
             }
         }
     }
@@ -200,13 +205,113 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12, §26.3: the `property_decls` key of the named sequence
+    /// or property a reference names: `name`, or `pkg::name` when it is
+    /// qualified by its package (as written, or as the elaborator spells a
+    /// reference to a name two packages declare), so each package keeps its
+    /// own body.
+    pub(super) fn sva_named_key(&self, e: &Expression) -> Option<String> {
+        let qualified = |pkg: &str, leaf: &str| {
+            let q = format!("{pkg}::{leaf}");
+            self.module.property_decls.contains_key(&q).then_some(q)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                match h.path.as_slice() {
+                    [one] => Some(one.name.name.clone()),
+                    [pkg, leaf] => qualified(&pkg.name.name, &leaf.name.name),
+                    _ => None,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    qualified(&h.path[0].name.name, &member.name)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// §16.8, §16.12: the actual argument of each formal of the named
+    /// sequence or property `key` in an instance with the arguments `args`:
+    /// bound by position or by name (`.x(a)`), and the declaration's default
+    /// actual argument for a formal the instance leaves out. A default may
+    /// name an earlier formal, which takes that formal's actual.
+    pub(super) fn sva_bind_actuals(
+        &self,
+        key: &str,
+        args: &[Expression],
+    ) -> HashMap<String, Expression> {
+        let formals: &[String] = self
+            .module
+            .property_params
+            .get(key)
+            .map_or(&[], |v| v.as_slice());
+        let mut map: HashMap<String, Expression> = HashMap::default();
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let Some(e) = expr
+                        && !matches!(e.kind, ExprKind::Empty)
+                    {
+                        map.insert(name.name.clone(), (**e).clone());
+                    }
+                }
+                ExprKind::Empty => {}
+                _ => {
+                    if let Some(f) = formals.get(i) {
+                        map.insert(f.clone(), a.clone());
+                    }
+                }
+            }
+        }
+        if let Some(defaults) = self.module.property_param_defaults.get(key) {
+            for (f, d) in formals.iter().zip(defaults) {
+                if let Some(d) = d
+                    && !map.contains_key(f)
+                {
+                    let d = super::elaborate::rewrite_expr(
+                        d,
+                        "",
+                        &map,
+                        &std::collections::HashSet::new(),
+                        &HashMap::default(),
+                    );
+                    map.insert(f.clone(), d);
+                }
+            }
+        }
+        map
+    }
+
+    /// §16.8: the body of the named sequence or property `key` for an
+    /// instance written without an argument list: each formal with a default
+    /// actual argument replaced by it.
+    pub(super) fn sva_body_with_defaults(&self, key: &str) -> Option<Expression> {
+        let body = self.module.property_decls.get(key)?;
+        if !self.module.property_param_defaults.contains_key(key) {
+            return Some(body.as_ref().clone());
+        }
+        let map = self.sva_bind_actuals(key, &[]);
+        Some(super::elaborate::rewrite_expr(
+            body,
+            "",
+            &map,
+            &std::collections::HashSet::new(),
+            &HashMap::default(),
+        ))
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
         }
         match &e.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                let name = h.path[0].name.name.as_str();
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                if let Some(key) = self.sva_named_key(e) =>
+            {
+                let name = key.as_str();
                 if self.module.sequences.contains(name)
                     && self
                         .module
@@ -219,31 +324,24 @@ impl Simulator {
                         return self.sva_expand_named(&inner, depth + 1);
                     }
                 }
+                // §16.8: an instance without an argument list takes every
+                // default actual argument.
+                if self.module.sequences.contains(name)
+                    && self.module.property_param_defaults.contains_key(name)
+                    && let Some(body) = self.sva_body_with_defaults(name)
+                {
+                    let inner = Self::sva_unclocked(&body);
+                    return self.sva_expand_named(&inner, depth + 1);
+                }
                 e.clone()
             }
             // `s(x, y)`: a named sequence / property with formals — the
             // body with the actuals substituted.
             ExprKind::Call { func, args } => {
-                let name = match &func.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some(h.path[0].name.name.clone())
-                    }
-                    _ => None,
-                };
+                let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
-                        let formals = self
-                            .module
-                            .property_params
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut map: HashMap<String, Expression> = HashMap::default();
-                        for (i, f) in formals.iter().enumerate() {
-                            if let Some(actual) = args.get(i) {
-                                map.insert(f.clone(), actual.clone());
-                            }
-                        }
+                        let map = self.sva_bind_actuals(&name, args);
                         let body = super::elaborate::rewrite_expr(
                             &body,
                             "",
@@ -2159,19 +2257,19 @@ impl Simulator {
         stat.kind = kind;
         if outcome {
             stat.pass_count += 1;
-            self.fire_sva_action(site_idx, true);
+            self.fire_sva_action(site_idx, true, false);
         } else if kind != 2 {
             stat.fail_count += 1;
-            self.fire_sva_action(site_idx, false);
+            self.fire_sva_action(site_idx, false, false);
         }
     }
 
-    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool, vacuous: bool) {
         // §20.12 PassOff/FailOff, decided when the attempt finishes.
         if self.assert_ctl_on {
             let st = self.sva_site_ctl(site_idx);
             if !(if passed {
-                st.pass_action(false)
+                st.pass_action(vacuous)
             } else {
                 st.fail_action()
             }) {
@@ -3269,13 +3367,10 @@ impl Simulator {
                                 fail_count: 0,
                             });
                     stat.kind = site_kind;
-                    // §16.12.1: holds, but no pass action unless a
-                    // §20.12 PassOn enabled it for vacuous successes.
+                    // §20.11: an enabled vacuous pass action runs for assert and assume.
                     if site_kind != 2 {
                         stat.pass_count += 1;
-                        if self.assert_ctl_on && self.sva_site_ctl(i).pass_action(true) {
-                            self.fire_sva_action(i, true);
-                        }
+                        self.fire_sva_action(i, true, true);
                     }
                 }
             }

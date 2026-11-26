@@ -40,9 +40,19 @@ per release are in the [release notes](../NOTES.md).
   `$assertcontrol` with Lock/Unlock, the assertion-type and directive-type
   masks, and `levels` plus a list of scopes or assertion names. They apply to
   concurrent, immediate and deferred assertions and covers; `expect`
-  statements ignore them, as in the reference simulator.
+  statements ignore them, as in the reference simulator. A concurrent
+  assertion runs its pass action on a vacuous success too, unless
+  `$assertvacuousoff` turns that off (§20.11).
 * **User-defined nettypes with resolution functions** (§6.6.7) —
-  `nettype T wire_t with resolver;` including Z-skip and built-in resolution.
+  `nettype T wire_t with resolver;` including Z-skip and built-in resolution,
+  a delay per driver, the declaration initializer as a driver, and aliased
+  nets resolved as one net (§10.11).
+* **`shortreal`** (§6.12) — stored, cast and passed through ports at IEEE 754
+  binary32 precision.
+* **Memory files** (§21.4, §21.5) — `$readmemh`/`$readmemb` and
+  `$writememh`/`$writememb` on fixed, dynamic, multidimensional and
+  associative arrays, subarrays and class properties. See the
+  [user guide](user-guide.md#memory-files).
 * **Per-module timescales** (§3.14, §20.3, §21.3.5) — `$time`/`$realtime`
   scale to the calling module's time unit; `timeunit`/`timeprecision`
   declarations scale delays; `$timeformat`/`%t` and `$printtimescale` are
@@ -120,10 +130,15 @@ See the [coverage guide](coverage-guide.md).
 ## Debug and integration
 
 * **Waveforms** (`--wave`, off by default) — VCD, FST (`--fst`) and XTrace
-  (`--xtrace`). See the [user guide](user-guide.md#waveforms).
+  (`--xtrace`), selected by scope (`--fst-scope`, `--xtrace-scope`, indexed
+  `$dumpvars` arguments such as `tb.g_lane[2].u_lane`) and excluded by module
+  or path (`--wave-suppress`). See the [user guide](user-guide.md#waveforms).
 * **DPI-C** via `--dpi-lib <path>` — load shared libraries of
   `import "DPI-C"` implementations written in C or C++ (an ISS shim, a custom
-  HDL-backdoor layer, your own UVM extensions). The repository ships
+  HDL-backdoor layer, your own UVM extensions), or name the C and C++ sources
+  among the design files and xezim compiles, links and caches the library
+  itself. An import that no library defines binds to a function the process
+  already has loaded, such as one of the C library. The repository ships
   `svdpi.h`, `vpi_user.h` and `sv_vpi_user.h`, so DPI code compiles without
   any vendor installation.
 * **VPI** via `--vpi-lib <path>` (`-m`) — the IEEE 1800 VPI routines and value
@@ -145,6 +160,10 @@ See the [coverage guide](coverage-guide.md).
   `XEZIM_EVENT_EDGE=0` turns it off).
 * **Packed memory arena**, on by default — large integral memories are stored
   compactly (`XEZIM_PACKED_MEM=0` turns it off).
+* **Event-waiter index**, on by default — a process parked on an event control
+  over signals, or plain expressions of them, is examined only when one of
+  those signals is written (`XEZIM_WAITER_INDEX=0` examines every waiter at
+  each pass).
 * **Warm design cache** — repeated runs skip parsing and elaboration. See the
   [user guide](user-guide.md#warm-design-cache).
 * **Native compilation** (`--features jit`) — hot bytecode compiles to machine

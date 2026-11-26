@@ -273,6 +273,7 @@ impl Simulator {
     /// POST-NBA r (one cycle "early" vs the reference simulator; the exact
     /// checker/BFM divergence shape of the rptr race-through report).
     pub(super) fn drain_inactive_pre_nba(&mut self) {
+        self.drain_active_driver_updates();
         let mut fuel = 1000u32;
         // §9.2: a `#0` continuation's write happens AFTER this slot's edge
         // detection; without recording it for the rescan drain, the caller
@@ -298,6 +299,7 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
+            self.drain_active_driver_updates();
         }
         self.in_edge_cont = __prev_edge_cont;
         // Re-detect the recorded positions NOW, against the still-pre-write
@@ -454,16 +456,61 @@ impl Simulator {
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
         // → decd_ill_expt → decd_special_sel chain). Without this final
         // settle, those cont-assign dependents stay stale until the next
-        // clock tick — symptom: e902 part6 decoder outputs lag a reference simulator by
-        // one cycle on inst-class transitions. settle alone is sufficient
-        // (no further check_edges); the always-block sens lists read from
-        // signals already captured in the loop's last snapshot, so they
-        // wouldn't re-trigger anyway.
+        // clock tick — symptom: e902 part6 decoder outputs lag a reference
+        // simulator by one cycle on inst-class transitions.
+        //
+        // This settle is NOT always the last word, though: it can itself
+        // change an edge-sensitive signal — e.g. a chained
+        // `always @(n0.f or n0.v) m1=n0.f;` then `always @(n1.f or n1.v) m2=n1.f;`
+        // with n0/n1 continuous assigns, where n1.f settles from 1.25 to 2.75
+        // only in this final propagation and the downstream relay must
+        // re-evaluate (issue #1239). Re-enter the settle→detect→dispatch
+        // cycle below if this settle was non-trivial, so such a relay fires in
+        // the same delta — otherwise n2 would stay stale until the next tick.
+        // Capture the trigger BEFORE the settle: if the cascade exited
+        // (break 1) with an edge-block's blocking-write still unsettled,
+        // `dirty_any` is true here, and the settle below drains it — possibly
+        // changing an edge signal in the process.
+        let dirt_before_final = self.dirty_any;
         if self.dirty_any {
             let t0 = self.profile_timing.then(std::time::Instant::now);
             self.settle_combinatorial();
             if let Some(t) = t0 {
                 t_settle += t.elapsed().as_nanos() as u64;
+            }
+        }
+        // §9.2 tail (see the rationale above): no check_edges runs after the
+        // final settle, so an edge signal it moves would go undelivered until
+        // the next tick. Re-enter settle→detect→dispatch (bounded) so the
+        // downstream relay re-evaluates in this same delta.
+        //
+        // Mode-agnostic: in dirty-edge mode the continuous-assign write also
+        // lands in `changed_edge_pos`; in full-scan mode the re-check
+        // full-scans (already that mode's per-iteration cost).
+        if dirt_before_final {
+            // Re-enter settle→detect→dispatch while the final settle keeps
+            // moving an edge signal. Each round may fire a relay whose
+            // blocking write lands in the next settle, which in turn changes
+            // the NEXT relay's input — so continue until a round produces no
+            // new edge fires and leaves nothing new to settle. Bounded against
+            // a zero-delay livelock.
+            let mut tail_guard = 0u32;
+            loop {
+                let eb = self.prof_edges_fired;
+                self.check_edges();
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                tail_guard += 1;
+                if tail_guard >= 64 || self.finished {
+                    break;
+                }
+                let progressed = self.prof_edges_fired != eb
+                    || self.dirty_any
+                    || !self.changed_edge_pos.is_empty();
+                if !progressed {
+                    break;
+                }
             }
         }
         (t_snap, t_nba, t_settle, t_edges)
@@ -714,6 +761,7 @@ impl Simulator {
         // drain (a stuck counter would hold every cont-assign propagation
         // forever).
         self.t0_starts_remaining = 0;
+        self.release_time0_held();
         // Close out the slot being abandoned before the clock jumps. Every
         // other time advance services the postponed region first; this
         // recovery path is the last one that did not, and skipping it would
@@ -1206,7 +1254,7 @@ impl Simulator {
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             let sens = w
                 .resolved_sensitivities
                 .iter()
@@ -1699,6 +1747,7 @@ impl Simulator {
                 if self.t0_starts_remaining > 0 && !self.event_queue.last_pop_front {
                     self.t0_starts_remaining -= 1;
                     if self.t0_starts_remaining == 0 {
+                        self.release_time0_held();
                         self.drain_deferred_proc_settle();
                     }
                 }
@@ -1757,6 +1806,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
+            self.drain_active_driver_updates();
             self.drain_condition_waiters(true, false);
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
@@ -1788,6 +1838,11 @@ impl Simulator {
         // the end of the time-0 active region, once the initial blocks above
         // have run and suspended — so a same-time pre-delay read of the output
         // still observes X (matches a reference simulator).
+        // §9.2.2.2: with no start batch to close (no process at time 0)
+        // the held entries are released here.
+        if !self.comb_time0_held.is_empty() {
+            self.release_time0_held();
+        }
         if self.time == 0 && !self.comb_time0_deferred_done && !self.comb_time0_deferred.is_empty()
         {
             self.comb_time0_deferred_done = true;
@@ -2272,6 +2327,11 @@ impl Simulator {
         // `schedule_front` fork children are exempted at pop time.
         if !self.checkpoint_restored {
             self.t0_starts_remaining = self.event_queue.slot_len(0);
+            // §9.2.2.2: with no process to start, the entries held for the
+            // start batch run now.
+            if self.t0_starts_remaining == 0 {
+                self.release_time0_held();
+            }
         }
         while !self.finished && iters < max_iters {
             iters += 1;
@@ -2614,6 +2674,7 @@ impl Simulator {
             // same-time work, so look again.
             if next_time > self.time && self.t0_starts_remaining > 0 {
                 self.t0_starts_remaining = 0;
+                self.release_time0_held();
                 self.drain_deferred_proc_settle();
                 continue;
             }
@@ -2915,6 +2976,13 @@ impl Simulator {
             self.cond_waiter_rechecks
         );
         chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!("[PROF] queue_elem_moves={}", self.queue_elem_moves);
+        chatter!(
+            "[PROF] timing_conds compiled={} interpreted={}",
+            self.timing_cond_evals[0],
+            self.timing_cond_evals[1]
+        );
+        chatter!("[PROF] select_store_copies={}", self.select_store_copies);
         chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
             "[PROF] local_meta_swaps={} local_meta_scans={}",
@@ -2926,6 +2994,10 @@ impl Simulator {
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,
             self.prof_waiter_iters
+        );
+        chatter!(
+            "[PROF] implicit_net_scope_steps={}",
+            initialization::IMPLICIT_NET_SCOPE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
         );
         chatter!(
             "[PROF] clocks_only_detect={} nba_elided={} (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)",
@@ -3645,13 +3717,9 @@ impl Simulator {
         // §16.12.2: strong properties still pending fail at the end of
         // simulation, before the summary counts them.
         self.sva_end_of_sim();
-        // Assertion + coverage summary (always when any data was recorded;
-        // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
-        // path xezim_cov.json when at least one stat exists). A run with code
-        // coverage writes it after the `final` blocks, which count too.
-        if self.code_cov.is_none() {
-            self.emit_coverage_summary();
-        }
+        // The assertion + coverage summary (and the JSON database) is written
+        // by `run` after the last slot's deferred reports mature and the
+        // `final` blocks run, which both count.
         if self.edge_block_stats_enabled {
             self.print_edge_block_stats();
         }

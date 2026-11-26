@@ -30,6 +30,24 @@ impl Simulator {
     /// the drive's indices frozen when it executed.
     pub(super) fn drive_clocking_select(&mut self, target: &Expression, val: Value, skew: u64) {
         let span = target.span;
+        // §14.16.2: drives of one output that mature together take effect
+        // in the order they were issued. A whole drive of the output issued
+        // before this one and maturing with it waits in `delayed_updates`,
+        // which commits apart from the nonblocking updates (after them, at
+        // the current time), so it moves into the nonblocking queue ahead of
+        // this drive. This drive is recorded so a whole drive issued after
+        // it queues behind it (`schedule_clocking_update`).
+        let mut again = false;
+        if let Some(id) = self.clocking_select_signal(target) {
+            let when = self.time.saturating_add(skew);
+            for value in self.take_clocking_whole_drives(id, when) {
+                self.queue_clocking_whole_nba(id, value, skew);
+            }
+            let now = self.time;
+            self.clocking_select_due.retain(|&(t, _)| t >= now);
+            again = self.clocking_select_due.contains(&(when, id));
+            self.clocking_select_due.push((when, id));
+        }
         let rvalue = self.make_intra_saved_expr(val, span);
         let delay = (skew > 0).then(|| {
             Expression::new(
@@ -51,6 +69,88 @@ impl Simulator {
             },
             span,
         ));
+        if again {
+            self.supersede_clocking_selects(target, skew);
+        }
+    }
+
+    /// §14.16.2: when synchronous drives of one output mature in the same
+    /// time step, "the last value is the only value driven". Each select
+    /// drive is a nonblocking update of its bits, so two drives of the same
+    /// bits (`cb.e[0] <= 1; cb.e[0] <= 0;`) changed them twice in that step
+    /// and woke `@(e)` with the value unchanged. The earlier updates of the
+    /// same bits that mature with this one (the last one queued) take its
+    /// value, so the bits change at most once. Only reached when another
+    /// select drive of the output is due at the same time.
+    fn supersede_clocking_selects(&mut self, target: &Expression, skew: u64) {
+        let Some(range) = self.delayed_lhs_select_range(target) else {
+            return;
+        };
+        let when = self.time.saturating_add(skew);
+        let base = Self::select_chain_base(target).and_then(Self::member_path_head);
+        // The queued updates of this time whose target has the same base
+        // name: a cheap filter before the select ranges are evaluated.
+        let same_base = |e: &NbaEntry| {
+            e.lhs.as_ref().is_some_and(|l| {
+                Self::select_chain_base(l).and_then(Self::member_path_head) == base
+            })
+        };
+        // Indices only: the targets stay in the queue and are lent to
+        // `queued_select_range` (a drive runs this on every clock edge).
+        let picked: Vec<usize> = if skew == 0 {
+            self.nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| same_base(e))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            self.delayed_nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, (t, e))| *t == when && same_base(e))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let Some((&last, earlier)) = picked.split_last() else {
+            return;
+        };
+        if earlier.is_empty() || self.queued_select_range(last, skew > 0) != Some(range) {
+            return;
+        }
+        let value = if skew == 0 {
+            self.nba_queue[last].value.clone()
+        } else {
+            self.delayed_nba_queue[last].1.value.clone()
+        };
+        for &i in earlier {
+            if self.queued_select_range(i, skew > 0) != Some(range) {
+                continue;
+            }
+            if skew == 0 {
+                self.nba_queue[i].value = value.clone();
+            } else {
+                self.delayed_nba_queue[i].1.value = value.clone();
+            }
+        }
+    }
+
+    /// `delayed_lhs_select_range` of the target of queued update `i` (of
+    /// `delayed_nba_queue` when `delayed`), read in place: the target is
+    /// taken out of the entry for the call and put back.
+    fn queued_select_range(&mut self, i: usize, delayed: bool) -> Option<(usize, u32, u32)> {
+        let lhs = if delayed {
+            self.delayed_nba_queue[i].1.lhs.take()
+        } else {
+            self.nba_queue[i].lhs.take()
+        };
+        let range = lhs.as_ref().and_then(|l| self.delayed_lhs_select_range(l));
+        if delayed {
+            self.delayed_nba_queue[i].1.lhs = lhs;
+        } else {
+            self.nba_queue[i].lhs = lhs;
+        }
+        range
     }
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
@@ -124,13 +224,69 @@ impl Simulator {
 
     /// §14.16.2: only synchronous drives of one output that mature in the
     /// same time step replace each other. Different skews remain pending;
-    /// the inertial gate-delay queue would cancel the earlier drive.
+    /// the inertial gate-delay queue would cancel the earlier drive. A select
+    /// drive of the output due at the same time commits as a nonblocking
+    /// update, so the whole drive queues behind it there and the later drive
+    /// wins.
     pub(super) fn schedule_clocking_update(&mut self, id: usize, val: &Value, delay: u64) {
         let when = self.time.saturating_add(delay);
         let value = self.fit_clocking_value(id, val);
         self.delayed_updates
             .retain(|(t, sid, _, _)| *sid != id || *t != when);
+        if self
+            .clocking_select_due
+            .iter()
+            .any(|&(t, sid)| t == when && sid == id)
+        {
+            self.queue_clocking_whole_nba(id, value, delay);
+            return;
+        }
         self.delayed_updates.push((when, id, value, None));
+    }
+
+    /// The whole drives of signal `id` waiting in `delayed_updates` to
+    /// mature at `when`, removed from it in the order they were scheduled.
+    fn take_clocking_whole_drives(&mut self, id: usize, when: u64) -> Vec<Value> {
+        let mut taken = Vec::new();
+        if self.delayed_updates.is_empty() {
+            return taken;
+        }
+        self.delayed_updates.retain(|(t, sid, v, mask)| {
+            let due = *sid == id && *t == when && mask.is_none();
+            if due {
+                taken.push(v.clone());
+            }
+            !due
+        });
+        taken
+    }
+
+    /// Queue a whole drive of signal `id` as a nonblocking update `delay`
+    /// ticks from now, behind the updates already queued for that time. A
+    /// later select of the signal in this time step merges into it.
+    fn queue_clocking_whole_nba(&mut self, id: usize, value: Value, delay: u64) {
+        if delay == 0 && !self.nba_behind_queued_partial(id) {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value,
+            });
+            return;
+        }
+        self.enqueue_context_nba(
+            NbaEntry {
+                elements: None,
+                lhs: None,
+                value,
+                resolved_id: Some(id),
+                static_key: None,
+                static_slice: None,
+                this_handle: None,
+                root_frame: None,
+            },
+            delay,
+        );
     }
 
     /// §14.3: an output with an edge skew is driven on that edge of the
@@ -206,6 +362,136 @@ impl Simulator {
         let mut e = sel.clone();
         swap_base(&mut e, saved);
         self.eval_expr(&e)
+    }
+
+    /// §14.5: the signals an expression bound to a clocking input reads, in
+    /// first-use order. A name that is not a signal (a parameter folded
+    /// away, a function) is left to the expression.
+    pub(super) fn clocking_expr_operands(e: &Expression, ids: &NameMap, out: &mut Vec<String>) {
+        if let Some(segs) = Self::flatten_member_path(e) {
+            let net = segs.join(".");
+            if ids.contains_key(net.as_str()) && !out.contains(&net) {
+                out.push(net);
+            }
+            return;
+        }
+        let mut walk = |x: &Expression| Self::clocking_expr_operands(x, ids, out);
+        match &e.kind {
+            ExprKind::Unary { operand, .. } => walk(operand),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left);
+                walk(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                walk(condition);
+                walk(then_expr);
+                walk(else_expr);
+            }
+            ExprKind::Paren(x) => walk(x),
+            ExprKind::Concatenation(parts) => parts.iter().for_each(walk),
+            ExprKind::Replication { count, exprs } => {
+                walk(count);
+                exprs.iter().for_each(walk);
+            }
+            ExprKind::Index { expr, index } => {
+                walk(expr);
+                walk(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                walk(expr);
+                walk(left);
+                walk(right);
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                args.iter().for_each(walk)
+            }
+            ExprKind::Inside { expr, ranges } => {
+                walk(expr);
+                ranges.iter().for_each(walk);
+            }
+            _ => {}
+        }
+    }
+
+    /// §14.5: `e` with each operand in `ops` replaced by its sample in
+    /// `snap`, kept in `intra_saved` under the slots pushed to `slots`.
+    fn clocking_expr_over_samples(
+        &mut self,
+        e: &mut Expression,
+        ops: &[(String, String)],
+        snap: &HashMap<String, Value>,
+        slots: &mut Vec<u64>,
+    ) {
+        if let Some(segs) = Self::flatten_member_path(e) {
+            let net = segs.join(".");
+            if let Some((_, hidden)) = ops.iter().find(|(n, _)| *n == net)
+                && let Some(v) = snap.get(hidden)
+            {
+                let idx = self.intra_saved_next;
+                self.intra_saved_next += 1;
+                self.intra_saved.insert(idx, v.clone());
+                slots.push(idx);
+                *e = Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_KEPT_MARKER.to_string(),
+                        args: vec![Self::intra_slot_literal(idx, e.span)],
+                    },
+                    e.span,
+                );
+            }
+            return;
+        }
+        let mut subs: Vec<&mut Expression> = Vec::new();
+        match &mut e.kind {
+            ExprKind::Unary { operand, .. } => subs.push(operand),
+            ExprKind::Binary { left, right, .. } => {
+                subs.push(left);
+                subs.push(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                subs.push(condition);
+                subs.push(then_expr);
+                subs.push(else_expr);
+            }
+            ExprKind::Paren(x) => subs.push(x),
+            ExprKind::Concatenation(parts) => subs.extend(parts.iter_mut()),
+            ExprKind::Replication { count, exprs } => {
+                subs.push(count);
+                subs.extend(exprs.iter_mut());
+            }
+            ExprKind::Index { expr, index } => {
+                subs.push(expr);
+                subs.push(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                subs.push(expr);
+                subs.push(left);
+                subs.push(right);
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                subs.extend(args.iter_mut())
+            }
+            ExprKind::Inside { expr, ranges } => {
+                subs.push(expr);
+                subs.extend(ranges.iter_mut());
+            }
+            _ => {}
+        }
+        for x in subs {
+            self.clocking_expr_over_samples(x, ops, snap, slots);
+        }
     }
 
     pub(super) fn tick_clocking_blocks(&mut self) {
@@ -330,12 +616,12 @@ impl Simulator {
                         .and_then(|m| m.get(&raw))
                         .copied()
                         .unwrap_or(dskew);
+                    // §14.16.2: a select drive commits as a nonblocking
+                    // update at any skew, `#0` included, so it takes its
+                    // place among the other drives of the output that
+                    // mature in this time step (`drive_clocking_select`).
                     if let Some(t) = target {
-                        if skew > 0 {
-                            self.drive_clocking_select(&t, val, skew);
-                        } else {
-                            self.assign_value(&t, &val);
-                        }
+                        self.drive_clocking_select(&t, val, skew);
                         continue;
                     }
                     if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
@@ -442,6 +728,26 @@ impl Simulator {
                     }
                 }
             }
+            // §14.5: an expression-bound input samples the expression over
+            // its operands' samples, taken above under their hidden names.
+            if !self.clocking_sig_bound_expr.is_empty()
+                && let Some(exprs) = self.clocking_sig_bound_expr.remove(skey)
+            {
+                for (vis, (e, ops)) in &exprs {
+                    let mut x = e.clone();
+                    let mut slots = Vec::new();
+                    self.clocking_expr_over_samples(&mut x, ops, &snap, &mut slots);
+                    let v = self.eval_expr(&x);
+                    for idx in slots {
+                        self.intra_saved.remove(&idx);
+                    }
+                    for (_, hidden) in ops {
+                        snap.remove(hidden);
+                    }
+                    snap.insert(vis.clone(), v);
+                }
+                self.clocking_sig_bound_expr.insert(skey.to_string(), exprs);
+            }
             // §14.13: publish each fresh sample to its hidden mirror signal so
             // `@(cb.sig)` fires at THIS edge, and only on an actual change.
             let mirror: Vec<(String, Value)> = snap
@@ -517,7 +823,7 @@ impl Simulator {
                 if waiter.value_ctx.is_some() {
                     self.rebase_value_terms(&mut waiter);
                 }
-                self.event_waiters.push(waiter);
+                self.park_event_waiter(waiter);
             }
             if let Some(h) = saved_hint {
                 *self.name_resolve_hint.borrow_mut() = h;
@@ -563,7 +869,7 @@ impl Simulator {
     pub(super) fn park_clocking_guard(&mut self, w: EventWaiter) {
         match w.resolved_sensitivities.iter().find_map(|t| t.iff.clone()) {
             Some(g) => self.deferred_clocking_guarded.push((w, g)),
-            None => self.event_waiters.push(w),
+            None => self.park_event_waiter(w),
         }
     }
 
@@ -653,9 +959,12 @@ impl Simulator {
         }
     }
 
-    /// §16.4: record a deferred assertion's outcome; its action block runs
+    /// §16.4: queue a deferred assertion's report; its action block runs
     /// when the report matures. Arguments of a subroutine-call action are
-    /// evaluated now, as §16.4 requires.
+    /// evaluated now, as §16.4 requires. The outcome is counted only when
+    /// the report matures (`mature_deferred_asserts`): a report flushed
+    /// because its process resumed in the same time slot (§16.4.2), or
+    /// superseded by a re-execution of its `always_comb`, is no attempt.
     pub(super) fn queue_deferred_assert(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
@@ -671,26 +980,14 @@ impl Simulator {
         let src = self.current_src_file();
         let stat_key = Self::assert_stat_key(a.span.start, src);
         self.note_assert_label(stat_key, label);
-        let entry = self
-            .assertion_stats
-            .entry(stat_key)
-            .or_insert(AssertionStat {
-                kind: kind_tag,
-                loc: Some((src, a.span.start)),
-                pass_count: 0,
-                fail_count: 0,
-            });
-        if passed {
-            entry.pass_count += 1;
-        } else {
-            entry.fail_count += 1;
-        }
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
-        // no process, keyed by the block's scope instead.
-        let (pid, comb_scope) = if self.settling {
-            (usize::MAX, self.name_resolve_hint.borrow().clone())
+        // no process, keyed by the scope `%m` names instead. The copies of a
+        // generate loop share the statement, and can share the settle's
+        // name hint, but each has its own `%m` path.
+        let (pid, comb_scope) = if self.settling || self.comb_direct_eval {
+            (usize::MAX, Some(self.m_path()))
         } else {
             (self.current_pid, None)
         };
@@ -704,9 +1001,7 @@ impl Simulator {
         // has no failure action).
         let default_error_scope =
             (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
-        if action.is_none() && default_error_scope.is_none() {
-            return;
-        }
+        // A report with no action still matures, to be counted then.
         let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
@@ -719,6 +1014,9 @@ impl Simulator {
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
             ctl,
+            stat_key,
+            stat_kind: kind_tag,
+            stat_loc: (src, a.span.start),
         });
     }
 
@@ -774,9 +1072,49 @@ impl Simulator {
     pub(super) fn mature_deferred_asserts(&mut self) {
         let mut pending = std::mem::take(&mut self.deferred_asserts);
         pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
-        for d in pending {
+        // §16.4: the `#0` reports mature together in the Observed region and
+        // the `final` ones in the Postponed region, before any of their
+        // actions run, so each group is counted on reaching its region and a
+        // `$finish` in one report's action leaves the others counted. A
+        // region a `$finish` kept the slot from reaching matures nothing.
+        let at = pending
+            .iter()
+            .position(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final)
+            .unwrap_or(pending.len());
+        let finals = pending.split_off(at);
+        for group in [pending, finals] {
+            if !self.finished {
+                for d in &group {
+                    self.count_deferred_report(d);
+                }
+            }
+            self.run_deferred_actions(group);
+        }
+    }
+
+    /// Count one matured deferred report in its statement's `assertion_stats`
+    /// entry (§16.4.2).
+    fn count_deferred_report(&mut self, d: &DeferredReport) {
+        let entry = self.assertion_stats.entry(d.stat_key).or_insert(AssertionStat {
+            kind: d.stat_kind,
+            loc: Some(d.stat_loc),
+            pass_count: 0,
+            fail_count: 0,
+        });
+        if d.passed {
+            entry.pass_count += 1;
+        } else {
+            entry.fail_count += 1;
+        }
+    }
+
+    /// The actions of matured deferred reports (see `mature_deferred_asserts`).
+    fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
+        for d in group {
             if self.finished {
-                if !d.passed {
+                // Only a report with a failure action left to run is noted:
+                // a cover that did not match has none (§16.14.3).
+                if !d.passed && (d.action.is_some() || d.default_error_scope.is_some()) {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .unwrap_or_else(|| "?".to_string());
@@ -852,7 +1190,15 @@ impl Simulator {
     /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
     pub(super) fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
-            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+        if matches!(
+            name.as_str(),
+            "$time"
+                | "$stime"
+                | "$realtime"
+                | "$__xz_time_at"
+                | "$__xz_stime_at"
+                | "$__xz_realtime_at"
+        ))
     }
 
     /// The design root is the synthetic multi-top wrapper (§23.3.3): its

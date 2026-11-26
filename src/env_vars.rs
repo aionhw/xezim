@@ -603,6 +603,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_MAX_INST_DEPTH", "Elab: max instance recursion depth"),
     (
+        "XEZIM_MAX_PACKED_WIDTH",
+        "Maximum live packed declaration width in bits (default 16777216, maximum 134217728)",
+    ),
+    (
         "XEZIM_MBX_DBG",
         "Debug: trace mailbox get/put/peek operations",
     ),
@@ -1041,6 +1045,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_WAITERS_FIRST",
         "Scheduling: run event waiters before edge blocks (0/1)",
+    ),
+    (
+        "XEZIM_WAITER_INDEX",
+        "Scheduling: 0 examines every parked @(...) waiter at each scheduling pass instead of only those whose signals were written (default 1; needs XEZIM_DIRTY_EDGE)",
+    ),
+    (
+        "XEZIM_WAITER_INDEX_SHADOW",
+        "Scheduling: 1 examines every parked @(...) waiter and stops on one the waiter index would have skipped although its signal changed",
     ),
     (
         "XEZIM_XZ_STATS",

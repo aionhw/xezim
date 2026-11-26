@@ -1,9 +1,9 @@
 module mwe12_struct_local_array ;
    typedef struct packed { logic [7:0] d ; logic v ; } s_t ;
    int failures = 0 ;
-   task automatic chk(bit ok, string msg);
+   function automatic void chk(bit ok, string msg);
       if (!ok) begin failures++ ; $display("FAIL : %s", msg) ; end
-   endtask
+   endfunction
 
    // ---- failing shape 1: struct array local to a TASK ----
    task automatic in_task();
