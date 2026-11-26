@@ -8,6 +8,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Resolve explicitly named VHDL tops case-insensitively in both the native simulator and the synthesized RTL runner (§15.4), using the emitted SystemVerilog spelling for elaboration.
+
+- **Performance:** Request a delta cycle when an immediate VHDL composite driver writes, avoiding per-driver scans in next-cycle scheduling.
+
+- **Performance:** Detect VHDL record events while copying fields from disjoint immediate drivers, avoiding a full record equality call on each update.
+
+- **Performance:** Compile static VHDL record-member reads directly to their materialized signal slots, including constant-indexed record array elements.
+
 - **Performance:** Avoid repeated function-name scans and unused write censuses during simulator setup.
 
 - **Performance:** Compact completed syntax lists before building elaboration tables.

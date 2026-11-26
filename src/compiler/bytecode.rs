@@ -12301,6 +12301,88 @@ impl<'a> BytecodeCompiler<'a> {
         self.signal_name_to_id.get(name).copied()
     }
 
+    /// Read an already materialized leaf of a VHDL effective signal (§14.7.3).
+    /// These generated records have fixed shape and no frame-owned storage.
+    /// Ordinary SV member paths and computed selectors keep their usual
+    /// resolution, including collection and class semantics.
+    fn vhdl_static_record_leaf_id(&self, expr: &Expression) -> Option<usize> {
+        if !xezim_core::vhdl::is_generated_span(expr.span)
+            || (self.method_mode && !self.free_function_mode)
+        {
+            return None;
+        }
+        fn collect<'e>(
+            compiler: &BytecodeCompiler<'_>,
+            expr: &'e Expression,
+            path: &mut String,
+        ) -> Option<&'e str> {
+            let append_index = |path: &mut String, expr: &Expression| {
+                let ExprKind::Number(n) = &expr.kind else {
+                    return None;
+                };
+                let index = compiler.eval_number_static(n)?.to_i64()?;
+                use std::fmt::Write;
+                write!(path, "[{index}]").ok()
+            };
+            match &expr.kind {
+                ExprKind::Ident(h) if h.root.is_none() => {
+                    let (head, tail) = h.path.split_first()?;
+                    let name = head.name.name.as_str();
+                    let digits = name.strip_prefix("vh_s")?;
+                    let digits = digits.strip_suffix("_last").unwrap_or(digits);
+                    if digits.is_empty()
+                        || !digits.bytes().all(|b| b.is_ascii_digit())
+                        || !head.selects.is_empty()
+                    {
+                        return None;
+                    }
+                    path.push_str(name);
+                    for part in tail {
+                        path.push('.');
+                        path.push_str(&part.name.name);
+                        for select in &part.selects {
+                            append_index(path, select)?;
+                        }
+                    }
+                    Some(name)
+                }
+                ExprKind::MemberAccess { expr: base, member } => {
+                    let head = collect(compiler, base, path)?;
+                    path.push('.');
+                    path.push_str(&member.name);
+                    Some(head)
+                }
+                ExprKind::Index { expr: base, index } => {
+                    let head = collect(compiler, base, path)?;
+                    append_index(path, index)?;
+                    Some(head)
+                }
+                _ => None,
+            }
+        }
+        let mut path = String::new();
+        let head = collect(self, expr, &mut path)?;
+        if self.local_var_regs.contains_key(head)
+            || self.local_var_array.contains_key(head)
+            || self.local_const_vars.contains_key(head)
+            || !self.is_member_wise_struct_name(head)
+            || self.is_member_wise_struct_name(&path)
+        {
+            return None;
+        }
+        if let Some(id) = self.lookup_signal_id_by_name(&path) {
+            return (!self.is_member_wise_struct_id(id)).then_some(id);
+        }
+        let mut scope = self.scope_hint.as_deref();
+        while let Some(here) = scope {
+            if let Some(id) = with_dotted(here, &path, |key| self.lookup_signal_id_by_name(key)) {
+                return (!self.is_member_wise_struct_id(id)).then_some(id);
+            }
+            scope = here.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        None
+    }
+
     /// The parameter value behind a signal-table TWIN: the elaborator gives
     /// an instance parameter a placeholder signal so it is readable
     /// hierarchically, and the identifier path resolved `hier` to that
@@ -18540,6 +18622,15 @@ impl<'a> BytecodeCompiler<'a> {
                     return Some(r);
                 }
                 if let Some(dest) = self.compile_formal_struct_member(expr) {
+                    return Some(dest);
+                }
+                if let Some(id) = self.vhdl_static_record_leaf_id(expr) {
+                    let dest = self.alloc_reg();
+                    if self.signal_signed[id] {
+                        self.emit(Insn::LoadSignalSigned(dest, as_sig_id(id)));
+                    } else {
+                        self.emit(Insn::LoadSignal(dest, as_sig_id(id)));
+                    }
                     return Some(dest);
                 }
                 // §9.7: `p.status` / `p.status()` on a process handle

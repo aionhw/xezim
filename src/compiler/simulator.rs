@@ -383,7 +383,8 @@ fn method_boost_enabled() -> bool {
 // Refresh cached AST bodies after boxing optional timing payloads.
 // Refresh cached AST bodies after compact declaration and name-cache storage.
 // Refresh cached AST bodies after boxing optional case-arm payloads.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3095;
+// Bind static leaves of generated VHDL records to their signal slots.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

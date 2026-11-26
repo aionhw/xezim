@@ -4,9 +4,29 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
+
+
+def verilog_top(netlist, requested):
+    # VHDL basic identifiers are case-insensitive; Verilog identifiers are not.
+    # GHDL preserves the entity declaration's spelling in its output.
+    matches = set()
+    module_header = re.compile(r"^\s*module\s+([^\s(;]+)")
+    with netlist.open() as source:
+        for line in source:
+            match = module_header.match(line)
+            if match:
+                name = match[1]
+                if name == requested:
+                    return name
+                if name.casefold() == requested.casefold():
+                    matches.add(name)
+    if len(matches) == 1:
+        return matches.pop()
+    raise ValueError(f"Cannot identify synthesized Verilog top for {requested!r}")
 
 
 def main(argv):
@@ -29,7 +49,7 @@ def main(argv):
                 check=True,
             )
         return subprocess.run(
-            [args.xezim, "-s", args.top, *argv[sep + 1:], netlist],
+            [args.xezim, "-s", verilog_top(netlist, args.top), *argv[sep + 1:], netlist],
             env={**os.environ, "XEZIM_JIT": "1"},
         ).returncode
 
@@ -37,7 +57,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except OSError as error:
+    except (OSError, ValueError) as error:
         sys.exit(str(error))
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
