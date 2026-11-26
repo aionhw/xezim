@@ -604,24 +604,76 @@ impl Simulator {
         }
     }
 
-    /// §28.12.2: combine two strength ranges point by point.
+    /// §28.12.2: combine two strength ranges point by point in O(1).
     pub(super) fn combine_strength(a: (i8, i8), b: (i8, i8), wired_and: Option<bool>) -> (i8, i8) {
+        if a.0 > a.1 || b.0 > b.1 {
+            return (i8::MAX, i8::MIN);
+        }
+        let (a0, a1) = (a.0 as i16, a.1 as i16);
+        let (b0, b1) = (b.0 as i16, b.1 as i16);
         let (mut lo, mut hi) = (i8::MAX, i8::MIN);
-        for p in a.0..=a.1 {
-            for q in b.0..=b.1 {
-                let outs: [i8; 2] = if p.abs() > q.abs() {
-                    [p, p]
-                } else if q.abs() > p.abs() {
-                    [q, q]
-                } else if let Some(and) = wired_and {
-                    let value = if and { p.min(q) } else { p.max(q) };
-                    [value, value]
-                } else {
-                    [p, q]
-                };
-                for o in outs {
-                    lo = lo.min(o);
-                    hi = hi.max(o);
+        let mut include = |x: i16| {
+            let x = x as i8;
+            lo = lo.min(x);
+            hi = hi.max(x);
+        };
+        let min_abs = |l: i16, h: i16| -> i16 {
+            if l <= 0 && h >= 0 {
+                0
+            } else {
+                l.abs().min(h.abs())
+            }
+        };
+        let mb = min_abs(b0, b1);
+        if a0 < -mb {
+            include(a0);
+            include(a1.min(-(mb + 1)));
+        }
+        if a1 > mb {
+            include(a0.max(mb + 1));
+            include(a1);
+        }
+        let ma = min_abs(a0, a1);
+        if b0 < -ma {
+            include(b0);
+            include(b1.min(-(ma + 1)));
+        }
+        if b1 > ma {
+            include(b0.max(ma + 1));
+            include(b1);
+        }
+        let a_pos = (a0.max(0), a1);
+        let a_neg = ((-a1).max(0), -a0);
+        let b_pos = (b0.max(0), b1);
+        let b_neg = ((-b1).max(0), -b0);
+        let (pp0, pp1) = (a_pos.0.max(b_pos.0), a_pos.1.min(b_pos.1));
+        if pp0 <= pp1 {
+            include(pp0);
+            include(pp1);
+        }
+        let (nn0, nn1) = (a_neg.0.max(b_neg.0), a_neg.1.min(b_neg.1));
+        if nn0 <= nn1 {
+            include(-nn1);
+            include(-nn0);
+        }
+        for (o0, o1) in [
+            (a_pos.0.max(b_neg.0), a_pos.1.min(b_neg.1)),
+            (a_neg.0.max(b_pos.0), a_neg.1.min(b_pos.1)),
+        ] {
+            if o0 <= o1 {
+                match wired_and {
+                    None => {
+                        include(-o1);
+                        include(o1);
+                    }
+                    Some(true) => {
+                        include(-o1);
+                        include(-o0);
+                    }
+                    Some(false) => {
+                        include(o0);
+                        include(o1);
+                    }
                 }
             }
         }
@@ -1452,5 +1504,60 @@ impl Simulator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod combine_strength_tests {
+    use super::Simulator;
+
+    fn combine_strength_ref(a: (i8, i8), b: (i8, i8), wired_and: Option<bool>) -> (i8, i8) {
+        let (mut lo, mut hi) = (i8::MAX, i8::MIN);
+        for p in a.0..=a.1 {
+            for q in b.0..=b.1 {
+                let outs: [i8; 2] = if p.abs() > q.abs() {
+                    [p, p]
+                } else if q.abs() > p.abs() {
+                    [q, q]
+                } else if let Some(and) = wired_and {
+                    let value = if and { p.min(q) } else { p.max(q) };
+                    [value, value]
+                } else {
+                    [p, q]
+                };
+                for o in outs {
+                    lo = lo.min(o);
+                    hi = hi.max(o);
+                }
+            }
+        }
+        (lo, hi)
+    }
+
+    #[test]
+    fn combine_strength_exhaustive_43200() {
+        let mut count = 0usize;
+        for a0 in -7i8..=7 {
+            for a1 in a0..=7 {
+                for b0 in -7i8..=7 {
+                    for b1 in b0..=7 {
+                        for wired_and in [None, Some(true), Some(false)] {
+                            assert_eq!(
+                                Simulator::combine_strength((a0, a1), (b0, b1), wired_and),
+                                combine_strength_ref((a0, a1), (b0, b1), wired_and),
+                                "mismatch for ({a0}, {a1}), ({b0}, {b1}), {wired_and:?}"
+                            );
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 43_200);
+        // Empty intervals match reference sentinel.
+        assert_eq!(
+            Simulator::combine_strength((3, 1), (0, 5), None),
+            combine_strength_ref((3, 1), (0, 5), None)
+        );
     }
 }

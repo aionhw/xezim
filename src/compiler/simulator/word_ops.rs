@@ -913,9 +913,7 @@ endmodule
 #[cold]
 #[inline(never)]
 pub(super) fn drop_xz(r: &mut Value) {
-    if r.has_xz() {
-        *r = r.to_two_state();
-    }
+    r.drop_xz_in_place();
 }
 
 /// `Insn::RealToInt`: §6.12.1 — a real rounds to a 64-bit integer, ties

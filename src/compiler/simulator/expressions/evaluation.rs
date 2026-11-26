@@ -2773,11 +2773,15 @@ impl Simulator {
                     }
                     return Value::from_bytes(&out);
                 }
-                let mut r = Value::zero(0);
-                for p in parts.iter().rev() {
-                    r = self.eval_expr(p).concat_with(&r);
+                if parts.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(parts.len());
+                    for p in parts.iter().rev() {
+                        vals.push(self.eval_expr(p));
+                    }
+                    Value::concat_refs(vals.iter().rev())
                 }
-                r
             }
             ExprKind::StreamOp {
                 left_to_right,
@@ -2785,32 +2789,28 @@ impl Simulator {
                 exprs,
             } => {
                 // Concat in source order: MSB = first expr. Build by concatenating from LSB (last expr).
-                let mut concat = Value::zero(0);
-                for p in exprs.iter().rev() {
-                    // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
-                    // §11.4.14: an unpacked operand streams its elements
-                    // leftmost first (`stream_elem_order`) — a descending
-                    // `[2:0]` array starts at index 2, a 2-D array goes row
-                    // by row. A queue / dynamic-array SLICE `q[a:b]` streams
-                    // elements a..b.
-                    // §11.4.14: resolve the collection's backing storage,
-                    // including class members, before reading its elements;
-                    // a `with [range]` / slice sub-range streams only the
-                    // selected elements (§11.4.14.4), in stream order.
-                    let elem_list = self.stream_operand_elems(p, false);
-                    let piece = if let Some((names, ew)) = elem_list {
-                        let mut acc = Value::zero(0);
-                        for en in &names {
-                            let ev = self.get_signal_value_by_name(en).unwrap_or(Value::zero(ew));
-                            acc = acc.concat_with(&ev);
-                        }
-                        acc
-                    } else {
-                        self.eval_expr(p)
-                    };
-                    concat = piece.concat_with(&concat);
-                }
-                let total_w = concat.width as usize;
+                let concat = if exprs.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut pieces = Vec::with_capacity(exprs.len());
+                    for p in exprs.iter().rev() {
+                        // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
+                        // §11.4.14: an unpacked operand streams its elements
+                        // leftmost first (`stream_elem_order`) — a descending
+                        // `[2:0]` array starts at index 2, a 2-D array goes row
+                        // by row. A queue / dynamic-array SLICE `q[a:b]` streams
+                        // elements a..b.
+                        // §11.4.14: resolve the collection's backing storage,
+                        // including class members, before reading its elements;
+                        // a `with [range]` / slice sub-range streams only the
+                        // selected elements (§11.4.14.4), in stream order.
+                        let piece = self
+                            .stream_operand_packed(p)
+                            .unwrap_or_else(|| self.eval_expr(p));
+                        pieces.push(piece);
+                    }
+                    Value::concat_refs(pieces.iter().rev())
+                };
                 let streamed = if !*left_to_right {
                     concat
                 } else {
@@ -2819,33 +2819,7 @@ impl Simulator {
                         .map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize)
                         .unwrap_or(1)
                         .max(1);
-                    // Reverse successive slice-sized chunks starting from the MSB side.
-                    let mut out = Value::zero(total_w as u32);
-                    let full_chunks = total_w / slice;
-                    let remainder = total_w - full_chunks * slice;
-                    // Original bits [total_w-1 .. 0], where bit (total_w-1) is MSB.
-                    // Source chunk k (0-indexed from MSB): bits [total_w-1-k*slice .. total_w-k*slice-slice].
-                    // With left_to_right streaming, chunk order is preserved but bits *within* each chunk stay ordered.
-                    // Actually `{<<slice {x}}` emits slice-sized groups MSB-first from x with each group's bits in LSB-first order inside the stream... The classic interpretation: slice the source into slice-sized chunks from LSB, then reverse the chunk order.
-                    // Standard behavior: output = reverse the order of slice-sized chunks of the source.
-                    for k in 0..full_chunks {
-                        for b in 0..slice {
-                            let src_bit = k * slice + b;
-                            let dst_bit = (full_chunks - 1 - k) * slice + b + remainder;
-                            if src_bit < total_w && dst_bit < total_w {
-                                out.set_bit(dst_bit, concat.get_bit(src_bit));
-                            }
-                        }
-                    }
-                    // Leftover bits at the top of the source (fewer than slice) go to the LSB of output.
-                    for b in 0..remainder {
-                        let src_bit = full_chunks * slice + b;
-                        let dst_bit = b;
-                        if src_bit < total_w {
-                            out.set_bit(dst_bit, concat.get_bit(src_bit));
-                        }
-                    }
-                    out
+                    concat.reverse_slices(slice)
                 };
                 // §11.4.14.2: a stream assigned to a WIDER integral target is
                 // LEFT-justified — the LRM's own example is
@@ -2864,7 +2838,7 @@ impl Simulator {
                 // made fatal here.
                 if ctx_width > streamed.width {
                     let pad = Value::zero(ctx_width - streamed.width);
-                    streamed.concat_with(&pad)
+                    Value::concat_refs([&streamed, &pad].into_iter())
                 } else {
                     streamed
                 }
@@ -2919,22 +2893,16 @@ impl Simulator {
                 }
                 let n_raw = count_val.to_u64().unwrap_or(1);
                 let n = if n_raw > MAX_REPL { 0 } else { n_raw };
-                let mut inner = Value::zero(0);
-                for e in exprs.iter().rev() {
-                    inner = self.eval_expr(e).concat_with(&inner);
-                }
-                let inner_w = inner.width as usize;
-                let total_w = (inner_w as u64).saturating_mul(n) as u32;
-                let mut r = Value::zero(total_w);
-                if inner_w > 0 {
-                    for k in 0..n as usize {
-                        let off = k * inner_w;
-                        for i in 0..inner_w {
-                            r.set_bit(off + i, inner.get_bit(i));
-                        }
+                let inner = if exprs.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(exprs.len());
+                    for e in exprs.iter().rev() {
+                        vals.push(self.eval_expr(e));
                     }
-                }
-                r
+                    Value::concat_refs(vals.iter().rev())
+                };
+                inner.replicate(n as usize)
             }
             ExprKind::Index { expr, index } => {
                 // §7.4.1/§11.5.1: a bit of a vector the call frame holds, at
@@ -4831,11 +4799,15 @@ impl Simulator {
                 self.eval_expr(expr)
             }
             ExprKind::AssignmentPattern(parts) => {
-                let mut r = Value::zero(0);
-                for p in parts.iter().rev() {
-                    r = self.eval_expr(p.expr()).concat_with(&r);
+                if parts.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(parts.len());
+                    for p in parts.iter().rev() {
+                        vals.push(self.eval_expr(p.expr()));
+                    }
+                    Value::concat_refs(vals.iter().rev())
                 }
-                r
             }
             // §10.9: a typed pattern has its type's value.
             ExprKind::TypedPattern { .. } => self.eval_typed_pattern(expr),
