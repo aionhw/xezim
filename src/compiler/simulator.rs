@@ -3902,8 +3902,18 @@ pub struct Simulator {
     /// dense per-entry header. `kind == 0` means "no arena stream".
     ts_arena: Vec<super::bytecode::TsInsn>,
     ts_hdr: Vec<TsHdr>,
+    /// True if any lowered comb `TwoStateBlock` exceeded `ts_arena`/`TsHdr`
+    /// limits and lives only in `comb_plan`. When false, `ts_hdr.kind() == 0`
+    /// skips probing `comb_plan` on every non-TS entry (e.g. `FusedGate`).
+    #[serde(skip)]
+    ts_has_overflow: bool,
     /// Same, for edge blocks (indexed like `compiled_edge_blocks`).
     ts_edge: Vec<TsSlot>,
+    /// Contiguous edge two-state code arena + dense 8-byte header table,
+    /// mirroring `ts_arena`/`ts_hdr` to avoid per-fire `Arc` + `Vec` chases.
+    ts_edge_arena: Vec<super::bytecode::TsInsn>,
+    ts_edge_hdr: Vec<TsHdr>,
+    ts_edge_hdr_tsx: Vec<u8>,
     /// Two-state scratch register file (u64 words).
     ts_regs: Vec<u64>,
     /// x/z planes of `ts_regs` for the x-plane executor.
@@ -4030,6 +4040,17 @@ pub struct Simulator {
     ts_ctl_dsts: Vec<(u32, u32)>,
     /// `ts_ctl` slots re-armed while the settle held the dependency edges.
     ts_ctl_rearm_pending: Vec<u32>,
+    /// Dynamic default-arm edge masks for single-writer combinational `case`/`if`
+    /// `CompiledAlwaysBlock` entries (`CaseCtl`).
+    case_ctl: Vec<CaseCtl>,
+    /// `case_ctl_by_entry[eidx]` holds the `case_ctl` slot index, or `u32::MAX`.
+    /// Empty when no combinational always block qualifies.
+    case_ctl_by_entry: Vec<u32>,
+    /// `(destination signal, slot)` of every `CaseCtl`, sorted: an external
+    /// write (deposit / VPI / force / release) re-arms it.
+    case_ctl_dsts: Vec<(u32, u32)>,
+    /// `case_ctl` slots re-armed while the settle held the dependency edges.
+    case_ctl_rearm_pending: Vec<u32>,
     /// XEZIM_CTL_MASK=0, or a settle mode that evaluates entries outside the
     /// canonical loop (partitioned / level-BSP), turns the skip off.
     ctl_on: bool,

@@ -194,11 +194,39 @@ pub(super) struct TsCtl {
     pub(super) pos1: u32,
     pub(super) npos1: u32,
     pub(super) smask1: u64,
-    /// Whether the edges above currently hold `mask == 0`.
-    pub(super) masked: bool,
+    /// Dynamic mask state of `(pos0, pos1)`:
+    /// `0` = neither masked, `1` = `pos0` masked / `pos1` active,
+    /// `2` = `pos0` active / `pos1` masked, `3` = both masked.
+    pub(super) mask_state: u8,
     /// For `TS_AND2` / `TS_OR2`: true when `sig2` is the controlling input
     /// (and `sig1` is masked); false when `sig1` is controlling.
     pub(super) ctl_is_sig2: bool,
+}
+
+/// Dynamic per-arm edge mask for single-writer combinational `always` blocks
+/// dispatched by a `case` or `if` selector (`CaseJump`, `CmpBranchConst`
+/// chain, or `BranchIfSignalFalse`). For each selector value `v`, bit `i` of
+/// `arm_masks[v]` (or `default_mask` when `v >= arm_masks.len()`) is `1` iff
+/// edge `i` is NOT read by the arm taken for `v` and can carry `mask = 0`
+/// while the selector stays steady.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct CaseCtl {
+    /// Primary selector signal (`sel_lo0..sel_lo0+sel_w0`).
+    pub(super) sel_sig0: u32,
+    pub(super) sel_lo0: u16,
+    pub(super) sel_w0: u16,
+    /// Optional second 1-bit selector signal for `{sel_sig0[sel_lo0], sel_sig1[sel_lo1]}`
+    /// concats (`u32::MAX` for a single-signal selector).
+    pub(super) sel_sig1: u32,
+    pub(super) sel_lo1: u16,
+    /// Per-selector-value maskable-edge bitset (up to 64 maskable edges).
+    pub(super) arm_masks: Box<[u64]>,
+    /// Maskable-edge bitset for selector values `>= arm_masks.len()`.
+    pub(super) default_mask: u64,
+    /// Dependency edge spans `(pos, npos, smask)` in `comb_dep_edges`.
+    pub(super) edges: Box<[(u32, u32, u64)]>,
+    /// Bit `i` is 1 iff `edges[i]` currently carries `mask = 0`.
+    pub(super) cur_masked: u64,
 }
 
 /// A continuous mux with equal-width, in-bounds descending ranges. Arms

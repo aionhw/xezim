@@ -101,6 +101,11 @@ pub(super) struct EventWaiters {
     hook_stamp: u64,
     /// Scratch for the drain's candidates.
     pub(super) cand_buf: Vec<u64>,
+    /// Compact L1-resident list of currently indexed signal IDs (those with
+    /// `sigs[id].live > 0`) when there are at most 16 of them; `u8::MAX` means
+    /// more than 16 and callers fall back to probing `watch[id]`.
+    watch_small: [u32; 16],
+    watch_small_len: u8,
 }
 
 impl EventWaiters {
@@ -149,6 +154,49 @@ impl EventWaiters {
             self.hooked.resize((id >> 6) + 1, 0);
         }
         self.hooked[id >> 6] |= 1u64 << (id & 63);
+    }
+
+    /// Rebuild the L1-resident small watched-signal list from `self.sigs`.
+    fn refresh_watch_small(&mut self) {
+        let mut n = 0usize;
+        for (&id, s) in &self.sigs {
+            if s.live > 0 {
+                if n >= self.watch_small.len() {
+                    self.watch_small_len = u8::MAX;
+                    return;
+                }
+                self.watch_small[n] = id as u32;
+                n += 1;
+            }
+        }
+        self.watch_small_len = n as u8;
+    }
+
+    /// Check if `id` is watched by an indexed waiter and record the write if
+    /// so. When <= 16 signals are watched (typical SoC testbenches), avoids
+    /// probing the multi-MB `watch` table on every non-quiet write.
+    #[inline(always)]
+    pub(super) fn check_and_note_write(&mut self, id: usize) {
+        let n = self.watch_small_len;
+        if n == 0 {
+            return;
+        }
+        if n <= 16 {
+            let id32 = id as u32;
+            let mut hit = false;
+            for i in 0..n as usize {
+                if unsafe { *self.watch_small.get_unchecked(i) } == id32 {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                return;
+            }
+        }
+        if id < self.watch.len() && self.watch[id] & WATCH_ANY != 0 {
+            self.note_write(id);
+        }
     }
 
     /// A watched signal was written: queue it for whoever asked.
@@ -210,6 +258,7 @@ impl EventWaiters {
                 *f |= WATCH_DRAIN;
             }
         }
+        self.refresh_watch_small();
     }
 
     /// Waiter `seq` left the list.
@@ -218,6 +267,7 @@ impl EventWaiters {
             self.cons.remove(&seq);
             return;
         }
+        let mut dropped = false;
         for id in Self::term_ids(w) {
             let Some(s) = self.sigs.get_mut(&id) else {
                 continue;
@@ -228,7 +278,11 @@ impl EventWaiters {
                 if let Some(f) = self.watch.get_mut(id) {
                     *f &= !WATCH_ANY;
                 }
+                dropped = true;
             }
+        }
+        if dropped {
+            self.refresh_watch_small();
         }
     }
 

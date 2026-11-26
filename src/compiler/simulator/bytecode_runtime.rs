@@ -2032,6 +2032,9 @@ impl Simulator {
                         self.ts_edge_abortn[block_idx].saturating_add(1);
                     if self.ts_edge_abortn[block_idx] >= TS_ABORT_DEMOTE {
                         self.ts_edge[block_idx] = TsSlot::No;
+                        if let Some(h) = self.ts_edge_hdr.get_mut(block_idx) {
+                            h.len_kind = 0;
+                        }
                     }
                 }
             }
@@ -2051,6 +2054,10 @@ impl Simulator {
             }
         }
         // Interpreter path.
+        self.exec_bytecode_interp(block_idx)
+    }
+
+    pub(super) fn exec_bytecode_interp(&mut self, block_idx: usize) -> bool {
         if !self.ts_sleep.is_empty() {
             if let Some(c) = self.ts_asleep_edge.get_mut(block_idx) {
                 if *c != 0 {

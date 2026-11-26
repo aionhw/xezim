@@ -2873,7 +2873,10 @@ pub fn lower_two_state(
                     }
                 });
             }
-            Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
+            Insn::BitXor(d, a, b)
+            | Insn::BitXnor(d, a, b)
+            | Insn::BitAnd(d, a, b)
+            | Insn::BitOr(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
                 let (aw, bw) = (wa > 64, wb > 64);
                 if aw != bw {
@@ -2885,22 +2888,42 @@ pub fn lower_two_state(
                 if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
                     gate!("signed widening (bitop)");
                 }
-                def!(rw, *d, wa.max(wb));
+                let w = wa.max(wb);
+                if aw && w > 512 {
+                    gate!("wide bitop >512b");
+                }
+                def!(rw, *d, w);
                 sg[*d as usize] = both_sg;
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                out.push(if aw {
+                if aw {
                     match insn {
-                        Insn::BitXor(..) => TsInsn::WXor { d, a, b },
-                        Insn::BitAnd(..) => TsInsn::WAnd { d, a, b },
-                        _ => TsInsn::WOr { d, a, b },
+                        Insn::BitXor(..) => out.push(TsInsn::WXor { d, a, b }),
+                        Insn::BitXnor(..) => {
+                            out.push(TsInsn::WXor { d, a, b });
+                            out.push(TsInsn::WNot {
+                                d,
+                                s: d,
+                                w: w as u16,
+                            });
+                        }
+                        Insn::BitAnd(..) => out.push(TsInsn::WAnd { d, a, b }),
+                        _ => out.push(TsInsn::WOr { d, a, b }),
                     }
                 } else {
                     match insn {
-                        Insn::BitXor(..) => TsInsn::Xor { d, a, b },
-                        Insn::BitAnd(..) => TsInsn::And { d, a, b },
-                        _ => TsInsn::Or { d, a, b },
+                        Insn::BitXor(..) => out.push(TsInsn::Xor { d, a, b }),
+                        Insn::BitXnor(..) => {
+                            out.push(TsInsn::Xor { d, a, b });
+                            out.push(TsInsn::Not {
+                                d,
+                                s: d,
+                                mask: ts_mask(w),
+                            });
+                        }
+                        Insn::BitAnd(..) => out.push(TsInsn::And { d, a, b }),
+                        _ => out.push(TsInsn::Or { d, a, b }),
                     }
-                });
+                }
             }
             Insn::BitNot(d, s) => {
                 let w = rw[*s as usize]?;
