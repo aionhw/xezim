@@ -10,6 +10,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Round VPI-forced `shortreal` values to binary32 (§6.12, §38.34).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
