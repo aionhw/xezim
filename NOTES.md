@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Real coverpoint bin arrays (`bins b[]` and `bins b[N]`) partition ranges by
+  `real_interval` and count hits across interval boundaries, and real cross
+  `intersect` selectors match overlapping real bins (§19.5.1, §19.6.1, §19.7.1,
+  §19.11.1, #NNNN).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
