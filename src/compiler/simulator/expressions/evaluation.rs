@@ -1810,12 +1810,7 @@ impl Simulator {
                 };
                 match op {
                     UnaryOp::Plus => v,
-                    UnaryOp::Minus => {
-                        let mut r = Value::zero(v.width).sub(&v).resize(v.width);
-                        // §11.8.1: unary minus preserves its operand type.
-                        r.is_signed = v.is_signed;
-                        r
-                    }
+                    UnaryOp::Minus => Self::negate_value(&v),
                     UnaryOp::LogNot => v.logic_not(),
                     UnaryOp::BitNot => v.bitwise_not(),
                     UnaryOp::BitAnd => v.reduce_and(),
