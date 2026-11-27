@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Reject a variable driven through output ports by instances in generate
+  blocks (loop iterations, or a generate branch beside a module-level
+  instance) as having multiple continuous drivers, as two explicit
+  instances already were (§6.5, §23.3.3, §27.4, aionhw/xezim-core#306).
 - Preserve full packed offsets in native slice reads and case-arm masking,
   and restore dynamic dependency masks with their controller state
   (§11.5.1, §12.5, Annex D.9).
