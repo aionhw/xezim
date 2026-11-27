@@ -939,3 +939,6 @@ mod packed_struct_input_actual_1645;
 
 #[path = "types/chapter6_nets_1638.rs"]
 mod chapter6_nets_1638;
+
+#[path = "types/typename_nested_pkg.rs"]
+mod typename_nested_pkg;
