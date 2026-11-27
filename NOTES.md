@@ -14,6 +14,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
   (§23.11, §20.12, §21.7.1.2, #721).
+- Reject a variable driven through output ports by instances in generate
+  blocks (loop iterations, or a generate branch beside a module-level
+  instance) as having multiple continuous drivers, as two explicit
+  instances already were (§6.5, §23.3.3, §27.4, aionhw/xezim-core#306).
 - Preserve full packed offsets in native slice reads and case-arm masking,
   and restore dynamic dependency masks with their controller state
   (§11.5.1, §12.5, Annex D.9).
