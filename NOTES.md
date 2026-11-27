@@ -12,6 +12,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 - Preserve the minus sign on negative zero (`-0.0`) in `%g` / `%G` formatting
   and `string.realtoa()` (§6.16.15, §21.2.1.1, §21.3.3).
+- Preserve the sign of zero in unary minus on `real`, `shortreal`, and
+  `realtime` values (§6.12, §11.4.3).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
