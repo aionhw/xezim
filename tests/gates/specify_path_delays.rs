@@ -953,3 +953,40 @@ endmodule
     );
     check("CLI SDF", &out, &expected);
 }
+
+/// §32.4.4 (#1650): selected vector port sources retain their wire delay.
+#[test]
+fn sdf_interconnect_source_accepts_packed_port_bits() {
+    let src = r#"`timescale 1ps/1ps
+module link(input a, output y);
+  buf (y, a);
+  specify (a => y) = 0; endspecify
+endmodule
+module sub(input [4:3] i, input s, output [2:0] y);
+  link u0(i[3], y[0]), u1(i[4], y[1]), us(s, y[2]);
+endmodule
+module tb;
+  reg [4:3] i = 0;
+  reg s = 0;
+  wire [2:0] y;
+  sub d(i,s,y);
+  initial begin $sdf_annotate("d.sdf", d); #100 i = 3; s = 1; #100 $finish; end
+  always @(posedge y[0]) $display("%0t ps bit3=1", $time);
+  always @(posedge y[1]) $display("%0t ps bit4=1", $time);
+  always @(posedge y[2]) $display("%0t ps scalar=1", $time);
+endmodule
+"#;
+    let sdf = r#"(DELAYFILE (DIVIDER /) (TIMESCALE 1ps)
+      (CELL (CELLTYPE "sub") (INSTANCE)
+        (DELAY (ABSOLUTE (INTERCONNECT i[3] u0/a (7))
+                         (INTERCONNECT i\[4\] u1/a (8))
+                         (INTERCONNECT s us/a (9)))))
+      (CELL (CELLTYPE "link") (INSTANCE *)
+        (DELAY (ABSOLUTE (IOPATH a y (10))))))"#;
+    let output = run("vector_port_interconnect", src, &[("d.sdf", sdf)], &[]);
+    check(
+        "interconnect from vector port bits",
+        &output,
+        &["117 bit3=1", "118 bit4=1", "119 scalar=1"],
+    );
+}

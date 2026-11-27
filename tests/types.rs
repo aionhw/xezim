@@ -942,3 +942,6 @@ mod chapter6_nets_1638;
 
 #[path = "types/typename_nested_pkg.rs"]
 mod typename_nested_pkg;
+
+#[path = "types/elaboration_scope_and_value_width.rs"]
+mod elaboration_scope_and_value_width;

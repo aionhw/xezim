@@ -647,3 +647,6 @@ mod unpacked_slice_nba_1644;
 
 #[path = "scheduling/intra_delay_signed_exponent.rs"]
 mod intra_delay_signed_exponent;
+
+#[path = "scheduling/delayed_generate_and_compound_lhs.rs"]
+mod delayed_generate_and_compound_lhs;

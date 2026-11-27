@@ -1425,3 +1425,8 @@ mod param_static_collections;
 
 #[path = "classes/inherited_packed_typedef_cousins.rs"]
 mod inherited_packed_typedef_cousins;
+
+#[path = "classes/indexed_compare_dispatch.rs"]
+mod indexed_compare_dispatch;
+#[path = "classes/static_collection_member_scope.rs"]
+mod static_collection_member_scope;

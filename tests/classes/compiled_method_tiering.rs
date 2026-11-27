@@ -589,3 +589,32 @@ fn step_vm_count(profile: &str) -> u64 {
     }
     vm
 }
+
+/// §7.10, §8.10 (#1666): use the object handle for an explicit
+/// `this.q` collection receiver in compiled code.
+#[test]
+fn dotted_collection_methods_compile_with_the_owner_handle() {
+    let source = r#"
+class row;
+  int q[$];
+  function int step(int value);
+    this.q.push_back(value);
+    return this.q.size();
+  endfunction
+endclass
+module top;
+  initial begin
+    row r = new;
+    int sum = 0;
+    for (int i = 0; i < 32; i++) sum += r.step(i);
+    $display("TAG %0d %0d", sum, r.q[31]);
+    $finish;
+  end
+endmodule
+"#;
+    let (interpreted, _, _) = run_with_admission(source, "1000000");
+    let (compiled, admitted, _) = run_with_admission(source, "0");
+    assert_eq!(interpreted, "TAG 528 31");
+    assert_eq!(compiled, interpreted);
+    assert!(admitted > 0, "no method body was admitted");
+}

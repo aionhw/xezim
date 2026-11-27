@@ -436,3 +436,6 @@ mod local_coll_elem_compare_1497;
 
 #[path = "collections/row_read_operands.rs"]
 mod row_read_operands;
+
+#[path = "collections/dynamic_row_input_foreach.rs"]
+mod dynamic_row_input_foreach;
