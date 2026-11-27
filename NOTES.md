@@ -10,6 +10,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Reject `vpiStringVal` deposits and forces on `real`, `shortreal`, and
+  `realtime` variables and real-typed nets with `vpiError` (§6.12, §38.34).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
