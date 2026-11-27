@@ -68,10 +68,9 @@ fn interval_boundary(lo: f64, width: f64, decimal: Option<(i128, i128, i32)>, i:
             return bound;
         }
     }
-    // Exponents too far apart for the common integer scale. Retain the
-    // 15 significant decimal digits guaranteed by binary64 here.
-    let bound = (i as f64).mul_add(width, lo);
-    format!("{bound:.14e}").parse().unwrap_or(bound)
+    // A common decimal scale can overflow. Compute the binary64 boundary
+    // with one rounding so distinct adjacent real samples stay distinct.
+    (i as f64).mul_add(width, lo)
 }
 
 #[derive(Clone, Copy)]
