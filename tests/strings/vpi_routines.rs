@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("xezim_{}_{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    let made = Command::new("mktemp")
+        .arg("-d")
+        .arg(std::env::temp_dir().join(format!("xezim_{tag}.XXXXXX")))
+        .output()
+        .expect("failed to launch mktemp");
+    assert!(made.status.success(), "{made:?}");
+    PathBuf::from(String::from_utf8(made.stdout).unwrap().trim_end())
 }
 
 fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
@@ -51,19 +54,25 @@ fn run_status(
     env: &[(&str, &str)],
     must_succeed: bool,
 ) -> String {
-    use std::io::Read;
     std::fs::write(dir.join("top.sv"), sv).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg(flag)
         .arg(lib)
-        .args(["--no-cache", "-s", "top", "top.sv"])
-        .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .args(["--no-cache", "-s", "top", "top.sv"]);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("failed to run xezim");
+    run_command(dir, cmd, must_succeed)
+}
+
+fn run_command(dir: &Path, mut cmd: Command, must_succeed: bool) -> String {
+    use std::io::Read;
+    let mut child = cmd
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run xezim");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let status = loop {
         if let Some(s) = child.try_wait().expect("try_wait") {
@@ -901,6 +910,259 @@ fn vpi_strength_and_value_formats() {
             "P hx3=a5 tv=4294967298 ri=4 rr=5",
         ],
     );
+}
+
+const STRINGVAL_REAL_C: &str = r#"
+#include <string.h>
+#include "vpi_user.h"
+
+static unsigned pli_errors;
+
+static PLI_INT32 on_pli_error(p_cb_data cb) {
+    (void)cb;
+    ++pli_errors;
+    return 0;
+}
+
+static void check(int ok, const char *what, const char *name, int code) {
+    if (!ok) vpi_printf("FAIL: %s on %s (format or flag %d)\n", what, name, code);
+}
+
+static double read_real(vpiHandle h, const char *name) {
+    s_vpi_value value = { .format = vpiRealVal };
+    vpi_get_value(h, &value);
+    check(vpi_chk_error(NULL) == 0 && value.format == vpiRealVal,
+          "vpiRealVal read", name, vpiRealVal);
+    return value.value.real;
+}
+
+static void check_string(vpiHandle h, const char *name, const char *expected) {
+    s_vpi_value value = { .format = vpiStringVal };
+    vpi_get_value(h, &value);
+    check(vpi_chk_error(NULL) == 0 && value.format == vpiStringVal && value.value.str &&
+          strcmp(value.value.str, expected) == 0, "vpiStringVal read", name, vpiStringVal);
+}
+
+static void check_rejection(PLI_BYTE8 *name, double expected, s_vpi_value *value) {
+    vpiHandle h = vpi_handle_by_name(name, NULL);
+    check(h && read_real(h, name) == expected, "initial value", name, 0);
+    const int flags[] = { vpiNoDelay, vpiForceFlag };
+    for (unsigned i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        unsigned before = pli_errors;
+        vpiHandle result = vpi_put_value(h, value, NULL, flags[i]);
+        s_vpi_error_info error;
+        int severity = vpi_chk_error(&error);
+        check(result == NULL, "NULL result", name, flags[i]);
+        check(severity == vpiError && error.level == vpiError, "vpiError", name, flags[i]);
+        check(pli_errors == before + 1, "one cbPLIError", name, flags[i]);
+        check(read_real(h, name) == expected, "unchanged value", name, flags[i]);
+    }
+}
+
+static void check_child_port(PLI_BYTE8 *name) {
+    vpiHandle h = vpi_handle_by_name(name, NULL);
+    check(h != NULL, "child port handle", name, 0);
+    s_vpi_value value = { .format = vpiStringVal, .value.str = "ABC" };
+    unsigned before = pli_errors;
+    vpi_put_value(h, &value, NULL, vpiNoDelay);
+    check(vpi_chk_error(NULL) == 0, "child port put succeeds", name, value.format);
+    check(pli_errors == before, "no cbPLIError", name, vpiNoDelay);
+    check_string(h, name, "ABC");
+}
+
+static void check_release(s_vpi_value *string_value) {
+    PLI_BYTE8 *name = "top.released";
+    vpiHandle h = vpi_handle_by_name(name, NULL);
+    s_vpi_value force = { .format = vpiRealVal, .value.real = 1.25 };
+    vpi_put_value(h, &force, NULL, vpiForceFlag);
+    check(vpi_chk_error(NULL) == 0 && read_real(h, name) == 1.25,
+          "real force succeeds", name, vpiForceFlag);
+    unsigned before = pli_errors;
+    vpi_put_value(h, string_value, NULL, vpiReleaseFlag);
+    check(vpi_chk_error(NULL) == 0, "release with string succeeds", name, vpiReleaseFlag);
+    check(pli_errors == before, "no cbPLIError", name, vpiReleaseFlag);
+    check(read_real(h, name) == 1.25, "release leaves variable value", name, vpiReleaseFlag);
+}
+
+static void check_numeric_puts(PLI_BYTE8 *name) {
+    vpiHandle h = vpi_handle_by_name(name, NULL);
+    s_vpi_vecval words[2] = { { .aval = 42 } };
+    struct {
+        s_vpi_value value;
+        double expected;
+    } cases[] = {
+        { { .format = vpiIntVal, .value.integer = -5 }, -5.0 },
+        { { .format = vpiRealVal, .value.real = 1.25 }, 1.25 },
+        { { .format = vpiShortRealVal, .value.real = 0.5 }, 0.5 },
+        { { .format = vpiScalarVal, .value.scalar = vpi1 }, 1.0 },
+        { { .format = vpiVectorVal, .value.vector = words }, 42.0 },
+        { { .format = vpiBinStrVal, .value.str = "101" }, 5.0 },
+        { { .format = vpiOctStrVal, .value.str = "10" }, 8.0 },
+        { { .format = vpiDecStrVal, .value.str = "23" }, 23.0 },
+        { { .format = vpiHexStrVal, .value.str = "2a" }, 42.0 },
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        s_vpi_value *value = &cases[i].value;
+        vpi_put_value(h, value, NULL, vpiNoDelay);
+        check(vpi_chk_error(NULL) == 0, "numeric put succeeds", name, value->format);
+        check(read_real(h, name) == cases[i].expected, "numeric value", name, value->format);
+    }
+}
+
+void stringval_real_probe(int artifact) {
+    s_cb_data cb = { .reason = cbPLIError, .cb_rtn = on_pli_error };
+    vpiHandle callback = vpi_register_cb(&cb);
+    check(callback != NULL, "register callback", "cbPLIError", 0);
+
+    s_vpi_value value = { .format = vpiStringVal, .value.str = "1.5" };
+    check_rejection("top.r", 2.5, &value);
+    check_rejection("top.sr", 3.5, &value);
+    check_rejection("top.rt", 4.5, &value);
+    check_rejection("top.rnet", 5.5, &value);
+    check_rejection("top.srnet", 6.5, &value);
+    check_rejection("top.reals[0]", 7.5, &value);
+    check_rejection("top.grid[1][0]", 9.5, &value);
+    check_rejection("top.alias_r", 10.5, &value);
+    check_rejection("top.alias_sr", 11.5, &value);
+    check_rejection("top.members.r", 12.5, &value);
+    check_rejection("top.members.sr", 13.5, &value);
+    check_rejection("top.u.local_r", 14.5, &value);
+    check_rejection("top.u.real_port", 15.5, &value);
+    check_rejection("probe_pkg::r", 16.5, &value);
+    check_rejection("top.i.r", 17.5, &value);
+    check_rejection("top.g.r", 18.5, &value);
+
+    check_child_port(artifact ? "top.u.val" : "u.val");
+    check_child_port(artifact ? "top.u.short_val" : "u.short_val");
+    s_vpi_value abc = { .format = vpiStringVal, .value.str = "ABC" };
+    check_rejection("top.val", 2.5, &abc);
+    check_rejection("top.short_val", 3.5, &abc);
+    check_release(&abc);
+
+    check_string(vpi_handle_by_name("top.r", NULL), "top.r", "2.5");
+    check_numeric_puts("top.r");
+    check_numeric_puts("top.sr");
+
+    PLI_BYTE8 *names[] = { "top.text", "top.bits", "top.regbits" };
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        vpiHandle h = vpi_handle_by_name(names[i], NULL);
+        vpi_put_value(h, &value, NULL, vpiNoDelay);
+        check(vpi_chk_error(NULL) == 0, "vpiStringVal put succeeds", names[i], value.format);
+        check_string(h, names[i], "1.5");
+    }
+
+    vpiHandle array = vpi_handle_by_name("top.reals", NULL);
+    s_vpi_arrayvalue values = { .format = vpiStringVal, .value.rawvals = "1.5" };
+    PLI_INT32 index = 0;
+    vpi_put_value_array(array, &values, &index, 2);
+    check(vpi_chk_error(NULL) == vpiError, "array put raises vpiError", "top.reals", values.format);
+    vpi_remove_cb(callback);
+    vpi_printf("CHK|stringval_real\n");
+}
+"#;
+
+const STRINGVAL_REAL_SV: &str = r#"
+package probe_pkg;
+  real r = 16.5;
+endpackage
+
+interface probe_if;
+  real r = 17.5;
+endinterface
+
+module child(output logic [23:0] val, output reg [23:0] short_val, output real real_port);
+  real local_r = 14.5;
+  assign real_port = local_r + 1.0;
+  initial begin
+    val = '0;
+    short_val = '0;
+  end
+endmodule
+
+module top;
+  nettype real RealNet;
+  nettype shortreal ShortRealNet;
+  real r = 2.5;
+  shortreal sr = 3.5;
+  realtime rt = 4.5;
+  real driver = 5.5;
+  RealNet rnet;
+  ShortRealNet srnet;
+  assign rnet = driver;
+  assign srnet = shortreal'(driver + 1.0);
+
+  string text = "old";
+  logic [23:0] bits = '0;
+  reg [31:0] regbits = '0;
+  real reals [0:1] = '{7.5, 8.5};
+  real grid [0:1][0:1];
+  typedef real RealAlias;
+  typedef shortreal ShortRealAlias;
+  RealAlias alias_r = 10.5;
+  ShortRealAlias alias_sr = 11.5;
+  typedef struct { real r; shortreal sr; } RealMembers;
+  RealMembers members = '{12.5, 13.5};
+
+  real val = 2.5;
+  shortreal short_val = 3.5;
+  real released = 0.0;
+  wire [23:0] child_val, child_short_val;
+  real child_real;
+  child u(.val(child_val), .short_val(child_short_val), .real_port(child_real));
+  probe_if i();
+  if (1) begin : g
+    real r = 18.5;
+  end
+
+  import "DPI-C" context function void stringval_real_probe(input int artifact);
+
+  initial begin
+    grid[1][0] = 9.5;
+    #1 stringval_real_probe($test$plusargs("artifact"));
+    rt = 9.5;
+    released = 19.5;
+    driver = 10.5;
+    #1;
+    $display("CHK|vars|%g|%g|%g", r, sr, rt);
+    $display("CHK|nets|%g|%g", rnet, srnet);
+    $display("CHK|string|%s", text);
+    $display("CHK|packed|%h|%h", bits, regbits);
+    $display("CHK|array|%g|%g", reals[0], reals[1]);
+    $display("CHK|collisions|%h|%h|%g|%g", u.val, u.short_val, val, short_val);
+    $display("CHK|released|%g", released);
+    $finish;
+  end
+endmodule
+"#;
+
+/// IEEE 1800-2023 §38.34 rejects vpiStringVal puts to real targets (§6.12).
+#[test]
+fn vpi_stringval_put_rejects_real_targets() {
+    let d = scratch("vpi_stringval_real");
+    let lib = shared_lib(&d, "stringval_real", STRINGVAL_REAL_C);
+    let source = run(&d, "--dpi-lib", &lib, STRINGVAL_REAL_SV, &[]);
+    let mut compile = Command::new(env!("CARGO_BIN_EXE_xezim"));
+    compile.args(["--compile", "--no-cache", "-o", "top.xezbc", "-s", "top", "top.sv"]);
+    run_command(&d, compile, true);
+    let mut reload = Command::new(env!("CARGO_BIN_EXE_xezim"));
+    reload.args(["top.xezbc", "+artifact", "--dpi-lib"]).arg(&lib);
+    let artifact = run_command(&d, reload, true);
+    let _ = std::fs::remove_dir_all(&d);
+    for text in [&source, &artifact] {
+        expect(
+            text,
+            &[
+                "CHK|stringval_real",
+                "CHK|vars|42|42|9.5",
+                "CHK|nets|10.5|11.5",
+                "CHK|string|1.5",
+                "CHK|packed|312e35|00312e35",
+                "CHK|array|7.5|8.5",
+                "CHK|collisions|414243|414243|2.5|3.5",
+                "CHK|released|19.5",
+            ],
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
