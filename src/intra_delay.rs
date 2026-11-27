@@ -110,12 +110,44 @@ fn define_line_end(b: &[u8], mut i: usize) -> usize {
     b.len()
 }
 
-/// Given `i` at the `#` of an intra-assignment delay, return
-/// `(delay_end, semi)` where `src[i+1..delay_end]` is the delay expression
-/// text (paren-wrapped or a single literal/identifier token) and `semi`
-/// indexes the statement's terminating `;`. `None` means "leave unchanged".
+/// IEEE 1800-2023 §5.7.2 and §9.4.5: a bare delay can be a real literal.
+/// Extend the scan across an adjacent exponent sign only after a whole
+/// numeric mantissa and exponent letter, so a sign on the RHS stays there.
+fn extend_signed_real_delay(b: &[u8], start: usize, end: usize) -> usize {
+    if !matches!(b.get(end), Some(b'+' | b'-'))
+        || !b.get(end + 1).is_some_and(u8::is_ascii_digit)
+    {
+        return end;
+    }
+    let [first, mantissa @ .., b'e' | b'E'] = &b[start..end] else {
+        return end;
+    };
+    if !first.is_ascii_digit() {
+        return end;
+    }
+
+    let is_decimal = |c: &u8| c.is_ascii_digit() || *c == b'_';
+    let integer_len = mantissa.iter().take_while(|c| is_decimal(c)).count();
+    match &mantissa[integer_len..] {
+        [] => {}
+        [b'.', digit, rest @ ..] if digit.is_ascii_digit() && rest.iter().all(is_decimal) => {}
+        _ => return end,
+    }
+    // IEEE 1800-2023 §5.8 and A.8.7: an adjacent unit name starts the RHS.
+    let mut k = end + 2;
+    while b.get(k).is_some_and(is_decimal) {
+        k += 1;
+    }
+    k
+}
+
+/// Given `i` at the first `#` of an intra-assignment delay, return
+/// `(delay_end, semi)`. The delay expression spans from the end of `#` or
+/// `##` to `delay_end`, and `semi` indexes the terminating `;`.
+/// `None` means "leave unchanged".
 fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let j = skip_ws_comments(b, i + 1);
+    let cycle_delay = b.get(i + 1) == Some(&b'#');
+    let j = skip_ws_comments(b, i + 1 + usize::from(cycle_delay));
     let delay_end;
     if j < b.len() && b[j] == b'(' {
         let mut k = j + 1;
@@ -145,7 +177,11 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
         if k == j {
             return None;
         }
-        delay_end = k;
+        delay_end = if cycle_delay {
+            k
+        } else {
+            extend_signed_real_delay(b, j, k)
+        };
     }
     let semi = find_stmt_semi(b, delay_end)?;
     // Empty RHS (`x = #1;` is not an intra-assignment) — leave unchanged.
@@ -372,7 +408,7 @@ pub fn rewrite_intra_assignment_delays_cow(src: &str) -> std::borrow::Cow<'_, st
                 );
             let nba_c = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking_c || nba_c {
-                if let Some((cnt_end, semi)) = extract_delay_and_rhs(b, i + 1) {
+                if let Some((cnt_end, semi)) = extract_delay_and_rhs(b, i) {
                     if define_end.is_none_or(|e| semi < e) {
                         let buf = out.get_or_insert_with(|| String::with_capacity(n + 64));
                         buf.push_str(&src[copied..i]);
@@ -462,6 +498,55 @@ mod tests {
             r,
             "v = $__xz_intra_delay(2, 5);\nx <= $__xz_intra_delay((D*2), w + 1);\n"
         );
+    }
+
+    #[test]
+    fn rewrites_signed_real_delays() {
+        let src = "x = #1.5e-1 7;\nx <= #1_0.5_E+0_1 8;\nx = #1_e-1 9;\n";
+        assert_eq!(
+            rewrite_intra_assignment_delays(src),
+            concat!(
+                "x = $__xz_intra_delay(1.5e-1, 7);\n",
+                "x <= $__xz_intra_delay(1_0.5_E+0_1, 8);\n",
+                "x = $__xz_intra_delay(1_e-1, 9);\n",
+            )
+        );
+    }
+
+    #[test]
+    fn signed_real_delay_token_boundaries() {
+        for (delay, rhs) in [
+            ("#1.5e-1", "ns + 7;"),
+            ("#1.5e-1", "ns;"),
+            ("#1.5e-1", "s;"),
+            ("#1.5e-1", "s * 2;"),
+            ("#1.5e-1", "s[0];"),
+            ("#1.5e-1", "s.a;"),
+            ("#1.5e-1_", "s + 3;"),
+            ("#1e-1", "ns + 7;"),
+            ("#1.5e-1", "s_var;"),
+            ("#1.5e-1", "s$var;"),
+            ("#1.5e-1", "nsvar;"),
+            ("#e", "-1;"),
+            ("#E", "-1;"),
+            ("#d_e", "-1;"),
+            ("#e", "+1;"),
+            ("#1", "-1;"),
+            ("#1", " -v;"),
+            ("##1", " - 1;"),
+            // Malformed exponent and cycle-count fragments retain their old split.
+            ("#1e", " - 1;"),
+            ("#1e", "-v;"),
+            ("#1e", "-_1 7;"),
+            ("#1._5e", "-1 7;"),
+            ("#1.e", "-1 7;"),
+            ("#1.2.3e", "-1 7;"),
+            ("##1e", "-1 7;"),
+        ] {
+            let input = format!("{delay}{rhs}");
+            let (end, semi) = extract_delay_and_rhs(input.as_bytes(), 0).unwrap();
+            assert_eq!((end, semi), (delay.len(), input.len() - 1), "{input}");
+        }
     }
 
     #[test]
