@@ -86,3 +86,10 @@ endmodule
         .collect();
     assert!(out.contains(&"n=111111".to_string()), "{out:?}");
 }
+
+/// A parameterless task call can omit parentheses; a variable read cannot.
+#[test]
+fn a_bare_variable_is_not_a_deferred_action() {
+    let e = rejected("module tb; int value; initial assert #0 (1) value; endmodule");
+    assert!(e.contains("'value' is not a subroutine"), "{e}");
+}
