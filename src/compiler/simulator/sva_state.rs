@@ -60,6 +60,10 @@ pub(super) struct SvaClockEvent {
     pub(super) event: EventExpr,
     pub(super) signal: Option<String>,
     pub(super) previous: Value,
+    /// Dense scalar clock cell. Restored checkpoints can use the expression
+    /// fallback, so this derived index is omitted from the saved state.
+    #[serde(skip)]
+    pub(super) scalar_clock_id: Option<usize>,
 }
 
 /// LRM §16.5 SVA clocked property site. Registered once when an
@@ -107,6 +111,9 @@ pub(super) struct SvaClockedSite {
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
     pub(super) disable: Option<Expression>,
+    /// The guard has no calls or other observable effects while idle.
+    #[serde(skip)]
+    pub(super) quiet_disable: bool,
     /// The clock event happened and the attempts it starts have not been
     /// evaluated yet (`sva_note_edges`).
     pub(super) fired: bool,

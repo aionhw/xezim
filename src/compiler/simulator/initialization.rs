@@ -2096,6 +2096,15 @@ impl Simulator {
                 .packed_signal_elem_widths
                 .retain(|n, _| !assoc.contains_key(n));
         }
+        // §6.21, §27.6: eagerly elaborated processes can also belong to a
+        // generate scope. Give them the same qualified local storage as
+        // pending instance processes before any lexical-collision pass.
+        for block in &mut module.initial_blocks {
+            Self::rename_instance_locals(&mut block.stmt, &block.scope);
+        }
+        for block in &mut module.always_blocks {
+            Self::rename_instance_locals(&mut block.stmt, &block.scope);
+        }
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.

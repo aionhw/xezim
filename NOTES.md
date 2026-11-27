@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Keep named process-block locals distinct across eagerly elaborated generate
+  scopes, and preserve `foreach` indices across timing controls
+  (§6.21, §12.7.3, §27.4, #1651).
+
 - Copy dynamic rows passed to a fixed-array input and preserve suspension in
   `foreach` over a selected row (§7.4.5, §12.7.3, §13.5.1, #1646).
 
@@ -248,8 +252,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
-- Compile dotted collection method calls using the owning object's handle
+- Compile dotted collection method calls using the owning object's handle,
+  including through another object's property or a method argument
   (§7.10, §8.10, #1666).
+- Skip unchanged scalar assertion clocks and avoid evaluating read-only
+  `disable iff` guards while there are no assertion attempts to cancel
+  (§16.12, #1654).
 
 - Dispatch lowered clocked blocks through the two-state arena after native
   dispatch, and update the live event-waiter index as signals enter or leave it.

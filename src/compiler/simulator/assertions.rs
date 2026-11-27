@@ -1005,6 +1005,42 @@ impl Simulator {
         disabled
     }
 
+    /// A guard made of reads and operators has nothing to do when there
+    /// are no attempts or matured procedural instances (§16.12).
+    pub(super) fn sva_quiet_disable(expr: &Expression) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        match &expr.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::SystemCall { name, args } => name == SVA_SIG_MARKER && args.len() == 1,
+            ExprKind::Paren(inner) => Self::sva_quiet_disable(inner),
+            ExprKind::Unary { op, operand } if matches!(op, U::LogNot | U::BitNot) => {
+                Self::sva_quiet_disable(operand)
+            }
+            ExprKind::Binary { op, left, right }
+                if matches!(
+                    op,
+                    B::LogAnd
+                        | B::LogOr
+                        | B::BitAnd
+                        | B::BitOr
+                        | B::BitXor
+                        | B::BitXnor
+                        | B::Eq
+                        | B::Neq
+                        | B::CaseEq
+                        | B::CaseNeq
+                        | B::Lt
+                        | B::Leq
+                        | B::Gt
+                        | B::Geq
+                ) =>
+            {
+                Self::sva_quiet_disable(left) && Self::sva_quiet_disable(right)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn sva_cancel_disabled(&mut self, i: usize) -> bool {
         let disabled = self.sva_site_disabled(i);
         if disabled {
@@ -1935,6 +1971,9 @@ impl Simulator {
     }
 
     fn sva_event_value(&mut self, event: &SvaClockEvent) -> Value {
+        if let Some(id) = event.scalar_clock_id {
+            return self.sva_signal_value(id);
+        }
         match &event.signal {
             Some(name) => self
                 .get_signal_value_by_name(name)
@@ -1948,6 +1987,11 @@ impl Simulator {
     pub(super) fn sva_events_fired(&mut self, events: &mut [SvaClockEvent]) -> bool {
         let mut fired = false;
         for event in events {
+            if let Some(id) = event.scalar_clock_id
+                && self.signal_table[id].get_bit_code(0) == event.previous.get_bit_code(0)
+            {
+                continue;
+            }
             let current = self.sva_event_value(event);
             let bit = |v: &Value| match v.get_bit(0) {
                 LogicBit::Zero => 0,
@@ -2142,10 +2186,21 @@ impl Simulator {
                 }
                 _ => None,
             };
+            let scalar_clock_id = match &event.expr.kind {
+                ExprKind::SystemCall { name, args }
+                    if name == SVA_SIG_MARKER && args.len() == 1 =>
+                {
+                    Self::sva_signal_marker_id(args).filter(|&id| {
+                        self.signal_widths.get(id) == Some(&1) && !self.signal_real[id]
+                    })
+                }
+                _ => None,
+            };
             let mut clock_event = SvaClockEvent {
                 event,
                 signal,
                 previous: Value::all_x(1),
+                scalar_clock_id,
             };
             clock_event.previous = self.sva_event_value(&clock_event);
             // A watched clock had its event in this time step only if it
@@ -2200,6 +2255,7 @@ impl Simulator {
             node: std::sync::Arc::new(node),
             async_abort,
             settled: Vec::new(),
+            quiet_disable: disable.as_ref().is_some_and(Self::sva_quiet_disable),
             disable,
             fired: false,
             attempts: Vec::new(),
@@ -3280,7 +3336,10 @@ impl Simulator {
             let fired = self.sva_events_fired(&mut events);
             self.sva_sites[i].events = events;
             if !fired {
-                self.sva_cancel_disabled(i);
+                let site = &self.sva_sites[i];
+                if !site.quiet_disable || !site.attempts.is_empty() || !site.matured.is_empty() {
+                    self.sva_cancel_disabled(i);
+                }
                 continue;
             }
             self.sva_sites[i].fired = true;
@@ -3668,12 +3727,17 @@ impl Simulator {
         if args.len() == 2 {
             return self.sva_lv_read(args);
         }
-        let id = match args.first().map(|a| &a.kind) {
-            Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) => {
-                value.parse::<usize>().unwrap_or(usize::MAX)
-            }
-            _ => usize::MAX,
-        };
+        self.sva_signal_value(Self::sva_signal_marker_id(args).unwrap_or(usize::MAX))
+    }
+
+    fn sva_signal_marker_id(args: &[Expression]) -> Option<usize> {
+        match &args.first()?.kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn sva_signal_value(&self, id: usize) -> Value {
         let Some(v) = self.signal_table.get(id) else {
             return Value::new(1);
         };

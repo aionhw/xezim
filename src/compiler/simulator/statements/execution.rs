@@ -2202,7 +2202,10 @@ impl Simulator {
                             for i in 0..self.sva_sites.len() {
                                 if !self.sva_sites[i].explicit_disable {
                                     let key = self.sva_sites[i].disable_scope.clone();
-                                    self.sva_sites[i].disable = self.sva_default_disable_for(&key);
+                                    let disable = self.sva_default_disable_for(&key);
+                                    self.sva_sites[i].quiet_disable =
+                                        disable.as_ref().is_some_and(Self::sva_quiet_disable);
+                                    self.sva_sites[i].disable = disable;
                                 }
                             }
                         }

@@ -419,8 +419,11 @@ impl<'a> BytecodeCompiler<'a> {
                 sign
             }
             // §11.5, §13.4.1: a function call has its return type's sign.
-            ExprKind::Call { func, .. } => {
-                if let Some((_, signed)) = self.class_method_return_type(func) {
+            ExprKind::Call { func, args } => {
+                if let Some((_, signed)) = self
+                    .coll_count_return_type(func, args)
+                    .or_else(|| self.class_method_return_type(func))
+                {
                     return Some(signed);
                 }
                 let ExprKind::Ident(h) = &func.kind else {
@@ -952,7 +955,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // §11.6.1: a function call is as wide as its return type; its
                 // arguments are sized by the formals, not by the call's
                 // context (`f(16'(a))` with an 8-bit result is 8 bits).
-                if let Some((w, _)) = self.class_method_return_type(func)
+                if let Some((w, _)) = self
+                    .coll_count_return_type(func, args)
+                    .or_else(|| self.class_method_return_type(func))
                     && w > 0
                 {
                     return w;

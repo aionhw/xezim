@@ -2974,8 +2974,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // that branch would bail. Not admitted (method/arity/receiver
                 // gate) => falls through to the pre-existing paths unchanged.
                 if self.method_mode
-                    && let ExprKind::MemberAccess { expr: base, member } = &func.kind
-                    && let Some(r) = self.compile_coll_method_call(base, member.name.as_str(), args)
+                    && let Some(r) = self.try_compile_coll_call(func, args)
                 {
                     return Some(r);
                 }

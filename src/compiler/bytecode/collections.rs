@@ -927,88 +927,136 @@ impl<'a> BytecodeCompiler<'a> {
     /// enum receivers) — none of them fires for a class member collection
     /// name, and the funnel's `expr_assoc_name`-gated member dispatch
     /// (`eval_call_inner`) routes the admitted shapes here byte-for-byte.
-    pub(super) fn compile_coll_method_call(
-        &mut self,
-        recv: &crate::ast::expr::Expression,
-        meth: &str,
-        args: &[crate::ast::expr::Expression],
-    ) -> Option<RegId> {
-        if !matches!(
-            meth,
-            "size"
-                | "num"
-                | "pop_front"
-                | "pop_back"
-                | "exists"
-                | "delete"
-                | "push_back"
-                | "push_front"
-                | "insert"
-        ) {
-            return None;
-        }
-        let arity_ok = match meth {
-            "size" | "num" | "pop_front" | "pop_back" => args.is_empty(),
-            "exists" | "delete" | "push_back" | "push_front" => args.len() == 1,
-            _ => args.len() == 2, // insert
-        };
-        if !arity_ok {
-            return None;
-        }
-        // Resolve the receiver shape FIRST (pure, no emission), so a
-        // rejection leaves the insn stream untouched. (A row-3 local
-        // receiver is an OWNED marked key — `\x01name` — hence the Cow.)
-        let (coll, base): (std::borrow::Cow<'_, str>, Option<&Expression>) = match &recv.kind {
-            // `q.meth()` — the receiver IS `this.q`.
-            crate::ast::expr::ExprKind::Ident(h)
-                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+    fn coll_call_receiver(func: &Expression) -> Option<(std::borrow::Cow<'_, Expression>, &str)> {
+        use std::borrow::Cow;
+        match &func.kind {
+            ExprKind::MemberAccess { expr, member } => Some((Cow::Borrowed(expr), &member.name)),
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && (2..=3).contains(&h.path.len())
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
             {
-                let name = h.path[0].name.name.as_str();
-                // A block local or formal shadows the member collection.
-                // (`local_var_regs` also carries the result/handle formals,
-                // which are never collection names — the second test is the
-                // load-bearing one for shadowing.)
-                if self.local_var_regs.contains_key(name) {
-                    return None;
-                }
-                // Row 3: a LOCAL queue / dynamic array declared in this
-                // body — receiver marked so the runtime bare arm resolves
-                // the interpreter's per-call `@name#id` store instead of
-                // the `this` member (a same-named member is shadowed).
-                if self.local_coll_names.contains(name) {
-                    (std::borrow::Cow::Owned(Self::local_coll_key(name)), None)
-                } else {
-                    (std::borrow::Cow::Borrowed(name), None)
+                let mut recv = h.clone();
+                recv.path.pop();
+                Some((
+                    Cow::Owned(Expression::new(ExprKind::Ident(recv), func.span)),
+                    &h.path.last()?.name.name,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// A collection count returns an int (§7.5.2, §7.9.1, §7.10.2).
+    /// The type sets the width of other operands in a comparison (§11.8.1).
+    pub(super) fn coll_count_return_type(
+        &self,
+        func: &Expression,
+        args: &[Expression],
+    ) -> Option<(u32, bool)> {
+        if !self.method_mode || !args.is_empty() {
+            return None;
+        }
+        let (recv, method) = Self::coll_call_receiver(func)?;
+        if !matches!(method, "size" | "num") {
+            return None;
+        }
+        self.coll_method_target(&recv)?;
+        Some((32, true))
+    }
+
+    /// Try a collection call in either of the parser's dotted name forms.
+    /// Discard instructions from arguments if lowering cannot finish.
+    pub(super) fn try_compile_coll_call(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+    ) -> Option<RegId> {
+        let (recv, method) = Self::coll_call_receiver(func)?;
+        let start = self.insns.len();
+        let first_reg = self.next_reg;
+        let result = self.compile_coll_method_call(&recv, method, args);
+        if result.is_none() {
+            self.truncate_insns(start);
+            self.next_reg = first_reg;
+        }
+        result
+    }
+
+    fn coll_method_target<'e>(
+        &self,
+        recv: &'e Expression,
+    ) -> Option<(std::borrow::Cow<'e, str>, Option<std::borrow::Cow<'e, Expression>>)> {
+        use std::borrow::Cow;
+
+        let (name, base) = match &recv.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.iter().all(|seg| seg.selects.is_empty()) =>
+            {
+                match h.path.as_slice() {
+                    [seg] => (seg.name.name.as_str(), None),
+                    [_, seg] => (
+                        seg.name.name.as_str(),
+                        Some(Cow::Owned(Self::dotted_head_expr(h))),
+                    ),
+                    _ => return None,
                 }
             }
-            // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
-            // collection `coll` on the object the base evaluates to.
-            crate::ast::expr::ExprKind::MemberAccess {
-                expr: inner,
-                member,
-            } => {
-                // `this.coll` / provably class-typed chain only — TYPED
-                // (Step 9e): the base must really evaluate to a handle.
-                if self.method_handle_chain_class(inner).is_none() {
-                    return None;
-                }
-                (std::borrow::Cow::Borrowed(member.name.as_str()), Some(inner))
+            ExprKind::MemberAccess { expr, member } => {
+                (member.name.as_str(), Some(Cow::Borrowed(expr.as_ref())))
             }
             _ => return None,
         };
-        let bare = base.is_none();
-        // Instance collection (assoc/queue keys, statics excluded) — bare
-        // receivers may additionally be a STATIC collection of the chain.
-        // A marked local receiver is always admitted (row 3).
-        let admitted = self.coll_member_names.contains(coll.as_ref())
-            || (bare && self.static_coll_member_names.contains(coll.as_ref()))
-            || Self::split_local_coll_key(coll.as_ref()).is_some();
-        if !admitted {
+        if let Some(base) = base {
+            let class = self.method_handle_chain_class(&base)?;
+            let admitted = if self.method_class.as_deref() == Some(class.as_str()) {
+                self.coll_member_names.contains(name)
+            } else {
+                self.method_admission.as_ref().is_some_and(|admission| {
+                    admission
+                        .instance_colls
+                        .get(&class)
+                        .is_some_and(|colls| colls.members.contains(name))
+                        || admission
+                            .instance_string_colls
+                            .get(&class)
+                            .is_some_and(|colls| colls.contains(name))
+                })
+            };
+            return admitted.then_some((Cow::Borrowed(name), Some(base)));
+        }
+        // A scalar local shadows member storage. A local collection keeps
+        // the runtime's per-call key and takes precedence over members.
+        if self.local_var_regs.contains_key(name) {
             return None;
         }
+        if self.local_coll_names.contains(name) {
+            return Some((Cow::Owned(Self::local_coll_key(name)), None));
+        }
+        (self.coll_member_names.contains(name) || self.static_coll_member_names.contains(name))
+            .then_some((Cow::Borrowed(name), None))
+    }
+
+    fn compile_coll_method_call(
+        &mut self,
+        recv: &Expression,
+        meth: &str,
+        args: &[Expression],
+    ) -> Option<RegId> {
+        let arity = match meth {
+            "size" | "num" | "pop_front" | "pop_back" => 0,
+            "exists" | "delete" | "push_back" | "push_front" => 1,
+            "insert" => 2,
+            _ => return None,
+        };
+        if args.len() != arity {
+            return None;
+        }
+        let (coll, base) = self.coll_method_target(recv)?;
+        let bare = base.is_none();
         // Receiver handle register: bare => `this`; dotted => the base's
         // handle (a bare member base emits its LoadClassMember here).
-        let handle_reg = if let Some(base) = base {
+        let handle_reg = if let Some(base) = base.as_deref() {
             match self.method_member_handle_reg(base) {
                 Some(r) => r,
                 None => self.compile_expr(base, 0)?,
