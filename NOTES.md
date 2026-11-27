@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Accept an instance a bind adds as the scope argument of an
+  assertion-control or dump task called from a process or subroutine of a
+  sub-instance; it was reported as an undeclared identifier
+  (§23.11, §20.12, §21.7.1.2, #721).
 - Preserve full packed offsets in native slice reads and case-arm masking,
   and restore dynamic dependency masks with their controller state
   (§11.5.1, §12.5, Annex D.9).
@@ -266,6 +270,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `simulator.rs`, `rand_csp.rs`, `expressions.rs`, `statements.rs`,
   `assignments.rs` and `processes.rs`. Public paths, behavior and the cache
   formats are unchanged (#961, raised by philipaxer).
+* The memory trace (`XEZIM_OOM_TRACE`) adds records that can be shared whole
+  from a redacted run: the job's memory limit and usage, the constructs that
+  made bind directives elaborate the design twice, time and memory growth per
+  phase and for the 40 heaviest definitions, `` `include `` file-access
+  counts, and the step and message class of a failure. Lexing and parsing of
+  text preprocessed earlier is labeled `parse source`, no longer `preprocess`
+  (docs/DEBUGGING.md, #721).
 
 ### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
 
