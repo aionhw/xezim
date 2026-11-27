@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Bounded unpacked structure-array input and output ports register typed
+  member signals so `real`, `shortreal`, integral, and four-state member
+  updates propagate across module boundaries (§7.2.2, §7.4.2, §7.6,
+  §23.3.3.2, #NNNN).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
