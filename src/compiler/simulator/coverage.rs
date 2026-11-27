@@ -2,6 +2,78 @@
 
 use super::*;
 
+struct CrossAxis {
+    shape: CpShape,
+    real: bool,
+}
+
+// A sign or parentheses do not introduce arithmetic rounding into a literal bound.
+fn literal_bound(e: &Expression) -> bool {
+    use crate::ast::expr::UnaryOp;
+    match &e.kind {
+        ExprKind::Number(_) => true,
+        ExprKind::Paren(inner)
+        | ExprKind::Unary {
+            op: UnaryOp::Plus | UnaryOp::Minus,
+            operand: inner,
+        } => literal_bound(inner),
+        _ => false,
+    }
+}
+
+// Resolve lo + i * width from the shortest round-trip decimal operands.
+// This keeps 3 * 0.1 at the same binary64 boundary as the literal 0.3,
+// including after cancellation when a range crosses zero (§19.5.1).
+fn decimal_steps(lo: f64, width: f64) -> Option<(i128, i128, i32)> {
+    fn parts(v: f64) -> Option<(i128, i32)> {
+        let text = format!("{v:e}");
+        let (digits, exp) = text.split_once('e')?;
+        let fraction = digits.split_once('.').map_or(0, |(_, f)| f.len() as i32);
+        Some((
+            digits.replace('.', "").parse().ok()?,
+            exp.parse::<i32>().ok()? - fraction,
+        ))
+    }
+    // Small integer operands already have an exact common scale.
+    if lo.abs() <= (1u64 << 53) as f64
+        && width <= (1u64 << 53) as f64
+        && lo.fract() == 0.0
+        && width.fract() == 0.0
+    {
+        return Some((lo as i128, width as i128, 0));
+    }
+    let (low, le) = parts(lo)?;
+    let (step, we) = parts(width)?;
+    let exp = if low == 0 { we } else { le.min(we) };
+    let scale = |n: i128, e: i32| {
+        if n == 0 {
+            Some(0)
+        } else {
+            n.checked_mul(10_i128.checked_pow((e - exp) as u32)?)
+        }
+    };
+    Some((scale(low, le)?, scale(step, we)?, exp))
+}
+
+fn interval_boundary(lo: f64, width: f64, decimal: Option<(i128, i128, i32)>, i: u64) -> f64 {
+    if let Some((low, step, exp)) = decimal
+        && let Some(value) = step
+            .checked_mul(i128::from(i))
+            .and_then(|n| low.checked_add(n))
+    {
+        if exp == 0 {
+            return value as f64;
+        }
+        if let Ok(bound) = format!("{value}e{exp}").parse() {
+            return bound;
+        }
+    }
+    // Exponents too far apart for the common integer scale. Retain the
+    // 15 significant decimal digits guaranteed by binary64 here.
+    let bound = (i as f64).mul_add(width, lo);
+    format!("{bound:.14e}").parse().unwrap_or(bound)
+}
+
 #[derive(Clone, Copy)]
 enum SampleType {
     Real,
@@ -131,9 +203,37 @@ impl Simulator {
         })
     }
 
+    fn cg_real_bound(e: &Expression, dollar: f64, env: &super::elaborate::ParamEnv) -> Option<f64> {
+        if matches!(e.kind, ExprKind::Dollar) {
+            return Some(dollar);
+        }
+        let v = super::elaborate::eval_const_expr_val_env(e, env);
+        (!v.has_xz()).then(|| {
+            let f = v.to_f64();
+            if f == 0.0 { 0.0 } else { f }
+        })
+    }
+
+    fn cg_real_value_range(
+        r: &ConstraintRange,
+        env: &super::elaborate::ParamEnv,
+    ) -> Option<(f64, f64)> {
+        let (lo, hi) = match r {
+            ConstraintRange::Value(e) => {
+                let v = Self::cg_real_bound(e, f64::NAN, env)?;
+                (v, v)
+            }
+            ConstraintRange::Range { lo, hi } => (
+                Self::cg_real_bound(lo, f64::NEG_INFINITY, env)?,
+                Self::cg_real_bound(hi, f64::INFINITY, env)?,
+            ),
+        };
+        (!lo.is_nan() && !hi.is_nan()).then_some((lo, hi))
+    }
+
     fn cg_real_ranges(
         &self,
-        bin: &crate::ast::decl::CoverBin,
+        values: &[ConstraintRange],
         ctor: &[(String, Value)],
     ) -> Vec<(i64, i64)> {
         let params: HashMap<String, Value> = ctor.iter().cloned().collect();
@@ -141,27 +241,198 @@ impl Simulator {
             base: &self.module.parameters,
             top: &params,
         };
-        let bound = |e: &Expression, unbounded| {
-            if matches!(e.kind, ExprKind::Dollar) {
-                return Self::cg_real_key(unbounded);
-            }
-            let v = super::elaborate::eval_const_expr_val_env(e, &env);
-            if v.has_xz() {
-                None
-            } else {
-                Self::cg_real_key(v.to_f64())
-            }
-        };
-        bin.values
+        values
             .iter()
-            .filter_map(|r| match r {
-                ConstraintRange::Value(e) => bound(e, f64::NAN).map(|v| (v, v)),
-                ConstraintRange::Range { lo, hi } => {
-                    let (lo, hi) = (bound(lo, f64::NEG_INFINITY)?, bound(hi, f64::INFINITY)?);
-                    (lo <= hi).then_some((lo, hi))
-                }
+            .filter_map(|r| {
+                let (lo, hi) = Self::cg_real_value_range(r, &env)?;
+                (lo <= hi).then_some((Self::cg_real_key(lo)?, Self::cg_real_key(hi)?))
             })
             .collect()
+    }
+
+    /// §19.5.1: distribute whole real intervals and singletons in declaration
+    /// order. The ranges in CgBin are inclusive ordered keys, even for a
+    /// half-open interval. Its counter name retains the original endpoints.
+    fn cg_real_array_bins(
+        &self,
+        def: &CovergroupDeclaration,
+        cp: &crate::ast::decl::Coverpoint,
+        bin: &crate::ast::decl::CoverBin,
+        base: &str,
+        ctor: &[(String, Value)],
+        sample: Option<f64>,
+    ) -> Option<Vec<CgBin>> {
+        if bin.is_wildcard || bin.with_filter.is_some() || !bin.transitions.is_empty() {
+            return None;
+        }
+        let params = ctor.iter().cloned().collect();
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &params,
+        };
+        // §19.7.1, Table 19-4: the group width is inherited unless the point overrides it.
+        let option = cp
+            .options
+            .iter()
+            .find(|(n, _)| n == "real_interval")
+            .map(|(_, e)| e)
+            .or_else(|| {
+                def.items.iter().find_map(|it| match it {
+                    CovergroupItem::TypeOption { name, val } if name == "real_interval" => {
+                        Some(val)
+                    }
+                    _ => None,
+                })
+            });
+        let width = match option {
+            Some(e) => Self::cg_real_bound(e, f64::NAN, &env)?,
+            None => 1.0,
+        };
+        if !(width.is_finite() && width > 0.0) {
+            return None;
+        }
+        let mut segments = Vec::new();
+        for r in &bin.values {
+            let (lo, hi) = Self::cg_real_value_range(r, &env)?;
+            if lo > hi {
+                continue; // §11.4.13: a reversed range is empty.
+            }
+            segments.push((r, lo, hi, 1, None));
+        }
+        if sample.is_some_and(|v| !segments.iter().any(|&(_, lo, hi, _, _)| lo <= v && v <= hi)) {
+            return Some(Vec::new());
+        }
+        let mut total = 0u64;
+        for (r, lo, hi, count, decimal) in &mut segments {
+            let (lo, hi) = (*lo, *hi);
+            if lo.is_finite() && hi.is_finite() && lo < hi {
+                // Count from the original low bound to avoid cumulative drift.
+                let span = hi - lo;
+                let steps = if span.is_infinite() {
+                    hi / width - lo / width
+                } else {
+                    span / width
+                }
+                .floor();
+                // Decline a partition finer than the representable spacing:
+                // rounding can otherwise assign the low endpoint to a later slot.
+                let spacing = (lo.next_up() - lo).max(hi - hi.next_down());
+                if width < spacing || steps >= (1u64 << 53) as f64 {
+                    return None;
+                }
+                let steps = steps as u64;
+                let check_edge = steps != 0 && span / steps as f64 != width;
+                if check_edge || (steps > 1 && sample.is_none_or(|v| lo <= v && v <= hi)) {
+                    *decimal = decimal_steps(lo, width);
+                }
+                // §19.5.1: LO + N*W and HI - N*W may round at both the
+                // multiplication and the bound. Preserve an explicit literal
+                // remainder when neither bound came from a computation.
+                let partial = check_edge && {
+                    let slack = match r {
+                        ConstraintRange::Range { lo, hi }
+                            if literal_bound(lo) && literal_bound(hi) =>
+                        {
+                            0.0
+                        }
+                        _ => {
+                            // At f64::MAX only the lower neighbor is finite.
+                            let ulp = if width == f64::MAX {
+                                width - width.next_down()
+                            } else {
+                                width.next_up() - width
+                            };
+                            steps as f64 * ulp + 2.0 * spacing
+                        }
+                    };
+                    hi - interval_boundary(lo, width, *decimal, steps) > slack
+                };
+                *count = (steps + u64::from(partial)).max(1);
+            }
+            total = total.checked_add(*count)?;
+        }
+        let n = match &bin.array_size {
+            Some(e) => u64::try_from(self.cg_const_i64(e, ctor)?).ok()?,
+            None => total.max(1),
+        };
+        // Bound materialization as for integral open arrays. A fixed bin can
+        // span many more intervals because its adjacent ranges coalesce.
+        if n == 0 || total.min(n) > 1 << 20 {
+            return None;
+        }
+        let per = (total / n).max(1);
+        let mut bins: Vec<CgBin> = Vec::new();
+        let mut seen = HashSet::default();
+        let mut offset = 0;
+        let mut previous = None;
+        for (r, lo, hi, count, decimal) in segments {
+            let start = offset;
+            offset += count;
+            if sample.is_some_and(|value| value < lo || value > hi) {
+                continue;
+            }
+            let single = matches!(r, ConstraintRange::Value(_));
+            let boundary = |i: u64| match i {
+                0 => lo,
+                i if i == count => hi,
+                i => interval_boundary(lo, width, decimal, i),
+            };
+            let slot = |i: u64| ((start + i) / per).min(n - 1);
+            // A sample reaches at most one slot per source range. Search the
+            // same boundaries used by a query, including its closed last bin.
+            let slots = if let Some(value) = sample {
+                let mut left = 0;
+                let mut right = count;
+                while right - left > 1 {
+                    let mid = left + (right - left) / 2;
+                    if boundary(mid) <= value {
+                        left = mid;
+                    } else {
+                        right = mid;
+                    }
+                }
+                slot(left)..=slot(left)
+            } else {
+                slot(0)..=slot(count - 1)
+            };
+            let mut edge = boundary((*slots.start() * per).saturating_sub(start));
+            for j in slots {
+                let first = edge;
+                let end = if j == n - 1 {
+                    count
+                } else {
+                    count.min((j + 1) * per - start)
+                };
+                let last = boundary(end);
+                edge = last;
+                let closed = end == count;
+                if !closed && first == last {
+                    continue; // rounded half-open interval contains no value
+                }
+                let l = Self::cg_real_key(first)?;
+                let h = Self::cg_real_key(last)?;
+                let range = (l, h - i64::from(!closed));
+                if bin.array_size.is_some() && previous == Some(j) {
+                    bins.last_mut()?.ranges.push(range);
+                } else if bin.array_size.is_some() || seen.insert((l, h, closed, single)) {
+                    let key = if bin.array_size.is_some() {
+                        format!("{base}[{j}]")
+                    } else if single {
+                        format!("{base}[{first:?}]")
+                    } else {
+                        let bracket = if closed { ']' } else { ')' };
+                        format!("{base}[{first:?}:{last:?}{bracket}")
+                    };
+                    bins.push(CgBin {
+                        key: Some(key),
+                        name: bin.name.name.clone(),
+                        ranges: vec![range],
+                    });
+                }
+                previous = Some(j);
+            }
+        }
+        Some(bins)
     }
 
     /// The covergroup definition `new` instantiates for a type name: inside
@@ -1049,25 +1320,29 @@ impl Simulator {
                 cp.bins
                     .iter()
                     .filter(|b| matches!(b.kind, CoverBinKind::Ignore | CoverBinKind::Illegal))
-                    .flat_map(|b| self.cg_real_ranges(b, ctor))
+                    .flat_map(|b| self.cg_real_ranges(&b.values, ctor))
                     .collect(),
             );
-            let bins = cp
-                .bins
-                .iter()
-                .filter(|b| b.kind == CoverBinKind::Bins)
-                .filter_map(|b| {
-                    let ranges = self.cg_real_ranges(b, ctor);
-                    ranges
-                        .iter()
-                        .any(|&(lo, hi)| !excl.iter().any(|&(l, h)| l <= lo && hi <= h))
-                        .then(|| CgBin {
-                            key: Some(format!("{}.{}", cp_name, b.name.name)),
-                            name: b.name.name.clone(),
-                            ranges,
-                        })
-                })
-                .collect();
+            let mut bins = Vec::new();
+            for b in cp.bins.iter().filter(|b| b.kind == CoverBinKind::Bins) {
+                let key = format!("{}.{}", cp_name, b.name.name);
+                if b.array_form
+                    && let Some(array) = self.cg_real_array_bins(def, cp, b, &key, ctor, None)
+                {
+                    bins.extend(array);
+                } else {
+                    bins.push(CgBin {
+                        key: Some(key),
+                        name: b.name.name.clone(),
+                        ranges: self.cg_real_ranges(&b.values, ctor),
+                    });
+                }
+            }
+            bins.retain(|b| {
+                b.ranges
+                    .iter()
+                    .any(|&(lo, hi)| !excl.iter().any(|&(l, h)| l <= lo && hi <= h))
+            });
             return CpShape {
                 bins,
                 auto: None,
@@ -1270,13 +1545,13 @@ impl Simulator {
 
     /// The bins a crossed item contributes (§19.6): its coverpoint's bins,
     /// or automatic bins of the sampled width for a crossed variable.
-    pub(super) fn cg_cross_axis(
+    fn cg_cross_axis(
         &self,
         def: &crate::ast::decl::CovergroupDeclaration,
         name: &str,
         insts: &[&CovergroupInstance],
         width_hint: Option<u32>,
-    ) -> CpShape {
+    ) -> CrossAxis {
         let cp = def.items.iter().find_map(|d| match d {
             CovergroupItem::Coverpoint(cp) if cp.name.as_ref().is_some_and(|n| n.name == name) => {
                 Some(cp)
@@ -1284,7 +1559,10 @@ impl Simulator {
             _ => None,
         });
         match cp {
-            Some(cp) => self.cg_point_shape(def, cp, insts, width_hint),
+            Some(cp) => CrossAxis {
+                shape: self.cg_point_shape(def, cp, insts, width_hint),
+                real: cp.is_real || insts.first().is_some_and(|i| i.real_points.contains(name)),
+            },
             None => {
                 let (space, group, nbins) =
                     Self::cg_auto_shape(Self::cg_sampled_width(name, insts, width_hint), 64);
@@ -1303,10 +1581,13 @@ impl Simulator {
                         }
                     })
                     .collect();
-                CpShape {
-                    bins,
-                    auto: Some((space, group, nbins)),
-                    excl: Vec::new(),
+                CrossAxis {
+                    real: false,
+                    shape: CpShape {
+                        bins,
+                        auto: Some((space, group, nbins)),
+                        excl: Vec::new(),
+                    },
                 }
             }
         }
@@ -1391,14 +1672,14 @@ impl Simulator {
                 // products a user bin selects belong to that bin, and the
                 // products an ignore_bins or illegal_bins selects to none;
                 // the remaining products stay automatic bins.
-                let axes: Vec<CpShape> = cr
+                let axes: Vec<CrossAxis> = cr
                     .items
                     .iter()
                     .map(|it| self.cg_cross_axis(def, &it.name, insts, None))
                     .collect();
                 let n_prod = axes
                     .iter()
-                    .fold(1u64, |t, a| t.saturating_mul(a.bins.len() as u64));
+                    .fold(1u64, |t, a| t.saturating_mul(a.shape.bins.len() as u64));
                 let mut hits: HashMap<Vec<usize>, u64> = HashMap::default();
                 for i in insts {
                     for (t, &c) in i.cross_hits.get(&cr_name).into_iter().flatten() {
@@ -1432,7 +1713,7 @@ impl Simulator {
                         }
                         for k in (0..prod.len()).rev() {
                             prod[k] += 1;
-                            if prod[k] < axes[k].bins.len() {
+                            if prod[k] < axes[k].shape.bins.len() {
                                 continue 'enumerate;
                             }
                             prod[k] = 0;
@@ -1477,10 +1758,10 @@ impl Simulator {
     /// illegal_bins selecting it removes it; otherwise the user bins that
     /// select it, else it is an automatic bin. `guards` (at sampling) masks
     /// the bins whose `iff` is false.
-    pub(super) fn cg_cross_owner(
+    fn cg_cross_owner(
         &self,
         cr: &crate::ast::decl::Cross,
-        axes: &[CpShape],
+        axes: &[CrossAxis],
         prod: &[usize],
         ctor: &[(String, Value)],
         guards: Option<&[bool]>,
@@ -1513,11 +1794,11 @@ impl Simulator {
     }
 
     /// §19.6.1 select_expression over one product of the cross's bins.
-    pub(super) fn cg_select(
+    fn cg_select(
         &self,
         sel: &crate::ast::decl::CrossSelect,
         cr: &crate::ast::decl::Cross,
-        axes: &[CpShape],
+        axes: &[CrossAxis],
         prod: &[usize],
         ctor: &[(String, Value)],
     ) -> bool {
@@ -1527,17 +1808,20 @@ impl Simulator {
                 let Some(k) = cr.items.iter().position(|i| i.name == cp.name) else {
                     return false;
                 };
-                let b = &axes[k].bins[prod[k]];
+                let b = &axes[k].shape.bins[prod[k]];
                 if bin.as_ref().is_some_and(|bn| b.name != bn.name) {
                     return false;
                 }
                 match intersect {
                     None => true,
                     Some(rs) => {
-                        let want: Vec<(i64, i64)> = rs
-                            .iter()
-                            .filter_map(|r| self.cg_range_bounds(r, ctor))
-                            .collect();
+                        let want: Vec<(i64, i64)> = if axes[k].real {
+                            self.cg_real_ranges(rs, ctor)
+                        } else {
+                            rs.iter()
+                                .filter_map(|r| self.cg_range_bounds(r, ctor))
+                                .collect()
+                        };
                         b.ranges
                             .iter()
                             .any(|&(l, h)| want.iter().any(|&(a, c)| l <= c && a <= h))
@@ -1561,11 +1845,11 @@ impl Simulator {
 
     /// `select with (expr)`: true when `expr`, with each crossed item's name
     /// bound to a value of its bin in `prod`, holds for some value tuple.
-    pub(super) fn cg_with_holds(
+    fn cg_with_holds(
         &self,
         e: &Expression,
         cr: &crate::ast::decl::Cross,
-        axes: &[CpShape],
+        axes: &[CrossAxis],
         prod: &[usize],
         ctor: &[(String, Value)],
     ) -> bool {
@@ -1576,13 +1860,13 @@ impl Simulator {
             .enumerate()
             .map(|(k, &b)| {
                 let mut vs = Vec::new();
-                'fill: for &(l, h) in &axes[k].bins[b].ranges {
+                'fill: for &(l, h) in &axes[k].shape.bins[b].ranges {
                     let mut v = l;
                     while v <= h {
                         if vs.len() >= MAX_VALUES {
                             break 'fill;
                         }
-                        if !Self::cg_in_ranges(v, &axes[k].excl) {
+                        if !Self::cg_in_ranges(v, &axes[k].shape.excl) {
                             vs.push(v);
                         }
                         v += 1;
@@ -2168,7 +2452,7 @@ impl Simulator {
     }
 
     /// The product bins (one bin index per axis) a sampled value tuple hits.
-    pub(super) fn cg_tuple_products(axes: &[CpShape], t: &[Value]) -> Vec<Vec<usize>> {
+    fn cg_tuple_products(axes: &[CrossAxis], t: &[Value]) -> Vec<Vec<usize>> {
         if t.len() != axes.len() || t.iter().any(|v| v.has_xz()) {
             return Vec::new();
         }
@@ -2182,7 +2466,7 @@ impl Simulator {
             let Some(value) = value else {
                 return Vec::new();
             };
-            let ids = Self::cg_axis_bins_of(&axes[k], value);
+            let ids = Self::cg_axis_bins_of(&axes[k].shape, value);
             let mut next = Vec::with_capacity(combos.len() * ids.len());
             for c in &combos {
                 for &id in &ids {
@@ -2354,7 +2638,12 @@ impl Simulator {
                                                 | crate::ast::decl::CoverBinKind::Illegal
                                         )
                                     })
-                                    .any(|b| Self::cg_in_ranges(v, &self.cg_real_ranges(b, &ctor)))
+                                    .any(|b| {
+                                        Self::cg_in_ranges(
+                                            v,
+                                            &self.cg_real_ranges(&b.values, &ctor),
+                                        )
+                                    })
                             } else {
                                 Self::cg_in_ranges(v, &self.cg_excluded_ranges(cp, &ctor))
                             }
@@ -2374,9 +2663,27 @@ impl Simulator {
                         if !bin.transitions.is_empty() {
                             continue;
                         }
-                        let matched = if real {
+                        let array = if real
+                            && bin.array_form
+                            && vi.is_some()
+                            && bin.kind == crate::ast::decl::CoverBinKind::Bins
+                        {
+                            self.cg_real_array_bins(
+                                &def,
+                                cp,
+                                bin,
+                                &base_key,
+                                &ctor,
+                                Some(val.to_f64()),
+                            )
+                        } else {
+                            None
+                        };
+                        let matched = if let Some(bins) = &array {
+                            !bins.is_empty()
+                        } else if real {
                             vi.is_some_and(|v| {
-                                Self::cg_in_ranges(v, &self.cg_real_ranges(bin, &ctor))
+                                Self::cg_in_ranges(v, &self.cg_real_ranges(&bin.values, &ctor))
                             })
                         } else if bin.is_wildcard {
                             // LRM §19.5 wildcard match: bit-wise compare with
@@ -2414,8 +2721,12 @@ impl Simulator {
                         }
                         match bin.kind {
                             crate::ast::decl::CoverBinKind::Bins if !excluded => {
-                                bin_increments
-                                    .extend(self.cg_value_bin_keys(bin, &base_key, vi, &ctor));
+                                if let Some(bins) = array {
+                                    bin_increments.extend(bins.into_iter().filter_map(|b| b.key));
+                                } else {
+                                    bin_increments
+                                        .extend(self.cg_value_bin_keys(bin, &base_key, vi, &ctor));
+                                }
                             }
                             crate::ast::decl::CoverBinKind::Illegal => illegal_hits.push(base_key),
                             _ => {}
@@ -2498,7 +2809,7 @@ impl Simulator {
                             let insts = [inst];
                             let scope = Self::cg_bin_scope(inst);
                             let ctor: &[(String, Value)] = &scope;
-                            let axes: Vec<CpShape> = cr
+                            let axes: Vec<CrossAxis> = cr
                                 .items
                                 .iter()
                                 .zip(&tuple)
