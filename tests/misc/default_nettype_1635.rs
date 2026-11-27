@@ -53,17 +53,120 @@ module top(a, b); input a; wire a; output var b; endmodule
 }
 
 #[test]
-fn inferred_ansi_and_nonansi_port_kinds_are_rejected_under_none() {
-    for def in [
-        "module top(input a); endmodule",
-        "module top(a); input a; endmodule",
-    ] {
-        let error = run(&format!("`default_nettype none\n{def}")).unwrap_err();
+fn inferred_nonansi_port_kinds_are_rejected_under_none() {
+    let error = run("`default_nettype none\nmodule top(a); input a; endmodule").unwrap_err();
+    assert!(
+        error.contains("port 'a'") && error.contains("default_nettype none"),
+        "{error}"
+    );
+}
+
+#[test]
+fn inferred_ansi_port_kinds_warn_and_default_to_wire_under_none() {
+    struct TempFile(std::path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("xezim_ansi_nettype_{}.sv", std::process::id()));
+    let _guard = TempFile(path.clone());
+    std::fs::write(
+        &path,
+        r#"
+`default_nettype none
+
+module dut_missing_port_type (
+   input        clk,
+   input  logic rst_n,
+   output logic q
+);
+   always_ff @(posedge clk or negedge rst_n) begin
+      if (!rst_n)
+         q <= 1'b0;
+      else
+         q <= ~q;
+   end
+endmodule
+
+module dut_defaults (
+   input           a,
+   input wire      explicit_wire,
+   input var logic explicit_var,
+   inout           b,
+   output          y
+);
+endmodule
+
+`default_nettype wire
+
+module tb_top;
+   logic clk = 1'b0;
+   logic rst_n = 1'b0;
+   logic q;
+
+   dut_missing_port_type u_dut (
+      .clk   (clk),
+      .rst_n (rst_n),
+      .q     (q)
+   );
+
+   dut_defaults u_def();
+
+   initial begin
+      #1;
+      $display("rst=%b open=%b", q, u_def.a);
+      rst_n = 1'b1;
+      #1 clk = 1'b1;
+      #1;
+      $display("clk=%b", q);
+      $finish;
+   end
+endmodule
+"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg("--no-cache")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("rst=0 open=z"), "{stdout}");
+    assert!(stdout.contains("clk=1"), "{stdout}");
+    assert!(!stderr.contains("error:"), "{stderr}");
+    for port in ["clk", "rst_n", "a", "b", "y"] {
+        let needle = format!("port '{port}'");
         assert!(
-            error.contains("port 'a'") && error.contains("default_nettype none"),
-            "{error}"
+            stderr
+                .lines()
+                .any(|line| line.contains("warning:")
+                    && line.contains(&needle)
+                    && line.contains("`default_nettype none")
+                    && line.contains("wire")),
+            "missing warning for {port} in:\n{stderr}"
         );
     }
+    for explicit in ["'q'", "'explicit_wire'", "'explicit_var'"] {
+        assert!(!stderr.contains(explicit), "unexpected warning for {explicit}:\n{stderr}");
+    }
+
+    // Genuine implicit nets inside a module with an ANSI port warning still error.
+    let error = run(r#"
+`default_nettype none
+module top(input clk);
+   assign ghost = clk;
+endmodule
+"#)
+    .unwrap_err();
+    assert!(
+        error.contains("ghost") && error.contains("default_nettype none"),
+        "{error}"
+    );
 }
 
 #[test]
