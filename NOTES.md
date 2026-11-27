@@ -10,10 +10,54 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Copy dynamic rows passed to a fixed-array input and preserve suspension in
+  `foreach` over a selected row (§7.4.5, §12.7.3, §13.5.1, #1646).
+
+- Size operands of enum casts in constant functions to the enum's base width
+  (§6.19.4, §6.24.1, #1636).
+- Resolve undelayed whole-array drivers of user-defined nettypes per element
+  when elaborating a child lazily (§6.6.7, §7.6, #1655).
+
+- Share class-scoped and handle-based storage for members of static collection
+  elements (§7.8, §7.10, §8.9, §8.23, #1685).
+- Dispatch class methods on indexed handles instead of treating them as string
+  methods (§6.16.6, §8.6, #1639).
+- Resolve generated continuous-assignment delay expressions in their declaring
+  scopes and schedule delayed member, part-select, and concatenation writes
+  (§10.3.3, §23.9, §27.4–§27.5, #1656, #1657).
+- Match SDF interconnect sources that select a bit of a packed vector port
+  (§32.4.4, #1650).
+
+- Preserve the minus sign on negative zero (`-0.0`) in `%g` / `%G` formatting
+  and `string.realtoa()` (§6.16.15, §21.2.1.1, §21.3.3).
+- Preserve the sign of zero in unary minus on `real`, `shortreal`, and
+  `realtime` values (§6.12, §11.4.3).
+- Round VPI-forced `shortreal` values to binary32 (§6.12, §38.34).
+- Accept signed exponents in bare real delays on blocking and nonblocking
+  assignments (§5.7.2, §9.4.5).
+- Bounded unpacked structure-array input and output ports register typed
+  member signals so `real`, `shortreal`, integral, and four-state member
+  updates propagate across module boundaries (§7.2.2, §7.4.2, §7.6,
+  §23.3.3.2, #NNNN).
+- Preserve defining package and class qualifiers for nested typedefs in
+  `$typename()` (§20.6.1).
+- Reject `vpiStringVal` deposits and forces on `real`, `shortreal`, and
+  `realtime` variables and real-typed nets with `vpiError` (§6.12, §38.34).
+- Real coverpoint bin arrays (`bins b[]` and `bins b[N]`) partition ranges by
+  `real_interval` and count hits across interval boundaries, and real cross
+  `intersect` selectors match overlapping real bins (§19.5.1, §19.6.1, §19.7.1,
+  §19.11.1, #NNNN).
 - Accept an instance a bind adds as the scope argument of an
   assertion-control or dump task called from a process or subroutine of a
   sub-instance; it was reported as an undeclared identifier
   (§23.11, §20.12, §21.7.1.2, #721).
+- Reject a variable driven through output ports by instances in generate
+  blocks (loop iterations, or a generate branch beside a module-level
+  instance) as having multiple continuous drivers, as two explicit
+  instances already were (§6.5, §23.3.3, §27.4, aionhw/xezim-core#306).
+- Reject a pass or fail action of a deferred assertion (`assert #0`,
+  `assert final`, and the `assume` and `cover` forms) that is not a single
+  subroutine call (§16.4, aionhw/xezim-core#309).
 - Preserve full packed offsets in native slice reads and case-arm masking,
   and restore dynamic dependency masks with their controller state
   (§11.5.1, §12.5, Annex D.9).
@@ -203,6 +247,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Compile dotted collection method calls using the owning object's handle
+  (§7.10, §8.10, #1666).
 
 - Dispatch lowered clocked blocks through the two-state arena after native
   dispatch, and update the live event-waiter index as signals enter or leave it.

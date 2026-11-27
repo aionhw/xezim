@@ -1242,6 +1242,8 @@ impl Simulator {
             // `tolower`/`toupper` must win over the string builtin.
             if matches!(mname, "tolower" | "toupper")
                 && args.is_empty()
+                && (!matches!(expr.kind, ExprKind::Index { .. })
+                    || self.expr_is_string_valued(expr))
                 && !self.class_expr_has_method(expr, mname)
             {
                 return self
@@ -1263,7 +1265,9 @@ impl Simulator {
                     | "bintoa"
                     | "realtoa"
                     | "atoreal"
-            ) && !self.class_expr_has_method(expr, mname)
+            ) && (!matches!(expr.kind, ExprKind::Index { .. })
+                    || self.expr_is_string_valued(expr))
+                && !self.class_expr_has_method(expr, mname)
             {
                 if let Some(v) = self.string_method(expr, mname, args) {
                     return v;
@@ -1274,6 +1278,8 @@ impl Simulator {
             // Guarded against a user class method of the same name.
             if matches!(mname, "atoi" | "atohex" | "atooct" | "atobin")
                 && args.is_empty()
+                && (!matches!(expr.kind, ExprKind::Index { .. })
+                    || self.expr_is_string_valued(expr))
                 && !self.class_expr_has_method(expr, mname)
             {
                 let s = self.eval_expr(expr).to_sv_string();

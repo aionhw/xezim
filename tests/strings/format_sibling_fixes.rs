@@ -65,6 +65,75 @@ fn g_decides_f_vs_e_after_rounding() {
     assert_eq!(line(&sim, "J="), "J=[0]"); // C/a reference simulator: 0
 }
 
+/// IEEE 1800-2023 §21.2.1.1 and §21.3.3 use C real formatting, including
+/// the minus sign on negative zero. `string.realtoa` (§6.16.15) uses the same
+/// renderer.
+#[test]
+fn g_and_realtoa_preserve_negative_zero() {
+    let sim = simulate(
+        r#"
+module tb;
+  real r;
+  shortreal sr;
+  string fmt, s, r_text, sr_text;
+  initial begin
+    // Use a runtime format because slang rejects %+g in a format literal.
+    fmt = "[%G][%+g]";
+    for (int sign = 0; sign < 2; sign++) begin
+      r = $bitstoreal({sign[0], 63'b0});
+      sr = $bitstoshortreal({sign[0], 31'b0});
+      $display("real%0d=[%g][%G][%0g][%.3g][%8.2g][%08.2g][%-8.2g]",
+               sign, r, r, r, r, r, r, r);
+      s = $sformatf("[%g][%G][%0g][%.3g][%8.2g][%08.2g][%-8.2g]",
+                    sr, sr, sr, sr, sr, sr, sr);
+      $display("shortreal%0d=%s", sign, s);
+      $display("dynamic%0d=%s%s", sign, $sformatf(fmt, r, r), $sformatf(fmt, sr, sr));
+
+      r_text.realtoa(r);
+      sr_text.realtoa(sr);
+      $display("realtoa%0d=[%s][%s]", sign, r_text, sr_text);
+      $display("controls%0d=[%.1f][%.1e][%.1f][%.1e]", sign, r, r, sr, sr);
+
+      $swrite(s, "[%g][%G]", r, sr);
+      $display("swrite%0d=%s", sign, s);
+      $write("write%0d=[%g][%G]\n", sign, r, sr);
+    end
+    $display("small=[%.2f][%.2g]", -1e-10, -1e-10);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed");
+
+    for kind in ["real", "shortreal"] {
+        let positive = format!("{kind}0=");
+        let negative = format!("{kind}1=");
+        assert_eq!(
+            line(&sim, &positive),
+            format!("{positive}[0][0][0][0][       0][00000000][0       ]")
+        );
+        assert_eq!(
+            line(&sim, &negative),
+            format!("{negative}[-0][-0][-0][-0][      -0][-0000000][-0      ]")
+        );
+    }
+    assert_eq!(line(&sim, "dynamic0="), "dynamic0=[0][+0][0][+0]");
+    assert_eq!(line(&sim, "dynamic1="), "dynamic1=[-0][-0][-0][-0]");
+    assert_eq!(line(&sim, "realtoa0="), "realtoa0=[0][0]");
+    assert_eq!(line(&sim, "realtoa1="), "realtoa1=[-0][-0]");
+    assert_eq!(line(&sim, "controls0="), "controls0=[0.0][0.0e+00][0.0][0.0e+00]");
+    assert_eq!(
+        line(&sim, "controls1="),
+        "controls1=[-0.0][-0.0e+00][-0.0][-0.0e+00]"
+    );
+    assert_eq!(line(&sim, "swrite0="), "swrite0=[0][0]");
+    assert_eq!(line(&sim, "swrite1="), "swrite1=[-0][-0]");
+    assert_eq!(line(&sim, "write0=").trim_end(), "write0=[0][0]");
+    assert_eq!(line(&sim, "write1=").trim_end(), "write1=[-0][-0]");
+    assert_eq!(line(&sim, "small="), "small=[-0.00][-1e-10]");
+}
+
 // ------------------------------------------------------------------- F3 --
 
 const RADIX_WIDTH: &str = r#"

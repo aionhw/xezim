@@ -304,7 +304,7 @@ impl Simulator {
     /// (default 6).
     pub(super) fn format_g(x: f64, prec: usize, upper: bool) -> String {
         if x == 0.0 {
-            return "0".to_string();
+            return if x.is_sign_negative() { "-0" } else { "0" }.to_string();
         }
         let p = prec.max(1);
         // C `%g` decides %f-vs-%e on the exponent of the value ROUNDED to p

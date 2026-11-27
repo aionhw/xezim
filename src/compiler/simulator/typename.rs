@@ -443,6 +443,14 @@ impl Simulator {
         let n = name.name.name.as_str();
         let scoped = if !name.scopes.is_empty() {
             name.qualified()
+        } else if let Some((owner, _)) = n.split_once("::")
+            && self.module.typedef_types.contains_key(n)
+            && (self.module.packages.contains(owner) || self.module.classes.contains_key(owner))
+            // §20.6.1: elaboration can add an owner without changing the
+            // identifier's span. An escaped token still spans its backslash.
+            && (name.name.span.end - name.name.span.start) as usize != n.len() + 1
+        {
+            n.to_string()
         } else {
             let suffix = format!("::{}", n);
             let mut pk: Vec<&String> = self

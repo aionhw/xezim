@@ -4547,10 +4547,11 @@ impl Simulator {
         if vars.len() != 1 {
             return None;
         }
-        // Class-member / collection associative array resolved via
-        // expr_assoc_name (handles `obj.assoc_member[k]`, array-element bases,
-        // etc.).
-        if let Some(an) = self.expr_assoc_name(array) {
+        // §12.7.3: a selected collection row has its own iteration keys.
+        if let Some(an) = self
+            .foreach_selected_collection(array)
+            .or_else(|| self.expr_assoc_name(array))
+        {
             let (keys, is_str) = self.array_iter_keys(&an);
             // A `.size`-shadowed collection (queue/dynamic) may shrink mid-
             // loop; use live-size bounds for it.

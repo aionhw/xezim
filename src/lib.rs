@@ -218,6 +218,9 @@ fn design_cache_key_for(
 ) {
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
+    // §23.9, §27.4: generated continuous assignments retain the bound delay operands.
+    hash.text("generate-continuous-delay-binding-v1");
+    hash.text("constant-enum-cast-width-and-lazy-nettype-array-drivers-v1");
     // Re-elaborate designs validated before duplicate package/typedef/interface
     // diagnostics (§3.13, §6.18, §25.3, §26.2) were added.
     hash.text("qualified-package-array-storage-and-pr-validation-v3");

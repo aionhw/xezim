@@ -5,6 +5,17 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    pub(in crate::compiler::simulator) fn negate_value(v: &Value) -> Value {
+        let mut r = if v.is_real {
+            // §6.12, §11.4.3: real unary minus flips the sign, including for zero.
+            v.negate()
+        } else {
+            Value::zero(v.width).sub(v).resize(v.width)
+        };
+        r.is_signed = v.is_signed;
+        r
+    }
+
     /// Execute bytecode instructions in isolation (no &mut self).
     /// Returns NBA entries produced. Used for parallel edge block execution.
     pub(super) fn exec_insns_isolated(
@@ -208,10 +219,7 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*s as usize].logic_not();
                 }
                 Insn::Negate(d, s) => {
-                    let w = vm_regs[*s as usize].width;
-                    let mut r = Value::zero(w).sub(&vm_regs[*s as usize]).resize(w);
-                    r.is_signed = vm_regs[*s as usize].is_signed;
-                    vm_regs[*d as usize] = r;
+                    vm_regs[*d as usize] = Self::negate_value(&vm_regs[*s as usize]);
                 }
                 Insn::ReduceAnd(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].reduce_and();
@@ -1021,10 +1029,7 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*s as usize].logic_not();
                 }
                 Insn::Negate(d, s) => {
-                    let w = vm_regs[*s as usize].width;
-                    let mut r = Value::zero(w).sub(&vm_regs[*s as usize]).resize(w);
-                    r.is_signed = vm_regs[*s as usize].is_signed;
-                    vm_regs[*d as usize] = r;
+                    vm_regs[*d as usize] = Self::negate_value(&vm_regs[*s as usize]);
                 }
                 Insn::ReduceAnd(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].reduce_and();
@@ -3429,10 +3434,7 @@ impl Simulator {
                     }
                 }
                 Insn::Negate(d, s) => {
-                    let w = self.vm_regs[*s as usize].width;
-                    let mut r = Value::zero(w).sub(&self.vm_regs[*s as usize]).resize(w);
-                    r.is_signed = self.vm_regs[*s as usize].is_signed;
-                    self.vm_regs[*d as usize] = r;
+                    self.vm_regs[*d as usize] = Self::negate_value(&self.vm_regs[*s as usize]);
                 }
                 Insn::ReduceAnd(d, s) => {
                     self.vm_regs[*d as usize] = self.vm_regs[*s as usize].reduce_and();

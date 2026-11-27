@@ -386,6 +386,8 @@ mod covergroup_class_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_bin_intervals.rs"]
+mod covergroup_real_bin_intervals;
 #[path = "classes/covergroup_real_bins.rs"]
 mod covergroup_real_bins;
 #[path = "classes/covergroup_sample_args.rs"]
@@ -1423,3 +1425,8 @@ mod param_static_collections;
 
 #[path = "classes/inherited_packed_typedef_cousins.rs"]
 mod inherited_packed_typedef_cousins;
+
+#[path = "classes/indexed_compare_dispatch.rs"]
+mod indexed_compare_dispatch;
+#[path = "classes/static_collection_member_scope.rs"]
+mod static_collection_member_scope;

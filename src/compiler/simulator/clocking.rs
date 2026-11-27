@@ -169,7 +169,7 @@ impl Simulator {
     /// of its value is `w[1]`. Any other select (an element of a packed
     /// array) gives its raw index range (`delayed_lhs_select_range`) with
     /// `false`, which only an identical select supersedes.
-    fn clocking_drive_bits(&mut self, lhs: &Expression) -> Option<(usize, u32, u32, bool)> {
+    pub(super) fn drive_select_bits(&mut self, lhs: &Expression) -> Option<(usize, u32, u32, bool)> {
         let (base, a, b) = match &lhs.kind {
             ExprKind::RangeSelect {
                 expr,
@@ -244,7 +244,7 @@ impl Simulator {
     }
 
     /// The signal, low bit and width that queued update `slot` writes: its
-    /// select's (`clocking_drive_bits`), or the whole signal's, and whether
+    /// select's (`drive_select_bits`), or the whole signal's, and whether
     /// those are physical bits. The target is read in place: it is taken out
     /// of the entry for the call and put back.
     fn queued_drive_range(&mut self, slot: NbaSlot) -> Option<(usize, u32, u32, bool)> {
@@ -265,7 +265,7 @@ impl Simulator {
                     self.get_lhs_signal_id(l).and_then(|id| whole(self, id))
                 }
                 ExprKind::Ident(_) => None,
-                _ => self.clocking_drive_bits(l),
+                _ => self.drive_select_bits(l),
             },
         };
         match slot {

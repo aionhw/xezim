@@ -101,6 +101,8 @@ mod decl_init_time_literal_scaling;
 mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
+#[path = "scheduling/deferred_assertion_actions.rs"]
+mod deferred_assertion_actions;
 #[path = "scheduling/procedural_assert_after_delay.rs"]
 mod procedural_assert_after_delay;
 #[path = "scheduling/procedural_assert_woken_off_tick.rs"]
@@ -642,3 +644,9 @@ mod delayed_nested_collections;
 
 #[path = "scheduling/unpacked_slice_nba_1644.rs"]
 mod unpacked_slice_nba_1644;
+
+#[path = "scheduling/intra_delay_signed_exponent.rs"]
+mod intra_delay_signed_exponent;
+
+#[path = "scheduling/delayed_generate_and_compound_lhs.rs"]
+mod delayed_generate_and_compound_lhs;

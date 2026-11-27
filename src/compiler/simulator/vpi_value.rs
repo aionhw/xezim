@@ -345,6 +345,19 @@ pub extern "C" fn vpi_put_value(
             );
             return std::ptr::null_mut();
         }
+        let vp = unsafe { &*value_p };
+        // §38.34 disallows vpiStringVal on real variables. Use the same
+        // storage check as fit_put_value, including for real-typed nets.
+        if vp.format == vpi::STRING_VAL
+            && h.kind != VpiKind::Slice
+            && vpi_api::cell_real(sim, sig_id)
+        {
+            vpi_error(
+                vpi::ERROR,
+                "vpi_put_value: vpiStringVal is illegal on a real target".into(),
+            );
+            return std::ptr::null_mut();
+        }
 
         // A slice decodes at its own width, then splices back into its parent.
         let w = if h.kind == VpiKind::Slice {
@@ -353,7 +366,6 @@ pub extern "C" fn vpi_put_value(
             vpi_api::cell_width(sim, sig_id).unwrap_or(32)
         };
         let is_signed = vpi_api::cell_signed(sim, sig_id);
-        let vp = unsafe { &*value_p };
 
         // A format we cannot decode writes NOTHING. The old code fell
         // through to "read the current value and write it back", which
@@ -512,6 +524,12 @@ pub extern "C" fn vpi_put_value(
 
         // For force: write value first, THEN add to forced_signals
         if flags == vpi::FORCE_FLAG {
+            // §6.12 and §38.34: a force uses the destination's shortreal precision.
+            let value = if value.is_real && sim.shortreal_signals.contains(&sig_id) {
+                sim.fit_value_to_signal(sig_id, &value)
+            } else {
+                value
+            };
             // Write directly to signal_table (bypass write_sig! which would skip)
             if sig_id < sim.signal_table.len() {
                 sim.signal_table[sig_id] = value.clone();
