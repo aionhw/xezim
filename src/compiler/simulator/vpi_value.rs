@@ -512,6 +512,12 @@ pub extern "C" fn vpi_put_value(
 
         // For force: write value first, THEN add to forced_signals
         if flags == vpi::FORCE_FLAG {
+            // §6.12 and §38.34: a force uses the destination's shortreal precision.
+            let value = if value.is_real && sim.shortreal_signals.contains(&sig_id) {
+                sim.fit_value_to_signal(sig_id, &value)
+            } else {
+                value
+            };
             // Write directly to signal_table (bypass write_sig! which would skip)
             if sig_id < sim.signal_table.len() {
                 sim.signal_table[sig_id] = value.clone();
