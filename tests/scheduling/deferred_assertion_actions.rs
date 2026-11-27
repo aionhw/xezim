@@ -65,6 +65,8 @@ module tb;
   function int f(); n += 10000; return 0; endfunction
   initial begin
     assert #0 (x) t(); else $error("no");
+    assert #0 (!x) else ;
+    assert final (x) ; else $error("no");
     assert final (x) u;
     assert #0 (x) c.m();
     assert #0 (x) vf();

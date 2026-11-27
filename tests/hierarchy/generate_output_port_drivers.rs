@@ -59,6 +59,10 @@ fn generate_branches_beside_a_module_instance_are_rejected() {
         "if (1) begin : g drv u (.i(a), .o(x)); end",
         "for (genvar g = 0; g < 1; g++) begin : f if (1) begin : h drv u (.i(a), .o(x)); end end",
         "case (2) 1: begin : b end 2: begin : c drv u (.i(a), .o(x)); end endcase",
+        "function automatic int pick(); return 1; endfunction
+         if (pick()) begin : g drv u (.i(a), .o(x)); end",
+        "function automatic int pick(); return 1; endfunction
+         case (1) pick(): begin : g drv u (.i(a), .o(x)); end endcase",
     ] {
         let e = rejected(&format!(
             "module tb; logic a = 1'b1; logic x; drv t (.i(a), .o(x)); {body} endmodule\n"
@@ -96,4 +100,24 @@ endmodule
 "#,
     );
     assert!(l.contains(&"y=10 z=0 w=1 n=1 loc=1".to_string()), "{l:?}");
+}
+
+/// A constant-function case match must prevent the default arm from contributing a driver.
+#[test]
+fn generate_case_does_not_count_an_inactive_default_driver() {
+    let output = lines(
+        r#"
+module tb;
+  logic x;
+  drv t (.i(1'b1), .o(x));
+  function automatic int pick(); return 1; endfunction
+  case (1)
+    pick(): begin : selected end
+    default: begin : skipped drv u (.i(1'b0), .o(x)); end
+  endcase
+  initial #1 $display("x=%b", x);
+endmodule
+"#,
+    );
+    assert!(output.contains(&"x=1".to_owned()), "{output:?}");
 }
