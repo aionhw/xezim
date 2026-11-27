@@ -364,3 +364,15 @@ fn partial_interval_keeps_its_own_bin() {
         2,
     );
 }
+
+/// Widely separated exponents still preserve the full precision of a boundary.
+#[test]
+fn interval_boundary_preserves_binary64_precision() {
+    check(
+        "cp: coverpoint x { bins b[] = {[1.0e-100:3.000000000000001]}; }",
+        "type_option.real_interval = 1.0000000000000002;",
+        "cp",
+        &[(0.5, 1), (1.0, 1), (1.0000000000000002, 2), (3.0, 3)],
+        3,
+    );
+}
