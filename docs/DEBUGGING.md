@@ -80,6 +80,37 @@ signal growth for small repeated instances points to duplicated storage;
 many distinct prepared bodies or large retained maps suggest other paths.
 Counts are lengths of containers at the latest checkpoint, not heap bytes.
 
+Besides the per-step records, a trace holds a few small records that can be
+read on their own:
+
+| Record | Counts | Use |
+|---|---|---|
+| `environment` checkpoint, at start | `mem_total_kib`, `mem_available_kib`, `cgroup_limit_kib`, `cgroup_usage_kib`, `cgroup_oom_kills` | The memory limit the job is killed at (0 when none is set) and what the job already uses. |
+| `bind.single_pass`, or `bind.discovery_pass` then `bind.rebuild` | `unit_binds`, `binds_to_instance_path`, `binds_in_generate_scope`, `binds_of_other_kind`, `module_scope_binds`, `defparams`, `nested_modules`, `instances_named_as_target` | Whether bind directives made the design elaborate twice, and which constructs did. |
+| `phase_summary`, at finish | `scopes`, `self_ms`, `self_grow_kib`, `self_shrink_kib` | Time and RSS growth of each phase, excluding nested phases. |
+| `definition_summary`, at finish | `rank`, `definitions`, plus the phase counts | The 40 definitions whose scopes grew RSS most. |
+| `include file access` checkpoint, at finish | `include_directives`, `include_path_probes`, `include_file_reads`, `include_read_kib`, `include_file_access_ms` | The file-system cost of `` `include `` lookup. |
+| `error` | `phase` is `<step>: <message class>` | Where the run failed. |
+
+```sh
+jq -c 'select(.event=="phase_summary" or .event=="definition_summary" or .event=="error"
+              or .phase=="environment" or .phase=="include file access"
+              or (.event=="checkpoint" and (.phase|startswith("bind."))))' memory.jsonl
+```
+
+Summaries are written when the run finishes or fails, so a killed run has
+none; the `environment` and bind records are written early. Model
+checkpoints also carry `*_slots_kib` counts: the memory the instance,
+continuous-assignment and process tables hold in their own slots.
+
+With `XEZIM_OOM_TRACE_REDACT=1`, paths, definition names and instance paths
+become `file#N`, `def#N` and `inst#N(d=depth,g=indexed scopes)`, and an
+`error` record keeps only the message text before its first quoted name
+(`unclassified` when that is not plain words). The records above then hold
+numbers and aliases only. `XEZIM_OOM_TRACE_MIN_DELTA_KIB=<N>` drops
+per-instance records whose RSS moved less than `N` KiB, which keeps the
+trace of a large design small.
+
 Every record is written immediately, without retaining a history or copying
 the design. A kill may leave a partial final line; preceding complete lines
 remain usable. Files append across invocations, and each trace starts with

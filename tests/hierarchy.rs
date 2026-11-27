@@ -19,6 +19,8 @@ mod array_of_module_instances;
 mod bind_audit;
 #[path = "hierarchy/bind_directive_basic.rs"]
 mod bind_directive_basic;
+#[path = "hierarchy/bound_instance_scope_args.rs"]
+mod bound_instance_scope_args;
 #[path = "hierarchy/bind_static_init_syscall_scope.rs"]
 mod bind_static_init_syscall_scope;
 #[path = "hierarchy/bind_in_module.rs"]
