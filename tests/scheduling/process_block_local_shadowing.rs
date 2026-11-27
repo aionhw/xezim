@@ -132,3 +132,71 @@ endmodule
     assert_eq!(u(&sim, "r1"), 0x10, "p1 reads its OWN local, not p2's");
     assert_eq!(u(&sim, "r2"), 0x1, "p2 reads its OWN local");
 }
+
+/// §6.21, §27.4 (#1651): each generated block retains its own local across
+/// timing controls, even when one iteration overwrites its value.
+#[test]
+fn generated_processes_preserve_named_block_locals() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  int done;
+  always #5 clk = ~clk;
+  for (genvar g = 0; g < 3; g++) begin : scope_g
+    initial begin : body
+      int k;
+      @(posedge clk); k = 100 + g;
+      @(posedge clk); if (g == 0) k = 999;
+      @(posedge clk);
+      $display("LOCAL %0d %0d", g, k);
+      done++;
+    end
+  end
+  initial begin wait (done == 3); $finish; end
+endmodule
+"#;
+    let result = simulate(src, 100).unwrap();
+    let mut lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|output| output.message.as_str())
+        .filter(|line| line.starts_with("LOCAL "))
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["LOCAL 0 999", "LOCAL 1 101", "LOCAL 2 102"]);
+}
+
+/// §12.7.3 (#1651): suspended foreach loops keep independent indices.
+#[test]
+fn generated_processes_preserve_foreach_indices() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  int done;
+  always #5 clk = ~clk;
+  for (genvar g = 0; g < 3; g++) begin : scope_g
+    initial begin : body
+      int a[3];
+      int sum = 0;
+      a[0] = 1; a[1] = 10; a[2] = 100;
+      foreach (a[i]) begin
+        @(posedge clk);
+        sum += a[i] + g;
+      end
+      $display("SUM %0d %0d", g, sum);
+      done++;
+    end
+  end
+  initial begin wait (done == 3); $finish; end
+endmodule
+"#;
+    let result = simulate(src, 100).unwrap();
+    let mut lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|output| output.message.as_str())
+        .filter(|line| line.starts_with("SUM "))
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["SUM 0 111", "SUM 1 114", "SUM 2 117"]);
+}

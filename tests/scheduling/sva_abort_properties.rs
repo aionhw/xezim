@@ -36,6 +36,34 @@ fn check(property: &str, setup: &str, expected: &[&str]) {
 const PULSE_BETWEEN_TICKS: &str = "#12 r=1; #1 r=0;";
 
 #[test]
+fn sva_scalar_clock_keeps_async_disable_and_iff() {
+    let source = r#"
+module top;
+  logic clk = 0, enable = 1, reset = 0;
+  int failures = 0;
+  always #5 clk = ~clk;
+  assert property (@(posedge clk iff enable) disable iff (reset) 1 |-> ##1 0)
+    else failures++;
+  initial begin
+    #7 reset = 1;
+    #1 reset = 0;
+    #12 enable = 0;
+    #20 enable = 1;
+    #17;
+    $display("FAILURES %0d", failures);
+    $finish;
+  end
+endmodule
+"#;
+    let result = simulate(source, 100).unwrap();
+    assert!(
+        result.output.iter().any(|out| out.message == "FAILURES 2"),
+        "assertion action count changed: {:?}",
+        result.output
+    );
+}
+
+#[test]
 fn accept_on_between_ticks_accepts_a_failing_attempt() {
     check("start |-> ##2 b", ";", &["T|F 25"]);
     check("accept_on (r) start |-> ##2 b", PULSE_BETWEEN_TICKS, &[]);

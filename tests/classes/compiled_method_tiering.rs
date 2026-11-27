@@ -618,3 +618,40 @@ endmodule
     assert_eq!(compiled, interpreted);
     assert!(admitted > 0, "no method body was admitted");
 }
+
+/// §7.10, §8.10 (#1666): dotted queue receivers use their declared class and
+/// the actual object handle for both class properties and formal arguments.
+#[test]
+fn dotted_collection_methods_compile_on_other_objects() {
+    let source = r#"
+class row;
+  int q[$];
+endclass
+class worker;
+  row owned = new;
+  function int step(row other, int value);
+    owned.q.push_back(value);
+    other.q.push_back(value + 1);
+    return owned.q.size() + other.q.size();
+  endfunction
+endclass
+module top;
+  function automatic bit count_matches(row r, bit [4:0] a, bit [4:0] b);
+    return r.q.size() == a + b;
+  endfunction
+  initial begin
+    worker w = new;
+    row r = new;
+    int sum = 0;
+    for (int i = 0; i < 32; i++) sum += w.step(r, i);
+    $display("TAG %0d %0d %0d %0d", sum, w.owned.q[31], r.q[31], count_matches(r, 16, 16));
+    $finish;
+  end
+endmodule
+"#;
+    let (interpreted, _, _) = run_with_admission(source, "1000000");
+    let (compiled, admitted, _) = run_with_admission(source, "0");
+    assert_eq!(interpreted, "TAG 1056 31 32 1");
+    assert_eq!(compiled, interpreted);
+    assert!(admitted > 0, "no method body was admitted");
+}
