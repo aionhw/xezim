@@ -193,3 +193,6 @@ mod vpi_deferred_rw_writes;
 
 #[path = "strings/class_collection_row_format.rs"]
 mod class_collection_row_format;
+
+#[path = "strings/vpi_shortreal_force.rs"]
+mod vpi_shortreal_force;
