@@ -534,7 +534,7 @@ pub(super) fn cell_signed(sim: &Simulator, id: usize) -> bool {
     }
 }
 
-fn cell_real(sim: &Simulator, id: usize) -> bool {
+pub(super) fn cell_real(sim: &Simulator, id: usize) -> bool {
     !is_packed_id(id) && sim.signal_real.get(id).copied().unwrap_or(false)
 }
 
