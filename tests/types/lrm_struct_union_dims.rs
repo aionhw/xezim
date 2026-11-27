@@ -18,11 +18,13 @@ const SRC: &str = r#"
 module tb;
   typedef struct { int k; }                in_t;
   typedef struct { int a; in_t n; string s; } up_t;
+  typedef struct { logic [7:0] a; in_t n; string s; } up4_t;
   typedef struct packed { bit [3:0] x; bit [3:0] y; } pk_t;
   typedef union tagged { void Invalid; int Valid; } tu_t;
 
   up_t u, v, w;
-  up_t un1, un2;      // never written: comparison must be X
+  up_t un1, un2;      // all 2-state/string members default to 0 / "": comparison is 1
+  up4_t un4_1, un4_2; // 4-state `logic` member starts at X: comparison must be X
   pk_t p, q;
   tu_t t;
 
@@ -61,6 +63,7 @@ module tb;
     undim_one  = $unpacked_dimensions(one);
 
     $display("UNINIT=%b", un1 == un2);
+    $display("UNINIT4=%b", un4_1 == un4_2);
     $display("INACTIVE=%b", $isunknown(t.Invalid));
   end
 endmodule
@@ -98,7 +101,8 @@ fn unpacked_struct_equality_is_member_wise() {
 #[test]
 fn comparing_uninitialised_structs_yields_x() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(line(&sim, "UNINIT="), "UNINIT=x");
+    assert_eq!(line(&sim, "UNINIT="), "UNINIT=1");
+    assert_eq!(line(&sim, "UNINIT4="), "UNINIT4=x");
 }
 
 #[test]

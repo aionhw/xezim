@@ -1504,6 +1504,9 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 };
                 self.emit(Insn::Move(slot, value));
+                if is_string && !self.expr_has_string_type_static(expr) {
+                    self.emit(Insn::StrOp(slot, StrOpKind::ToStr, Box::new(vec![slot])));
+                }
                 // §6.8, §6.12.1: `longint t = r;` rounds a real initializer.
                 if matches!(kind, Some(LocalKind::Int { .. })) {
                     self.emit_real_to_int_fit(slot, expr, width);
@@ -1603,6 +1606,9 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 };
                 self.emit(Insn::Move(slot, v));
+                if is_string && !self.expr_has_string_type_static(e) {
+                    self.emit(Insn::StrOp(slot, StrOpKind::ToStr, Box::new(vec![slot])));
+                }
                 // §6.8, §6.12.1: `longint t = r;` rounds a real initializer.
                 if matches!(kind, Some(LocalKind::Int { .. })) {
                     self.emit_real_to_int_fit(slot, e, w);

@@ -33,6 +33,9 @@ pub(super) struct EventStampStore {
     names_by_id: Vec<Arc<str>>,
     times: Vec<Option<u64>>,
     plans: Vec<Option<Rc<NamedEventPlan>>>,
+    /// Recycled slot IDs freed when dead class-instance stamps are pruned.
+    #[serde(skip)]
+    free_ids: Vec<usize>,
 }
 
 impl EventStampStore {
@@ -40,13 +43,63 @@ impl EventStampStore {
         if let Some(&id) = self.names.get(name) {
             return id;
         }
-        let id = EventId(self.names_by_id.len());
         let name: Arc<str> = Arc::from(name);
+        if let Some(idx) = self.free_ids.pop() {
+            let id = EventId(idx);
+            self.names.insert(Arc::clone(&name), id);
+            self.names_by_id[idx] = name;
+            self.times[idx] = None;
+            self.plans[idx] = None;
+            return id;
+        }
+        let id = EventId(self.names_by_id.len());
         self.names.insert(Arc::clone(&name), id);
         self.names_by_id.push(name);
         self.times.push(None);
         self.plans.push(None);
         id
+    }
+
+    /// Reclaim `\u{2}inst<h>#...` and `\u{2}obj<id>` stamps belonging to GC'd
+    /// class instances while preserving stamps still live at `now` or held by
+    /// live instances. Freed slot indices are pushed to `free_ids` for reuse.
+    pub(super) fn prune_dead_instance_stamps(
+        &mut self,
+        mut is_dead_handle: impl FnMut(usize) -> bool,
+        mut is_live_obj_id: impl FnMut(u64) -> bool,
+        now: u64,
+    ) -> usize {
+        if self.names.is_empty() {
+            return 0;
+        }
+        let mut doomed: Vec<usize> = Vec::new();
+        self.names.retain(|name, &mut id| {
+            let dead = if let Some(rest) = name.strip_prefix("\u{2}inst") {
+                rest.split_once('#')
+                    .and_then(|(h, _)| h.parse::<usize>().ok())
+                    .is_some_and(&mut is_dead_handle)
+            } else if let Some(rest) = name.strip_prefix("\u{2}obj") {
+                rest.parse::<u64>()
+                    .ok()
+                    .is_some_and(|oid| !is_live_obj_id(oid) && self.times[id.0] != Some(now))
+            } else {
+                false
+            };
+            if dead {
+                doomed.push(id.0);
+                false
+            } else {
+                true
+            }
+        });
+        let removed = doomed.len();
+        for idx in doomed {
+            self.names_by_id[idx] = Arc::from("");
+            self.times[idx] = None;
+            self.plans[idx] = None;
+            self.free_ids.push(idx);
+        }
+        removed
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&u64> {
@@ -136,6 +189,35 @@ mod tests {
                 assert_eq!(stamps.contains_key(key), previous.contains_key(key));
             }
         }
+    }
+
+    #[test]
+    fn pruning_dead_instance_stamps_reclaims_entries_and_reuses_slots() {
+        let mut stamps = EventStampStore::default();
+        let mod_ev = stamps.intern("mod_ev");
+        stamps.mark(mod_ev, 5);
+        stamps.insert("\x02inst10#done".into(), 10);
+        stamps.insert("\x02inst11#done".into(), 10);
+        stamps.insert("\x02obj1".into(), 5);
+        stamps.insert("\x02obj2".into(), 10);
+
+        let initial_slots = stamps.names_by_id.len();
+        let removed = stamps.prune_dead_instance_stamps(|h| h == 10, |oid| oid == 2, 10);
+        assert_eq!(removed, 2); // inst10 + stale obj1 at t=5 (obj2 is live; time=10)
+        assert_eq!(stamps.get("mod_ev"), Some(&5));
+        assert_eq!(stamps.get("\x02inst10#done"), None);
+        assert_eq!(stamps.get("\x02inst11#done"), Some(&10));
+        assert_eq!(stamps.get("\x02obj1"), None);
+        assert_eq!(stamps.get("\x02obj2"), Some(&10));
+
+        // Interning new stamps reuses freed ID slots instead of growing unboundedly.
+        let r1 = stamps.intern("\x02inst20#done");
+        let r2 = stamps.intern("\x02inst21#done");
+        stamps.mark(r1, 20);
+        stamps.mark(r2, 20);
+        assert_eq!(stamps.names_by_id.len(), initial_slots);
+        assert_eq!(stamps.get("\x02inst20#done"), Some(&20));
+        assert_eq!(stamps.get("\x02inst21#done"), Some(&20));
     }
 
     #[test]

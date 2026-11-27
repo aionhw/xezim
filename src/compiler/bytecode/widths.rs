@@ -79,7 +79,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.widths.declared_width(&raw).unwrap_or(32)
                 }
             }
-            ExprKind::Index { expr, .. } => {
+            ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     // Register-bound LOCAL ARRAY element (inlined pure body):
                     // its declared element width. Missing this returned the
@@ -111,6 +111,14 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
+                        if let Some(idx) = self.eval_const_bound(index)
+                            && let Some(id) =
+                                self.lookup_signal_id_by_name(&format!("{name}[{idx}]"))
+                            && let Some(&w) = self.signal_widths.get(id)
+                            && w > 0
+                        {
+                            return w;
+                        }
                         if let Some((_, _, elem_w)) = self.arrays.get(&name) {
                             return *elem_w;
                         }
@@ -823,24 +831,38 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Paren(inner) => self.named_cast_key(inner),
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let n = h.path.len();
-                let key = format!("{}::{}", h.path[n - 2].name.name, h.path[n - 1].name.name);
+                let prefix = h.path[n - 2].name.name.as_str();
+                let key = format!("{}::{}", prefix, h.path[n - 1].name.name);
                 let known = self.cast_widths.is_some_and(|m| m.contains_key(&key))
                     || self.params.is_some_and(|p| p.contains_key(&key));
-                Some(if known {
-                    key
+                if known {
+                    Some(key)
+                } else if self.deferred_packages.is_some_and(|pkgs| pkgs.contains(prefix))
+                    && !self.cast_widths.is_some_and(|m| m.contains_key(prefix))
+                {
+                    Some(h.path[n - 1].name.name.clone())
                 } else {
-                    h.path[n - 1].name.name.clone()
-                })
+                    None
+                }
             }
             ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
             ExprKind::MemberAccess { expr, member } => {
                 let ExprKind::Ident(h) = &expr.kind else {
                     return None;
                 };
-                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
+                let prefix = h.path.last()?.name.name.as_str();
+                let key = format!("{}::{}", prefix, member.name);
                 let known = self.cast_widths.is_some_and(|m| m.contains_key(&key))
                     || self.params.is_some_and(|p| p.contains_key(&key));
-                Some(if known { key } else { member.name.clone() })
+                if known {
+                    Some(key)
+                } else if self.deferred_packages.is_some_and(|pkgs| pkgs.contains(prefix))
+                    && !self.cast_widths.is_some_and(|m| m.contains_key(prefix))
+                {
+                    Some(member.name.clone())
+                } else {
+                    None
+                }
             }
             _ => None,
         }

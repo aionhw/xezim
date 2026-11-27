@@ -1087,6 +1087,13 @@ impl Simulator {
             if cd.static_properties.contains(*seg) {
                 return None;
             }
+            if cd
+                .property_types
+                .get(*seg)
+                .is_some_and(|dt| self.class_dt_is_event(&cd.name, dt))
+            {
+                return None;
+            }
             let inst = self.heap.get(h)?.as_ref()?;
             if self.prop_owners(&inst.class_name).get(*seg)?.0 != *owner {
                 return None;
@@ -1246,6 +1253,7 @@ impl Simulator {
             w
         };
         let val = self.eval_expr_ctx(rvalue, w);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         if rhs_call && self.assign_pending_ret_collection(lvalue) {
             return true;
         }
@@ -1410,6 +1418,7 @@ impl Simulator {
             if iw == 0 { 32 } else { iw }
         };
         let val = self.eval_expr_ctx(rvalue, w);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         if rhs_call {
             // The full path takes a returned collection here; a member
             // target is never its destination.
@@ -1966,7 +1975,14 @@ impl Simulator {
             }
         }
         // §15.5.5: a class-member event takes the other event's object.
-        self.bind_instance_event_assign(lvalue, rvalue);
+        if self.any_events_possible() && self.bind_instance_event_assign(lvalue, rvalue) {
+            return;
+        }
+        // §15.5.5: handle assignment on frame-local / formal / ref / module
+        // event variables before `simple_blocking_assign`.
+        if self.any_events_possible() && self.try_event_handle_assign(lvalue, rvalue) {
+            return;
+        }
         // §13.4.1, §7.2: `f = t;` in the function `f`, with `t` a whole
         // unpacked struct, spreads `t` over the return variable's leaves.
         // The plain copy below stored it as one value nobody reads.
@@ -2011,7 +2027,7 @@ impl Simulator {
         }
         // §15.5.5: `event_var = other_event / null / q[i]` re-binds
         // the HANDLE, it does not copy a value.
-        if self.try_event_handle_assign(lvalue, rvalue) {
+        if self.any_events_possible() && self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
         let sized_new = Self::sized_new_parts(rvalue);
@@ -3360,22 +3376,18 @@ impl Simulator {
                 || self
                     .instance_assoc_member(&lname)
                     .is_some_and(|scoped| !in_frame && self.class_queue_prop(&scoped));
-            if !lhs_is_queue
-                && (self.string_signals.contains(&*lname)
-                    || self.string_signals.contains(
-                        &lh.path
-                            .last()
-                            .map(|s| s.name.name.clone())
-                            .unwrap_or_default(),
-                    )
-                    || self.expr_is_string_valued(rvalue))
-            {
-                let mut s = String::new();
+            if !lhs_is_queue && parts.iter().any(|p| self.operand_has_string_type(p)) {
+                let mut out: Vec<u8> = Vec::new();
                 for p in parts {
                     let pv = self.eval_expr(p);
-                    s.push_str(&pv.to_sv_string());
+                    let bytes = pv.sv_string_bytes_cow();
+                    if self.operand_has_string_type(p) {
+                        out.extend_from_slice(&bytes);
+                    } else {
+                        out.extend(bytes.iter().copied().filter(|&b| b != 0));
+                    }
                 }
-                let sval = Value::from_string(&s);
+                let sval = Value::from_bytes(&out);
                 // Store the byte-concat result with correct scoping:
                 //  - a method-LOCAL string lives in the current call frame
                 //    (VarDecl frame isolation), and reads consult the frame
@@ -3419,6 +3431,7 @@ impl Simulator {
                     None => self.eval_expr(rvalue),
                 };
                 let v = self.fill_into_real_target(lvalue, v);
+                let v = self.fit_rhs_for_string_target(lvalue, rvalue, v);
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
@@ -3666,9 +3679,7 @@ impl Simulator {
                             // left-justified (zero padding on the right).
                             let rem = total - k * ew;
                             let mut v = Value::zero(elem_w);
-                            for b in 0..rem {
-                                v.set_bit(ew - rem + b, sv.get_bit(b));
-                            }
+                            v.copy_bits_from(ew - rem, &sv, 0, rem);
                             v
                         } else {
                             Value::zero(elem_w)
@@ -3727,24 +3738,31 @@ impl Simulator {
                     || self.module.dynamic_arrays.contains(&*rname)
                 {
                     let n = self.get_queue_size(&rname) as usize;
+                    let mut buf = String::with_capacity(rname.len() + 16);
+                    {
+                        use std::fmt::Write;
+                        let _ = write!(&mut buf, "{rname}[0]");
+                    }
                     let elem_w = self
-                        .lookup_signal_width(&format!("{}[0]", rname))
+                        .lookup_signal_width(&buf)
                         .unwrap_or_else(|| {
                             self.module.arrays.get(&*rname).map(|t| t.2).unwrap_or(8)
                         });
-                    let total_w = (n as u32) * elem_w;
-                    let mut packed = Value::zero(total_w);
+                    let mut vals = Vec::with_capacity(n);
                     for i in 0..n {
-                        let ev = self
-                            .get_signal_value_by_name(&format!("{}[{}]", rname, i))
-                            .unwrap_or(Value::zero(elem_w));
-                        // pack at position [total_w-1-i*elem_w .. total_w-(i+1)*elem_w]
-                        let dst_base = total_w as usize - (i + 1) * elem_w as usize;
-                        for b in 0..elem_w as usize {
-                            packed.set_bit(dst_base + b, ev.get_bit(b));
+                        use std::fmt::Write;
+                        buf.clear();
+                        let _ = write!(&mut buf, "{rname}[{i}]");
+                        let mut ev = self
+                            .get_signal_value_by_name(&buf)
+                            .unwrap_or_else(|| Value::zero(elem_w));
+                        if ev.width != elem_w {
+                            ev.is_signed = false;
+                            ev = ev.resize(elem_w);
                         }
+                        vals.push(ev);
                     }
-                    packed
+                    Value::concat_refs(vals.iter())
                 } else {
                     self.eval_expr(rvalue)
                 }
@@ -3762,26 +3780,8 @@ impl Simulator {
                     .map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize)
                     .unwrap_or(1)
                     .max(1);
-                let mut out = Value::zero(total_w as u32);
-                let full_chunks = total_w / slice;
-                let remainder = total_w - full_chunks * slice;
-                for k in 0..full_chunks {
-                    for b in 0..slice {
-                        let src_bit = k * slice + b;
-                        let dst_bit = (full_chunks - 1 - k) * slice + b + remainder;
-                        if src_bit < total_w && dst_bit < total_w {
-                            out.set_bit(dst_bit, rhs_val.get_bit(src_bit));
-                        }
-                    }
-                }
-                for b in 0..remainder {
-                    let src_bit = full_chunks * slice + b;
-                    let dst_bit = b;
-                    if src_bit < total_w {
-                        out.set_bit(dst_bit, rhs_val.get_bit(src_bit));
-                    }
-                }
-                out
+                let _ = total_w;
+                rhs_val.reverse_slices(slice)
             };
             // Distribute `ordered` MSB-first to each target in source order.
             let total = ordered.width as usize;
@@ -3844,19 +3844,27 @@ impl Simulator {
                     if fixed_order.is_none() {
                         self.set_queue_size(&dname, n_elems as u64);
                     }
+                    let mut dyn_name_buf = if fixed_order.is_none() {
+                        String::with_capacity(dname.len() + 16)
+                    } else {
+                        String::new()
+                    };
                     for k in 0..n_elems {
                         let hi = msb.saturating_sub(k * elem_w as usize).saturating_sub(1);
                         let lo = msb.saturating_sub((k + 1) * elem_w as usize);
                         if hi >= lo {
                             let slice_v = ordered.range_select(hi, lo);
-                            let ename = match &fixed_order {
-                                Some(names) => match names.get(k) {
-                                    Some(n) => n.clone(),
-                                    None => break,
-                                },
-                                None => format!("{}[{}]", dname, k),
-                            };
-                            self.set_signal_value_by_name(&ename, slice_v);
+                            if let Some(names) = &fixed_order {
+                                let Some(ename) = names.get(k) else {
+                                    break;
+                                };
+                                self.set_signal_value_by_name(ename, slice_v);
+                            } else {
+                                use std::fmt::Write;
+                                dyn_name_buf.clear();
+                                let _ = write!(&mut dyn_name_buf, "{dname}[{k}]");
+                                self.set_signal_value_by_name(&dyn_name_buf, slice_v);
+                            }
                         }
                     }
                 } else if let Some((names, ew)) = ranged.as_ref() {
@@ -4711,6 +4719,7 @@ impl Simulator {
             self.eval_assign_rhs(lvalue, rvalue, w)
         };
         let val = self.fill_into_real_target(lvalue, val);
+        let val = self.fit_rhs_for_string_target(lvalue, rvalue, val);
         // A collection RETURNED by the call in `rvalue` (recorded at
         // its `return` statement): copy it into a collection lvalue.
         if matches!(&rvalue.kind, ExprKind::Call { .. }) {

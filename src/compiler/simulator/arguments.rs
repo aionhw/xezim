@@ -1320,7 +1320,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         );
                         let signed = self.type_is_signed_concrete(&m.data_type);
-                        Some(Self::fit_local_decl_init(
+                        Some(self.fit_local_decl_init(
                             raw,
                             mw.max(1),
                             &m.data_type,
@@ -3398,7 +3398,11 @@ impl Simulator {
     pub(super) fn apply_default_outs(&mut self, wb: Vec<(Expression, Value)>, cname: &str) {
         self.class_context_stack.push(Some(cname.to_string()));
         for (dflt, v) in wb {
-            self.assign_value(&dflt, &v);
+            if let Some(canon) = Self::decode_event_handle_value(&v) {
+                self.assign_event_handle_canon(&dflt, &canon);
+            } else {
+                self.assign_value(&dflt, &v);
+            }
         }
         self.class_context_stack.pop();
     }

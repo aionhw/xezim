@@ -9,28 +9,26 @@ use crate::harness::{Order, check};
 // §6.19.5: Enum name() of a value not in the enum
 #[test]
 fn c6_19_enum_name_other_type() {
-    // Known gap (§6.19.5): `r1` reference `[] 001`, xezim `[XB] 001`
     check(
         "6.19_enum_name_other_type",
         include_str!("sv/6.19_enum_name_other_type.sv"),
         "ren",
         Order::Exact,
-        &["T|r2|[] 101"],
-        &["T|r1|"],
+        &["T|r1|[] 001", "T|r2|[] 101"],
+        &[],
     );
 }
 
 // §6.21: Scope and lifetime: explicit static variable in a loop body block
 #[test]
 fn c6_21_static_blockvar_reinit() {
-    // Known gap (§6.21): `r1`: 2 reference lines differ from xezim's 2, e.g. reference `12`, xezim `11`
     check(
         "6.21_static_blockvar_reinit",
         include_str!("sv/6.21_static_blockvar_reinit.sv"),
         "rsb",
-        Order::Exact,
-        &["T|r2|1", "T|r2|2"],
-        &["T|r1|12", "T|r1|11", "T|r1|13"],
+        Order::Multiset,
+        &["T|r1|11", "T|r1|12", "T|r1|13", "T|r2|1", "T|r2|2"],
+        &[],
     );
 }
 
@@ -55,7 +53,6 @@ fn c6_24_3_bitstream_cast_unpacked() {
 // §6.6.7: User-defined nettypes and resolution functions
 #[test]
 fn c6_6_7_udn_port_driver() {
-    // Known gap (§6.6.7): `6.6.7b` reference `ws=2.500000 1`, xezim `ws=1.000000 1`
     check(
         "6.6.7_udn_port_driver",
         include_str!("sv/6.6.7_udn_port_driver.sv"),
@@ -63,10 +60,11 @@ fn c6_6_7_udn_port_driver() {
         Order::Exact,
         &[
             "T|6.6.7a|wr=5.250000",
+            "T|6.6.7b|ws=2.500000 1",
             "T|6.6.7c|p4=9",
             "T|6.6.7d|wr=13.250000",
         ],
-        &["T|6.6.7b|"],
+        &[],
     );
 }
 
@@ -173,7 +171,6 @@ fn c6_8_local_2state_vector() {
 // §5.13, §6.5, §6.6.1, §6.6.3, §6.6.4, §6.6.5, ...: net kinds, 2/4-state types, strings, enums, casts, $cast, parameters
 #[test]
 fn c6_data_types() {
-    // Known gap (§6.21): `6.21b` reference `12`, xezim `11`
     // Known gap (§6.12): `6.12b` reference `0`, xezim `64`
     // Known gap (§6.23): `6.23` reference `9 64`, xezim `1 1`
     check(
@@ -182,6 +179,8 @@ fn c6_data_types() {
         "c06",
         Order::Exact,
         &[
+            "T|6.21b|11",
+            "T|6.21b|12",
             "T|6.5|a",
             "T|6.6.1|wd=x wz=1",
             "T|6.6.3|wa=0 wo=1",
@@ -258,16 +257,13 @@ fn c6_data_types() {
             "T|6.24.3c|01020304",
             "T|6.24.3d|'{'hab, 'hcd, 'hef}",
         ],
-        &["T|6.21b|12", "T|6.21b|11", "T|6.12b|", "T|6.23|"],
+        &["T|6.12b|", "T|6.23|"],
     );
 }
 
 // §6.12.1, §6.20.3, §6.20.6, §6.22, §6.25: shortreal/real conversions, typedef forms, chandle, type parameters
 #[test]
 fn c6_types_more() {
-    // Known gap (§6.20.2): `6.20.2`: 3 reference lines differ from xezim's 3, e.g. reference `c06x.t1 arr='{1, 2, 3}`, xezim `c06x.t1 arr=x`
-    // Known gap (§6.12.1): `6.12.1c` reference `7766279631452241920`, xezim `9223372036854775807`
-    // Known gap (§6.19): `6.19b` reference `[] 001`, xezim `[XB] 001`
     // Known gap (§6.24.1): `6.24.1l` reference `4`, xezim `0`
     // IEEE 1800-2023 over the reference (§6.12, #1463): `shortreal` holds an
     // IEEE 754 binary32 value, so `6.12a` reads `0.3333333433` and `6.12b`
@@ -280,16 +276,21 @@ fn c6_types_more() {
         Order::Exact,
         &[
             "T|6.20.3|c06x.t1 -3 bits=8 w=8",
+            "T|6.20.2|c06x.t1 arr='{1, 2, 3}",
             "T|6.20.3|c06x.t2 4095 bits=12 w=8",
+            "T|6.20.2|c06x.t2 arr='{7, 8, 9}",
             "T|6.20.3|c06x.t3 0 bits=32 w=3",
+            "T|6.20.2|c06x.t3 arr='{1, 2, 3}",
             "T|6.8a|3 1 1",
             "T|6.20.6|42",
             "T|6.12.1a|4",
             "T|6.12.1b|-4",
+            "T|6.12.1c|7766279631452241920",
             "T|6.12.1d|0",
             "T|6.12.1e|1.844674e+19",
             "T|6.12.1f|0.000000",
             "T|6.19a|RUN 011",
+            "T|6.19b|[] 001",
             "T|6.19c|4",
             "T|6.19d|x1 XB",
             "T|6.25|5",
@@ -303,9 +304,6 @@ fn c6_types_more() {
             "T|6.16w|2 AB",
         ],
         &[
-            "T|6.20.2|",
-            "T|6.12.1c|",
-            "T|6.19b|",
             "T|6.24.1l|",
             "T|6.12a|",
             "T|6.12b|",

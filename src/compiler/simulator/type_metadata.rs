@@ -2021,8 +2021,34 @@ impl Simulator {
             });
             return self.typename_of_dt(&target);
         }
-        // Otherwise a bare built-in keyword (`string`, `int`, ...) or the
-        // type name itself.
+        // Otherwise a built-in vector/atom keyword (`bit[7:0]`, `logic signed[15:0]`, ...)
+        // or the type name itself. Route parameterized vector fragments back
+        // through `typename_of_dt` so normalization (e.g. `reg` vs `logic`)
+        // matches IEEE 1800-2023 §20.6.1.
+        if concrete.contains('[') || concrete.contains(' ') {
+            let head = concrete
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if matches!(
+                head,
+                "bit"
+                    | "logic"
+                    | "reg"
+                    | "byte"
+                    | "shortint"
+                    | "int"
+                    | "longint"
+                    | "integer"
+                    | "time"
+                    | "real"
+                    | "shortreal"
+                    | "realtime"
+            ) && let Some(dt) = self.resolve_type_binding_dt(concrete)
+            {
+                return self.typename_of_dt(&dt);
+            }
+        }
         concrete.to_string()
     }
 
@@ -2207,6 +2233,41 @@ impl Simulator {
                 scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: cn.to_string(),
+                    span,
+                },
+                span,
+                bound: Default::default(),
+            }),
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span,
+        }
+    }
+
+    /// A `TypeReference` naming `tn`, splitting any `a::b::c` qualifiers into
+    /// `scopes` so `lookup_scoped_type` finds qualified package or class types.
+    pub(super) fn scoped_type_ref(tn: &str) -> DataType {
+        if !tn.contains("::") {
+            return Self::class_type_ref(tn);
+        }
+        let span = crate::ast::Span::dummy();
+        let mut parts = tn.split("::").collect::<Vec<_>>();
+        let leaf = parts.pop().unwrap_or(tn);
+        let scopes = parts
+            .into_iter()
+            .map(|s| crate::ast::types::TypeScope {
+                name: crate::ast::Identifier {
+                    name: s.to_string(),
+                    span,
+                },
+                type_args: Vec::new(),
+            })
+            .collect();
+        DataType::TypeReference {
+            name: Box::new(crate::ast::types::TypeName {
+                scopes,
+                name: crate::ast::Identifier {
+                    name: leaf.to_string(),
                     span,
                 },
                 span,

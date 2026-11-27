@@ -38,6 +38,14 @@ impl Simulator {
         let lo = pos
             .map(|p| p.saturating_mul(ew))
             .filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w))?;
+        let two_state = self.signal_two_state.get(id).copied().unwrap_or(false);
+        let coerced;
+        let val = if two_state && val.has_xz() {
+            coerced = val.to_two_state();
+            &coerced
+        } else {
+            val
+        };
         let mut cur = self.signal_table[id].clone();
         let prev = cur.clone();
         for b in 0..ew {
@@ -113,14 +121,24 @@ impl Simulator {
                 return None;
             }
         }
-        let mut b = self.eval_expr(expr).sv_string_bytes();
-        let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-        let cbyte = (val.resize_for_assign(8).to_u64().unwrap_or(0) & 0xFF) as u8;
-        if i < b.len() && cbyte != 0 {
-            b[i] = cbyte;
-            // A `Value` may carry string metadata; store the freshly rebuilt
-            // string so the element keeps its string-ness.
-            return Some(self.assign_value(expr, &Self::sv_string_from_bytes(&b)));
+        let idx_val = self.eval_expr(index);
+        if idx_val.has_xz() {
+            return Some(false);
+        }
+        let Some(idx) = idx_val.to_i64() else {
+            return Some(false);
+        };
+        if idx < 0 {
+            return Some(false);
+        }
+        let mut cur = self.eval_expr(expr);
+        let mut cv = val.resize_for_assign(8);
+        if cv.has_xz() {
+            cv = cv.to_two_state();
+        }
+        let cbyte = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
+        if cur.sv_string_putc_in_place(idx, cbyte) {
+            return Some(self.assign_value(expr, &cur));
         }
         Some(false)
     }

@@ -611,4 +611,338 @@ impl Simulator {
         }
         None
     }
+
+    /// Resolve a `force`/`release` lvalue to its unpacked-struct base name and
+    /// flattened `StructUnionType`, if it names an unpacked struct stored as
+    /// per-member signals (e.g. an unpacked-struct variable, net, or UDN).
+    fn resolve_unpacked_struct_target(
+        &mut self,
+        lvalue: &Expression,
+    ) -> Option<(String, crate::ast::types::StructUnionType)> {
+        let base_name = if let Some(target) = self.inst_array_member_canon(lvalue) {
+            return self.resolve_unpacked_struct_target(&target);
+        } else if let ExprKind::Ident(h) = &lvalue.kind
+            && h.path.iter().all(|s| s.selects.is_empty())
+        {
+            self.resolve_hier_name(h).to_string()
+        } else if let Some(name) = self.flat_member_name(lvalue) {
+            if self.module.var_decl_types.contains_key(&name) {
+                name
+            } else if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
+                format!("{}.{}", hint, name)
+            } else {
+                name
+            }
+        } else if let ExprKind::Index { expr: base, index } = &lvalue.kind
+            && let ExprKind::Ident(bh) = &base.kind
+            && bh.path.iter().all(|s| s.selects.is_empty())
+        {
+            let bn = self.resolve_hier_name(bh);
+            let idx = self.eval_expr(index).to_i64()?;
+            format!("{}[{}]", bn, idx)
+        } else {
+            return None;
+        };
+
+        let mut lookup = base_name.as_str();
+        let dt = loop {
+            if let Some(d) = self.module.var_decl_types.get(lookup) {
+                break d;
+            }
+            if let Some(open) = lookup.rfind('[')
+                && lookup.ends_with(']')
+            {
+                lookup = &lookup[..open];
+            } else {
+                return None;
+            }
+        };
+        let resolved =
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        match resolved {
+            DataType::Struct(su)
+                if !su.packed
+                    && !su.members.is_empty()
+                    && !(matches!(su.kind, crate::ast::types::StructUnionKind::Union)
+                        && !su.tagged) =>
+            {
+                Some((base_name, su.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_struct_force_leaves(
+        &self,
+        base_name: &str,
+        base_lval: &Expression,
+        rhs: &Expression,
+        su: &crate::ast::types::StructUnionType,
+        out: &mut Vec<(String, Expression, Expression)>,
+    ) {
+        use crate::ast::expr::{AssignmentPatternItem, ExprKind};
+        let peeled_rhs = rhs.peel_typed_pattern();
+        let pattern_items = match &peeled_rhs.kind {
+            ExprKind::AssignmentPattern(items) => Some(items.as_slice()),
+            _ => None,
+        };
+        let mut pos_idx = 0usize;
+        let mut member_idx = 0usize;
+        for m in &su.members {
+            for decl in &m.declarators {
+                let mname = &decl.name.name;
+                let leaf_name = format!("{base_name}.{mname}");
+                let member_ident = crate::ast::Identifier {
+                    name: mname.clone(),
+                    span: lval_span(base_lval),
+                };
+                let leaf_lval = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(base_lval.clone()),
+                        member: member_ident.clone(),
+                    },
+                    base_lval.span,
+                );
+                let mrhs = if let Some(items) = pattern_items {
+                    if let Some(found) = items.iter().find_map(|it| match it {
+                        AssignmentPatternItem::Named(k, e) if k.ident.name == *mname => {
+                            Some(e.clone())
+                        }
+                        _ => None,
+                    }) {
+                        found
+                    } else if let Some(AssignmentPatternItem::Ordered(e)) = items.get(pos_idx) {
+                        pos_idx += 1;
+                        e.clone()
+                    } else if let Some(def) = items.iter().find_map(|it| match it {
+                        AssignmentPatternItem::Default(e) => Some(e.clone()),
+                        _ => None,
+                    }) {
+                        def
+                    } else if member_idx < items.len()
+                        && let Some(AssignmentPatternItem::Ordered(e)) = items.get(member_idx)
+                    {
+                        e.clone()
+                    } else {
+                        Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(rhs.clone()),
+                                member: member_ident.clone(),
+                            },
+                            rhs.span,
+                        )
+                    }
+                } else {
+                    Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(rhs.clone()),
+                            member: member_ident.clone(),
+                        },
+                        rhs.span,
+                    )
+                };
+                member_idx += 1;
+
+                let eff_dims = super::elaborate::struct_member_dims(
+                    &m.data_type,
+                    &decl.dimensions,
+                    &self.module.typedef_unpacked_dims,
+                );
+                let resolved_m = super::elaborate::resolve_typedef_chain(
+                    &m.data_type,
+                    &self.module.typedef_types,
+                );
+                if !eff_dims.is_empty() {
+                    if let Some((lo, hi)) = super::elaborate::extract_array_range(
+                        &eff_dims,
+                        &self.module.parameters,
+                    ) {
+                        let a = lo.min(hi);
+                        let b = lo.max(hi);
+                        if (b - a) < 1024 {
+                            let peeled_mrhs = mrhs.peel_typed_pattern();
+                            let arr_items = match &peeled_mrhs.kind {
+                                ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
+                                _ => None,
+                            };
+                            for (offset, idx) in (a..=b).enumerate() {
+                                let elem_name = format!("{leaf_name}[{idx}]");
+                                let idx_expr = Expression::new(
+                                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                                        size: None,
+                                        signed: false,
+                                        base: crate::ast::expr::NumberBase::Decimal,
+                                        value: idx.to_string(),
+                                        cached_val: Default::default(),
+                                    }),
+                                    base_lval.span,
+                                );
+                                let elem_lval = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(leaf_lval.clone()),
+                                        index: Box::new(idx_expr.clone()),
+                                    },
+                                    base_lval.span,
+                                );
+                                let elem_rhs = if let Some(its) = arr_items {
+                                    if let Some(AssignmentPatternItem::Ordered(e)) =
+                                        its.get(offset)
+                                    {
+                                        e.clone()
+                                    } else if let Some(def) = its.iter().find_map(|it| match it {
+                                        AssignmentPatternItem::Default(e) => Some(e.clone()),
+                                        _ => None,
+                                    }) {
+                                        def
+                                    } else {
+                                        Expression::new(
+                                            ExprKind::Index {
+                                                expr: Box::new(mrhs.clone()),
+                                                index: Box::new(idx_expr),
+                                            },
+                                            mrhs.span,
+                                        )
+                                    }
+                                } else {
+                                    Expression::new(
+                                        ExprKind::Index {
+                                            expr: Box::new(mrhs.clone()),
+                                            index: Box::new(idx_expr),
+                                        },
+                                        mrhs.span,
+                                    )
+                                };
+                                if let DataType::Struct(sub_su) = resolved_m
+                                    && !sub_su.packed
+                                    && !sub_su.members.is_empty()
+                                {
+                                    self.collect_struct_force_leaves(
+                                        &elem_name,
+                                        &elem_lval,
+                                        &elem_rhs,
+                                        sub_su,
+                                        out,
+                                    );
+                                } else {
+                                    out.push((elem_name, elem_lval, elem_rhs));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if let DataType::Struct(sub_su) = resolved_m
+                    && !sub_su.packed
+                    && !sub_su.members.is_empty()
+                {
+                    self.collect_struct_force_leaves(&leaf_name, &leaf_lval, &mrhs, sub_su, out);
+                } else {
+                    out.push((leaf_name, leaf_lval, mrhs));
+                }
+            }
+        }
+    }
+
+    pub(in crate::compiler::simulator) fn try_force_unpacked_struct(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        is_force: bool,
+    ) -> bool {
+        let Some((base_name, su)) = self.resolve_unpacked_struct_target(lvalue) else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        self.collect_struct_force_leaves(&base_name, lvalue, rvalue, &su, &mut leaves);
+        if leaves.is_empty()
+            || !leaves.iter().any(|(name, _, _)| {
+                self.signal_name_to_id.contains_key(name.as_str())
+                    || self.signals.contains_key(name.as_str())
+            })
+        {
+            return false;
+        }
+        // Snapshot all leaf RHS values before mutating any leaf in case RHS
+        // reads back from the struct itself or its aliases.
+        let mut evaluated = Vec::with_capacity(leaves.len());
+        for (leaf_name, leaf_lval, leaf_rval) in leaves {
+            let v = self.eval_expr(&leaf_rval);
+            evaluated.push((leaf_name, leaf_lval, leaf_rval, v));
+        }
+        for (leaf_name, leaf_lval, leaf_rval, v) in evaluated {
+            let id = self.signal_name_to_id.get(leaf_name.as_str()).copied();
+            if let Some(id) = id {
+                self.unforce_cell(id);
+                self.partial_forces.remove(&id);
+            }
+            self.forced_names.remove(&leaf_name);
+            self.assign_value(&leaf_lval, &v);
+            self.ctl_note_deposit(&leaf_lval);
+            match id {
+                Some(id) => {
+                    self.force_cell(id, v);
+                    self.arm_force_expr(leaf_name, &leaf_lval, &leaf_rval);
+                }
+                None => {
+                    self.forced_names.insert(leaf_name.clone());
+                    self.arm_force_expr(leaf_name, &leaf_lval, &leaf_rval);
+                }
+            }
+            if let Some(sig) = id
+                && self.vpi_cb_mask != 0
+            {
+                let reason = if is_force {
+                    vpi_cb::CB_FORCE
+                } else {
+                    vpi_cb::CB_ASSIGN
+                };
+                self.vpi_notify_override(reason, Some(sig));
+            }
+        }
+        true
+    }
+
+    pub(in crate::compiler::simulator) fn try_release_unpacked_struct(
+        &mut self,
+        lvalue: &Expression,
+        is_release: bool,
+    ) -> bool {
+        let Some((base_name, su)) = self.resolve_unpacked_struct_target(lvalue) else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        self.collect_struct_force_leaves(&base_name, lvalue, lvalue, &su, &mut leaves);
+        if leaves.is_empty()
+            || !leaves.iter().any(|(name, _, _)| {
+                self.signal_name_to_id.contains_key(name.as_str())
+                    || self.signals.contains_key(name.as_str())
+            })
+        {
+            return false;
+        }
+        let base_target = self.force_target(lvalue);
+        for (leaf_name, _, _) in &leaves {
+            let id = self.signal_name_to_id.get(leaf_name.as_str()).copied();
+            self.release_override(Some((leaf_name.as_str(), id)));
+            if let Some(sig) = id
+                && self.vpi_cb_mask != 0
+            {
+                let reason = if is_release {
+                    vpi_cb::CB_RELEASE
+                } else {
+                    vpi_cb::CB_DEASSIGN
+                };
+                self.vpi_queue_release(reason, Some(sig));
+            }
+        }
+        if let Some((bname, bid)) = base_target {
+            self.release_override(Some((bname.as_str(), bid)));
+        }
+        true
+    }
+}
+
+#[inline]
+fn lval_span(e: &Expression) -> crate::ast::Span {
+    e.span
 }

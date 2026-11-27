@@ -198,7 +198,8 @@ thread_local! {}
 // Implicit-logic collection elements have integral types in compiled methods.
 // Unpacked NBA copies use the interpreter; dotted collection elements retain their width.
 // Dotted collection methods take the owning object's handle (§7.10, §8.10).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318d;
+// Chapter 6 data-type lowering (enums, shortreal, strings, events, typedefs, parameterized types, UDNs).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318e;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -2929,9 +2930,10 @@ pub struct Simulator {
     #[serde(skip)]
     typed_pattern_seq: u64,
     /// §6.19.5: the enumeration a type name denotes, for method receivers
-    /// (`enum_receivers`), valid for `type_tables_gen` of the second field.
+    /// (`enum_receivers`), keyed by enclosing class context (`""` outside any
+    /// class), valid for `type_tables_gen` of the second field.
     #[serde(skip)]
-    enum_recv_cache: HashMap<String, Option<std::rc::Rc<enum_receivers::EnumRecvType>>>,
+    enum_recv_cache: HashMap<String, HashMap<String, Option<std::rc::Rc<enum_receivers::EnumRecvType>>>>,
     #[serde(skip)]
     enum_recv_cache_gen: u64,
     /// §13.5: the slice actuals of the `output`, `inout` and `ref` array

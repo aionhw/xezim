@@ -465,6 +465,7 @@ impl Simulator {
                 return v;
             }
         }
+        let whole = expr;
         match &expr.kind {
             ExprKind::Number(num) => {
                 let v = self.eval_number(num);
@@ -501,14 +502,16 @@ impl Simulator {
                 v
             }
             ExprKind::StringLiteral(s) => {
-                // IEEE 1800-2017 §6.16: A string literal is a packed array of
-                // bytes (8 bits per character).  An empty string "" has width
-                // 0 (zero characters), *not* 8.  `Value::from_string` also
-                // maps chars above 0x7F to their Latin-1 byte — one byte per
-                // char, matching the §5.9.1 escape decoder — where the old
-                // per-`s.bytes()` loop counted UTF-8 bytes, so `"\xf1"` was
-                // 16 bits wide and truncated to the wrong byte (0xb1).
-                Value::from_string(s)
+                // IEEE 1800-2023 §5.9 / §6.16: A string literal is a packed array
+                // of 8-bit characters; an empty string literal `""` in an integral
+                // context is 8'h00 (`Value::zero(8)`). When converted to `string`,
+                // NUL bytes are removed. `Value::from_string` maps chars > 0x7F to
+                // Latin-1 bytes (1 byte per char).
+                if s.is_empty() {
+                    Value::zero(8)
+                } else {
+                    Value::from_string(s)
+                }
             }
             ExprKind::Ident(hier) => {
                 // §14.3: the flat spelling of `cb.sig[i]` (the select on the
@@ -723,6 +726,43 @@ impl Simulator {
                         }
                     }
                 }
+                // LRM §15.5.3: `e.triggered` on a named/class event.
+                // Match BEFORE class-property / hierarchical signal lookup
+                // when the prefix is a known event so object event properties
+                // don't short-circuit to raw X, while ordinary properties named
+                // `triggered` still fall through.
+                if hier.path.len() >= 2
+                    && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
+                {
+                    let head = hier_prefix(hier);
+                    let head_expr = Expression::new(ExprKind::Ident(head), expr.span);
+                    if let Some(fired) = self.event_triggered_now(&head_expr) {
+                        return if fired {
+                            Value::ones(1)
+                        } else {
+                            Value::zero(1)
+                        };
+                    }
+                }
+                // §15.5.5.3: non-scalar / class-member event handle in boolean
+                // context (`e.ev`, `u.sub_e`, `arr[i]`) must precede generic
+                // property / hierarchical signal reads.
+                if self.any_events_possible()
+                    && (hier.path.len() > 1 || !hier.path[0].selects.is_empty())
+                {
+                    let leaf = hier.path.last().unwrap().name.name.as_str();
+                    if self.class_event_names().contains(leaf)
+                        || self.module.events.contains(leaf)
+                        || self
+                            .module
+                            .events
+                            .contains(self.resolve_hier_name(hier).as_ref())
+                    {
+                        if let Some(v) = self.event_bool_value(expr) {
+                            return v;
+                        }
+                    }
+                }
                 // §8.9: a static property through a handle, null or not,
                 // names the shared cell of the handle's declared class.
                 if hier.path.len() == 2
@@ -909,21 +949,6 @@ impl Simulator {
                         return v;
                     }
                 }
-                // LRM §15.5.3: `e.triggered` on a named event.
-                // `e.triggered` parses as Ident(path=[e, triggered]); match
-                // here BEFORE generic signal lookup so we don't get back X.
-                if hier.path.len() >= 2
-                    && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
-                {
-                    let head = hier_prefix(hier);
-                    let head_expr = Expression::new(ExprKind::Ident(head), expr.span);
-                    let fired = self.event_triggered_now(&head_expr).unwrap_or(false);
-                    return if fired {
-                        Value::ones(1)
-                    } else {
-                        Value::zero(1)
-                    };
-                }
                 // §6.19.6: enum methods written WITHOUT parentheses parse as a
                 // hierarchical Ident, e.g. `color1.num` -> path=[color1, num].
                 // Route to the enum-method evaluator when the prefix is an
@@ -941,6 +966,13 @@ impl Simulator {
                         mname.as_str(),
                         "num" | "first" | "last" | "next" | "prev" | "name"
                     ) {
+                        // §5.13, §6.19.5: paren-less enum methods read their
+                        // declared enum type directly (matching paren'd calls),
+                        // before falling back to collection/hierarchical lookup.
+                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
+                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
+                            return v;
+                        }
                         let head = hier_prefix(hier);
                         if head
                             .path
@@ -954,16 +986,6 @@ impl Simulator {
                                 .map(|tn| self.module.enum_members.contains_key(&tn))
                                 .unwrap_or(false)
                                 || self.module.enum_members.contains_key(&bare)
-                                // A PROCEDURAL local's enum typedef is only in
-                                // the typedef overlay/global —
-                                // `type_name_of_var` reads var_class_types and
-                                // the signal tables, none of which know it. So
-                                // `e_t l; l.name` fell through to a
-                                // hierarchical read (""), while the same
-                                // declaration at module scope worked. Frame
-                                // overlay first, as `local_class_type_of`
-                                // orders it; this is the map
-                                // `enum_typed_receiver` already keys on.
                                 || self
                                     .local_typedef_type_of(&bare)
                                     .or_else(|| self.var_typedef_types.get(&bare).cloned())
@@ -974,23 +996,8 @@ impl Simulator {
                                 if let Some(v) = self.eval_builtin_method(&bare, &mname, &[]) {
                                     return v;
                                 }
-                                // `name` has no `BuiltinM` arm: §6.19.5.7's
-                                // enum-method evaluator lives on the CALL
-                                // path, which already decomposes this exact
-                                // multi-segment Ident. A parenless method is
-                                // the zero-argument call §13.5.5 says it is,
-                                // so dispatch it as one rather than reading
-                                // the name as hierarchical storage — that read
-                                // returned "" for `.name` at every scope.
                                 return self.eval_call_inner(expr, &[]);
                             }
-                        }
-                        // §5.13, §6.19.5: any other receiver (a class
-                        // property, a struct member, an element) takes the
-                        // methods from its declared type, as the call does.
-                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
-                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
-                            return v;
                         }
                     }
                 }
@@ -1016,6 +1023,25 @@ impl Simulator {
                         .cloned()
                     {
                         if let Some(v) = self.ref_alias_read(&storage) {
+                            return v;
+                        }
+                    }
+                    // §15.5.5.3: an event handle in a Boolean/value context
+                    // evaluates to 1'b1 if non-null and 1'b0 if null.
+                    if self.any_events_possible()
+                        && (self.local_event_handle(name).is_some()
+                            || self.module.events.contains(name.as_str())
+                            || self.event_aliases.contains_key(name.as_str())
+                            || (!self.ref_binding_stack.is_empty()
+                                && self
+                                    .ref_binding_stack
+                                    .iter()
+                                    .rev()
+                                    .any(|m| m.contains_key(name.as_str())))
+                            || (self.this_stack.last().copied().flatten().is_some()
+                                && self.class_event_names().contains(name.as_str())))
+                    {
+                        if let Some(v) = self.event_bool_value(expr) {
                             return v;
                         }
                     }
@@ -1286,6 +1312,15 @@ impl Simulator {
                                 .contains(&hier.path[0].name.name)
                             && let Some(v) =
                                 self.class_scope_member_value(&hier.path[0].name.name, prop)
+                        {
+                            return v;
+                        }
+                        if hier.path[0].selects.is_empty()
+                            && hier.path[1].selects.is_empty()
+                            && self.module.classes.contains_key(cls)
+                            && !self.signal_name_to_id.contains_key(&format!("{}.{}", cls, prop))
+                            && !self.signal_name_to_id.contains_key(cls)
+                            && let Some(v) = self.class_scoped_enum_literal(cls, prop)
                         {
                             return v;
                         }
@@ -2293,18 +2328,24 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                // §15.5.4: comparing event variables compares their IDENTITY
-                // (which synchronization object they name), not a value. An
-                // event's 1-bit backing signal holds an arbitrary toggle state,
-                // so the integral path returned x — `e1 == e2` after `e1 = e2`
-                // read x instead of 1. Null compares equal only to null.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let lk = self.event_operand_key(left);
-                    let rk = self.event_operand_key(right);
-                    if let (Some(lk), Some(rk)) = (lk, rk) {
-                        let eq = lk == rk;
-                        let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
-                        return Value::from_u64(res as u64, 1);
+                // §15.5.4 / §15.5.5.3: comparing event variables compares their
+                // IDENTITY (`==`, `!=`, `===`, `!==`), not a toggle value,
+                // and null compares equal only to null. Guard on shape + live
+                // event presence so non-event compares pay zero overhead.
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) && Self::expr_could_be_event(left)
+                    && Self::expr_could_be_event(right)
+                    && self.any_events_possible()
+                {
+                    if let Some(lk) = self.event_operand_key(left) {
+                        if let Some(rk) = self.event_operand_key(right) {
+                            let eq = lk == rk;
+                            let is_eq = matches!(op, BinaryOp::Eq | BinaryOp::CaseEq);
+                            let res = if is_eq { eq } else { !eq };
+                            return Value::from_u64(res as u64, 1);
+                        }
                     }
                 }
                 // §11.4.8 gated-call elision, RIGHT-hand mask. Handled BEFORE
@@ -2446,21 +2487,6 @@ impl Simulator {
                 // corrupts code such as hierarchical scope-string walking.
                 // Both string probes below ask the same questions of an
                 // unchanged state; answer each at most once.
-                let mut left_is_str: Option<bool> = None;
-                let mut right_is_str: Option<bool> = None;
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && *left_is_str.get_or_insert_with(|| self.operand_is_string(left))
-                    && *right_is_str.get_or_insert_with(|| self.operand_is_string(right))
-                {
-                    let ls = l.to_sv_string();
-                    let rs = r.to_sv_string();
-                    let res = match op {
-                        BinaryOp::Eq => ls == rs,
-                        BinaryOp::Neq => ls != rs,
-                        _ => unreachable!(),
-                    };
-                    return Value::from_u64(res as u64, 1);
-                }
                 // IEEE 1800-2017 §11.8.1/§11.8.2: an expression is UNSIGNED as
                 // soon as ANY operand is unsigned, and §11.8.2 step 2 converts
                 // every operand to the EXPRESSION's signedness BEFORE it is
@@ -2516,19 +2542,28 @@ impl Simulator {
                         | BinaryOp::Neq
                 ) && (self.operand_has_string_type(left) || self.operand_has_string_type(right))
                 {
-                    // §6.16: string comparison is by TEXT. Equality also goes
-                    // through here because an out-of-bounds string-collection
-                    // read stores X bits whose text is "" — a bit-level
-                    // compare against "" then yielded X instead of 1 (§6.16
-                    // strings are 2-state).
-                    let (a, b) = (wl.to_sv_string(), wr.to_sv_string());
+                    // §6.16: string comparison is by TEXT (unsigned byte order).
+                    // Normalize non-string-typed operands (literals/integrals) by
+                    // stripping NULs while preserving any `%u`/`%z` NULs already
+                    // inside string-typed operands.
+                    let a = if self.operand_has_string_type(left) {
+                        wl
+                    } else {
+                        wl.sv_string_strip_nul()
+                    };
+                    let b = if self.operand_has_string_type(right) {
+                        wr
+                    } else {
+                        wr.sv_string_strip_nul()
+                    };
+                    let cmp = a.sv_string_cmp(&b, false);
                     let t = match op {
-                        BinaryOp::Lt => a < b,
-                        BinaryOp::Leq => a <= b,
-                        BinaryOp::Gt => a > b,
-                        BinaryOp::Geq => a >= b,
-                        BinaryOp::Eq => a == b,
-                        _ => a != b,
+                        BinaryOp::Lt => cmp < 0,
+                        BinaryOp::Leq => cmp <= 0,
+                        BinaryOp::Gt => cmp > 0,
+                        BinaryOp::Geq => cmp >= 0,
+                        BinaryOp::Eq => cmp == 0,
+                        _ => cmp != 0,
                     };
                     return Value::from_u64(t as u64, 1);
                 }
@@ -2682,6 +2717,11 @@ impl Simulator {
                         (else_expr, then_expr)
                     };
                     let mut v = self.eval_expr_typed(taken, arm_ctx, arms_unsigned);
+                    let str_result = self.operand_has_string_type(then_expr)
+                        || self.operand_has_string_type(else_expr);
+                    if str_result && !v.is_real && !self.operand_has_string_type(taken) {
+                        v = v.sv_string_strip_nul();
+                    }
                     // §11.4.11 + §11.8.1: BOTH branches determine the result
                     // type. If either is unsigned the result is unsigned, and
                     // the narrower branch is then extended by the RESULT's
@@ -2697,7 +2737,7 @@ impl Simulator {
                     // pass to TIMEOUT before this was narrowed).
                     let other_is_cheap =
                         matches!(&other.kind, ExprKind::Ident(_) | ExprKind::Number(_));
-                    if !v.is_real && other_is_cheap {
+                    if !str_result && !v.is_real && other_is_cheap {
                         let o = self.eval_expr_ctx(other, ctx_width);
                         if !o.is_real {
                             if !o.is_signed {
@@ -2712,21 +2752,32 @@ impl Simulator {
                 }
             }
             ExprKind::Concatenation(parts) => {
-                // String concatenation (`{indent, s, ...}`) when any operand is
-                // string-valued: join the operands' text. Bit-concat would
-                // byte-misalign (shifting 0x20 spaces into 0x40 '@').
-                if parts.iter().any(|p| self.expr_is_string_valued(p)) {
-                    let mut s = String::new();
+                // IEEE 1800-2023 §6.16 Table 6-9: concatenation with at least
+                // one `string`-typed operand is a string concatenation.
+                // Literal-only / literal+integral concats stay integral bit-vector
+                // concatenations.
+                if parts.iter().any(|p| self.operand_has_string_type(p)) {
+                    let mut out: Vec<u8> = Vec::new();
                     for p in parts {
-                        s.push_str(&self.eval_expr(p).to_sv_string());
+                        let pv = self.eval_expr(p);
+                        let bytes = pv.sv_string_bytes_cow();
+                        if self.operand_has_string_type(p) {
+                            out.extend_from_slice(&bytes);
+                        } else {
+                            out.extend(bytes.iter().copied().filter(|&b| b != 0));
+                        }
                     }
-                    return Value::from_string(&s);
+                    return Value::from_bytes(&out);
                 }
-                let mut r = Value::zero(0);
-                for p in parts.iter().rev() {
-                    r = self.eval_expr(p).concat_with(&r);
+                if parts.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(parts.len());
+                    for p in parts.iter().rev() {
+                        vals.push(self.eval_expr(p));
+                    }
+                    Value::concat_refs(vals.iter().rev())
                 }
-                r
             }
             ExprKind::StreamOp {
                 left_to_right,
@@ -2734,32 +2785,28 @@ impl Simulator {
                 exprs,
             } => {
                 // Concat in source order: MSB = first expr. Build by concatenating from LSB (last expr).
-                let mut concat = Value::zero(0);
-                for p in exprs.iter().rev() {
-                    // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
-                    // §11.4.14: an unpacked operand streams its elements
-                    // leftmost first (`stream_elem_order`) — a descending
-                    // `[2:0]` array starts at index 2, a 2-D array goes row
-                    // by row. A queue / dynamic-array SLICE `q[a:b]` streams
-                    // elements a..b.
-                    // §11.4.14: resolve the collection's backing storage,
-                    // including class members, before reading its elements;
-                    // a `with [range]` / slice sub-range streams only the
-                    // selected elements (§11.4.14.4), in stream order.
-                    let elem_list = self.stream_operand_elems(p, false);
-                    let piece = if let Some((names, ew)) = elem_list {
-                        let mut acc = Value::zero(0);
-                        for en in &names {
-                            let ev = self.get_signal_value_by_name(en).unwrap_or(Value::zero(ew));
-                            acc = acc.concat_with(&ev);
-                        }
-                        acc
-                    } else {
-                        self.eval_expr(p)
-                    };
-                    concat = piece.concat_with(&concat);
-                }
-                let total_w = concat.width as usize;
+                let concat = if exprs.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut pieces = Vec::with_capacity(exprs.len());
+                    for p in exprs.iter().rev() {
+                        // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
+                        // §11.4.14: an unpacked operand streams its elements
+                        // leftmost first (`stream_elem_order`) — a descending
+                        // `[2:0]` array starts at index 2, a 2-D array goes row
+                        // by row. A queue / dynamic-array SLICE `q[a:b]` streams
+                        // elements a..b.
+                        // §11.4.14: resolve the collection's backing storage,
+                        // including class members, before reading its elements;
+                        // a `with [range]` / slice sub-range streams only the
+                        // selected elements (§11.4.14.4), in stream order.
+                        let piece = self
+                            .stream_operand_packed(p)
+                            .unwrap_or_else(|| self.eval_expr(p));
+                        pieces.push(piece);
+                    }
+                    Value::concat_refs(pieces.iter().rev())
+                };
                 let streamed = if !*left_to_right {
                     concat
                 } else {
@@ -2768,33 +2815,7 @@ impl Simulator {
                         .map(|e| self.eval_expr(e).to_u64().unwrap_or(1) as usize)
                         .unwrap_or(1)
                         .max(1);
-                    // Reverse successive slice-sized chunks starting from the MSB side.
-                    let mut out = Value::zero(total_w as u32);
-                    let full_chunks = total_w / slice;
-                    let remainder = total_w - full_chunks * slice;
-                    // Original bits [total_w-1 .. 0], where bit (total_w-1) is MSB.
-                    // Source chunk k (0-indexed from MSB): bits [total_w-1-k*slice .. total_w-k*slice-slice].
-                    // With left_to_right streaming, chunk order is preserved but bits *within* each chunk stay ordered.
-                    // Actually `{<<slice {x}}` emits slice-sized groups MSB-first from x with each group's bits in LSB-first order inside the stream... The classic interpretation: slice the source into slice-sized chunks from LSB, then reverse the chunk order.
-                    // Standard behavior: output = reverse the order of slice-sized chunks of the source.
-                    for k in 0..full_chunks {
-                        for b in 0..slice {
-                            let src_bit = k * slice + b;
-                            let dst_bit = (full_chunks - 1 - k) * slice + b + remainder;
-                            if src_bit < total_w && dst_bit < total_w {
-                                out.set_bit(dst_bit, concat.get_bit(src_bit));
-                            }
-                        }
-                    }
-                    // Leftover bits at the top of the source (fewer than slice) go to the LSB of output.
-                    for b in 0..remainder {
-                        let src_bit = full_chunks * slice + b;
-                        let dst_bit = b;
-                        if src_bit < total_w {
-                            out.set_bit(dst_bit, concat.get_bit(src_bit));
-                        }
-                    }
-                    out
+                    concat.reverse_slices(slice)
                 };
                 // §11.4.14.2: a stream assigned to a WIDER integral target is
                 // LEFT-justified — the LRM's own example is
@@ -2813,7 +2834,7 @@ impl Simulator {
                 // made fatal here.
                 if ctx_width > streamed.width {
                     let pad = Value::zero(ctx_width - streamed.width);
-                    streamed.concat_with(&pad)
+                    Value::concat_refs([&streamed, &pad].into_iter())
                 } else {
                     streamed
                 }
@@ -2840,24 +2861,45 @@ impl Simulator {
                 //    resize handle it.
                 const MAX_REPL: u64 = 1 << 20;
                 let count_val = self.eval_expr(count);
-                let n_raw = count_val.to_u64().unwrap_or(1);
-                let n = if n_raw > MAX_REPL { 0 } else { n_raw };
-                let mut inner = Value::zero(0);
-                for e in exprs.iter().rev() {
-                    inner = self.eval_expr(e).concat_with(&inner);
-                }
-                let inner_w = inner.width as usize;
-                let total_w = (inner_w as u64).saturating_mul(n) as u32;
-                let mut r = Value::zero(total_w);
-                if inner_w > 0 {
-                    for k in 0..n as usize {
-                        let off = k * inner_w;
-                        for i in 0..inner_w {
-                            r.set_bit(off + i, inner.get_bit(i));
+                if exprs.iter().any(|e| self.operand_has_string_type(e)) {
+                    let Some(c) = count_val.to_i64() else {
+                        return Value::zero(0);
+                    };
+                    if count_val.has_xz() || c <= 0 || (c as u64) > MAX_REPL {
+                        return Value::zero(0);
+                    }
+                    let mut unit: Vec<u8> = Vec::new();
+                    for e in exprs {
+                        let pv = self.eval_expr(e);
+                        let bytes = pv.sv_string_bytes_cow();
+                        if self.operand_has_string_type(e) {
+                            unit.extend_from_slice(&bytes);
+                        } else {
+                            unit.extend(bytes.iter().copied().filter(|&b| b != 0));
                         }
                     }
+                    if unit.is_empty() {
+                        return Value::zero(0);
+                    }
+                    let n = c as usize;
+                    let mut out = Vec::with_capacity(unit.len().saturating_mul(n));
+                    for _ in 0..n {
+                        out.extend_from_slice(&unit);
+                    }
+                    return Value::from_bytes(&out);
                 }
-                r
+                let n_raw = count_val.to_u64().unwrap_or(1);
+                let n = if n_raw > MAX_REPL { 0 } else { n_raw };
+                let inner = if exprs.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(exprs.len());
+                    for e in exprs.iter().rev() {
+                        vals.push(self.eval_expr(e));
+                    }
+                    Value::concat_refs(vals.iter().rev())
+                };
+                inner.replicate(n as usize)
             }
             ExprKind::Index { expr, index } => {
                 // §7.4.1/§11.5.1: a bit of a vector the call frame holds, at
@@ -2891,6 +2933,21 @@ impl Simulator {
                     return self.eval_expr_ctx(&selected, ctx_width);
                 }
 
+                if self.any_events_possible() && !matches!(&expr.kind, ExprKind::Call { .. }) {
+                    let leaf = match &expr.kind {
+                        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                        ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                        _ => None,
+                    };
+                    if let Some(l) = leaf
+                        && (self.module.events.contains(l)
+                            || self.class_event_names().contains(l))
+                    {
+                        if let Some(v) = self.event_bool_value(whole) {
+                            return v;
+                        }
+                    }
+                }
                 // §14.3: `cb.sig[i]` on an unpacked-array clockvar reads the
                 // element's sample (see `tick_clocking_blocks`).
                 if let Some(v) = self.clocking_array_elem_read(expr, index) {
@@ -3755,10 +3812,9 @@ impl Simulator {
                         // string flag another frame left on the name is not it.
                         self.frame_name_is_string(nm)
                     } {
-                        let content = self.eval_expr(expr).sv_string_bytes();
-                        let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                        let byte = content.get(i).copied().unwrap_or(0);
-                        return Self::sv_byte(byte);
+                        let base = self.eval_expr(expr);
+                        let idx_val = self.eval_expr(index);
+                        return Self::sv_index_read(&base, &idx_val);
                     }
                 }
                 // Nested packed multi-D select (`a[i][j]` on
@@ -4002,10 +4058,9 @@ impl Simulator {
                 ) {
                     if let Some(fname) = self.flat_member_name(expr) {
                         if self.is_string_collection(&fname) {
-                            let text = self.eval_expr(expr).sv_string_bytes();
-                            let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                            let b = text.get(i).copied().unwrap_or(0);
-                            return Self::sv_byte(b);
+                            let base = self.eval_expr(expr);
+                            let idx_val = self.eval_expr(index);
+                            return Self::sv_index_read(&base, &idx_val);
                         }
                     }
                 }
@@ -4476,6 +4531,13 @@ impl Simulator {
                 v
             }
             ExprKind::SystemCall { name, args } => {
+                if name == "$__xz_named_cast" && args.len() == 2 {
+                    if let Some(v) =
+                        self.try_eval_specialized_named_cast(expr, &args[0], &args[1], ctx_width)
+                    {
+                        return v;
+                    }
+                }
                 self.eval_expr_system_call(expr, ctx_width, name, args)
             }
             ExprKind::This => {
@@ -4496,6 +4558,15 @@ impl Simulator {
                     });
                     if self.expr_is_string_valued(recv) || recv_name.is_some() {
                         return self.eval_call(expr, &[]);
+                    }
+                }
+                if member.name != "triggered"
+                    && self.any_events_possible()
+                    && (self.class_event_names().contains(member.name.as_str())
+                        || !self.module.events.is_empty())
+                {
+                    if let Some(v) = self.event_bool_value(expr) {
+                        return v;
                     }
                 }
 
@@ -4725,11 +4796,15 @@ impl Simulator {
                 self.eval_expr(expr)
             }
             ExprKind::AssignmentPattern(parts) => {
-                let mut r = Value::zero(0);
-                for p in parts.iter().rev() {
-                    r = self.eval_expr(p.expr()).concat_with(&r);
+                if parts.is_empty() {
+                    Value::zero(0)
+                } else {
+                    let mut vals = Vec::with_capacity(parts.len());
+                    for p in parts.iter().rev() {
+                        vals.push(self.eval_expr(p.expr()));
+                    }
+                    Value::concat_refs(vals.iter().rev())
                 }
-                r
             }
             // §10.9: a typed pattern has its type's value.
             ExprKind::TypedPattern { .. } => self.eval_typed_pattern(expr),

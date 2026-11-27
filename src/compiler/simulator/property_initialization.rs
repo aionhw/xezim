@@ -483,7 +483,12 @@ impl Simulator {
                             en.push(']');
                             let w = self.widths.get(&en).copied().unwrap_or(default_w);
                             let mut v = if is_str {
-                                self.eval_expr(e)
+                                let v = self.eval_expr(e);
+                                if !v.is_real && !self.operand_has_string_type(e) {
+                                    v.sv_string_strip_nul()
+                                } else {
+                                    v
+                                }
                             } else if let Some(dt) = elem_dt.as_ref() {
                                 self.eval_pattern_leaf_value(dt, e, (w > 0).then_some(w))
                             } else if w > 0 {
@@ -540,6 +545,12 @@ impl Simulator {
                     continue;
                 }
             }
+            if self.class_prop_declared_event(handle, &slot) {
+                let lv = Self::hier_ident_expr(Self::iface_path_segs(&slot, init.span), init.span);
+                if self.bind_instance_event_assign(&lv, init) {
+                    continue;
+                }
+            }
             let real = cdef.properties.get(&pname).is_some_and(|sig| sig.is_real);
             // §10.8: a pattern takes the property's declared type.
             let decl_ty = if has_pattern(&init) {
@@ -570,12 +581,42 @@ impl Simulator {
         }
         let width = self.heap_prop_width(handle, pname);
         self.construct_init_depth += 1;
+        let is_str = decl_ty
+            .as_ref()
+            .is_some_and(|dt| {
+                matches!(
+                    self.resolve_dt_ref(dt),
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            })
+            || self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|inst| inst.class_name.clone())
+                .and_then(|cls| self.class_property_decl_type(&cls, pname))
+                .is_some_and(|(dt, unpacked)| {
+                    unpacked.is_empty()
+                        && matches!(
+                            self.resolve_dt_ref(&dt),
+                            DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        )
+                });
         let typed = decl_ty.and_then(|dt| self.eval_in_packed_type(init, &dt));
-        let value = match (typed, width) {
+        let mut value = match (typed, width) {
             (Some(v), _) => v,
             (None, Some(width)) => self.eval_expr_ctx(init, width),
             (None, None) => self.eval_expr(init),
         };
+        if is_str && !value.is_real && !self.operand_has_string_type(init) {
+            value = value.sv_string_strip_nul();
+        }
         self.construct_init_depth -= 1;
         let value = if real {
             Value::from_f64(value.to_f64())

@@ -298,8 +298,8 @@ impl Simulator {
         id: usize,
         hi: u32,
         lo: u32,
-        val_bits: u64,
-        xz_bits: u64,
+        mut val_bits: u64,
+        mut xz_bits: u64,
     ) {
         if id >= self.signal_table.len() {
             return;
@@ -309,6 +309,11 @@ impl Simulator {
         // VM's `BlockingAssignRange` does.
         if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
             return;
+        }
+        // §6.11.1/§6.11.2: 2-state signals drop X/Z -> 0 on partial writes too.
+        if xz_bits != 0 && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            val_bits &= !xz_bits;
+            xz_bits = 0;
         }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
@@ -464,13 +469,18 @@ impl Simulator {
         if is_packed_id(id) {
             return self.packed_store_value(id, val);
         }
-        let width = self.signal_widths[id];
-        let mut resized = val.resize(width);
-        // §6.11.1/§10.7: a 2-state destination drops X/Z on every write.
-        if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
-            resized = resized.to_two_state();
-        }
-        resized.is_signed = self.signal_signed[id];
+        let resized = if self.signal_real.get(id).copied().unwrap_or(false) || val.is_real {
+            self.fit_value_to_signal(id, val)
+        } else {
+            let width = self.signal_widths[id];
+            let mut resized = val.resize(width);
+            // §6.11.1/§10.7: a 2-state destination drops X/Z on every write.
+            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+                resized = resized.to_two_state();
+            }
+            resized.is_signed = self.signal_signed[id];
+            resized
+        };
         let changed = self.signal_table[id] != resized;
         if changed {
             write_sig!(self, id, resized);
@@ -484,43 +494,9 @@ impl Simulator {
     #[inline]
     pub(super) fn fast_signal_write(&mut self, name: &str, val: Value) -> bool {
         if let Some(&id) = self.signal_name_to_id.get(name) {
-            let width = self.signal_widths[id];
-            let mut resized = val.resize(width);
-            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
-                resized = resized.to_two_state();
-            }
-            resized.is_signed = self.signal_signed[id];
-            let changed = self.signal_table[id] != resized;
-            if changed {
-                write_sig!(self, id, resized);
-                self.table_modified = true;
-                // Avoid a second signal_name_to_id lookup via mark_dirty(name)
-                // — we already resolved id above.
-                self.mark_dirty_id(id);
-            }
-            changed
+            self.fast_signal_write_id(id, &val)
         } else if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
-            // Array-element fast path. Required because per-element entries
-            // are no longer materialised in signal_name_to_id; without this,
-            // every $readmemh element falls into the slow path that runs
-            // sync_table_to_hashmap (O(num_signals) per call), which on E902
-            // ballooned simulation memory past 6 GB.
-            if is_packed_id(id) {
-                return self.packed_store_value(id, &val);
-            }
-            let width = self.signal_widths[id];
-            let mut resized = val.resize(width);
-            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
-                resized = resized.to_two_state();
-            }
-            resized.is_signed = self.signal_signed[id];
-            let changed = self.signal_table[id] != resized;
-            if changed {
-                write_sig!(self, id, resized);
-                self.table_modified = true;
-                self.mark_dirty_id(id);
-            }
-            changed
+            self.fast_signal_write_id(id, &val)
         } else {
             // Fallback
             self.sync_table_to_hashmap();
@@ -530,7 +506,11 @@ impl Simulator {
                 .copied()
                 .filter(|w| *w > 0)
                 .unwrap_or(val.width);
-            let mut resized = val.resize(width);
+            let mut resized = if self.name_is_shortreal(name) {
+                Value::from_f64(val.to_f64() as f32 as f64)
+            } else {
+                val.resize(width)
+            };
             resized.is_signed = self.signed_signals.contains(name);
             let changed = self.signals.get(name).is_none_or(|p| *p != resized);
             if changed {

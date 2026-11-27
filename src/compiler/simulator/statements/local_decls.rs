@@ -26,6 +26,7 @@ impl Simulator {
     /// A `string` keeps its text unresized: resizing to the placeholder
     /// width padded it with NULs that later concatenations copied.
     pub(in crate::compiler::simulator) fn fit_local_decl_init(
+        &self,
         raw: Value,
         w: u32,
         data_type: &DataType,
@@ -34,7 +35,10 @@ impl Simulator {
         signed: bool,
     ) -> Value {
         if is_real_type {
-            if matches!(data_type, DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }) {
+            if super::elaborate::is_type_shortreal_resolved(
+                self.resolve_dt_ref(data_type),
+                &self.module.typedef_types,
+            ) {
                 return Value::from_f64(raw.to_f64() as f32 as f64);
             }
             return if raw.is_real {
@@ -44,7 +48,7 @@ impl Simulator {
             };
         }
         if matches!(
-            data_type,
+            self.resolve_dt_ref(data_type),
             crate::ast::types::DataType::Simple {
                 kind: crate::ast::types::SimpleType::String,
                 ..
@@ -86,9 +90,21 @@ impl Simulator {
         // So is a struct whose members name a type parameter (`typedef
         // struct packed { T inner; logic [3:0] tag; } wrap_t;`) with the
         // members bound: `w.inner` had no width in its layout.
+        let spec_res = if tp_concrete.is_none() {
+            super::elaborate::resolve_specialized_class_data_type(
+                data_type,
+                &self.module.parameters,
+                &self.module,
+            )
+        } else {
+            None
+        };
         let bound_typedef = match tp_concrete.as_deref() {
             Some(c) => self.bound_typedef_dt(c),
-            None => self.struct_with_bound_members(data_type),
+            None => spec_res
+                .as_ref()
+                .map(|r| r.data_type.clone())
+                .or_else(|| self.struct_with_bound_members(data_type)),
         };
         let resolved_dt: std::borrow::Cow<'a, DataType> = match bound_typedef {
             Some(dt) => std::borrow::Cow::Owned(dt),
@@ -98,36 +114,42 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
-        let scoped_class_w = match data_type {
-            crate::ast::types::DataType::TypeReference {
-                name, dimensions, ..
-            } if name.has_scope() => {
-                let width = self
-                    .scoped_inherited_typedef(name)
-                    .map(|(target, params)| {
-                        super::elaborate::resolve_type_width(
-                            &target,
-                            Some(&params),
-                            Some(&self.module.typedefs),
-                        )
+        let scoped_class_w = if let Some(res) = &spec_res {
+            Some(res.width)
+        } else {
+            match data_type {
+                crate::ast::types::DataType::TypeReference {
+                    name, dimensions, ..
+                } if name.has_scope() => {
+                    let width = self
+                        .scoped_inherited_typedef(name)
+                        .map(|(target, params)| {
+                            super::elaborate::resolve_type_width(
+                                &target,
+                                Some(&params),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .filter(|&w| w > 0)
+                        .or_else(|| {
+                            super::elaborate::specialized_class_scope_width(name, &self.module)
+                        });
+                    width.and_then(|w| {
+                        let mut total: u64 = u64::from(w);
+                        for d in dimensions {
+                            let crate::ast::types::PackedDimension::Range { left, right, .. } = d
+                            else {
+                                return None;
+                            };
+                            let l = super::elaborate::const_eval_i64_with_params(left, None)?;
+                            let r = super::elaborate::const_eval_i64_with_params(right, None)?;
+                            total = total.checked_mul(l.abs_diff(r) + 1)?;
+                        }
+                        u32::try_from(total).ok()
                     })
-                    .filter(|&w| w > 0)
-                    .or_else(|| super::elaborate::specialized_class_scope_width(name, &self.module));
-                width.and_then(|w| {
-                    let mut total: u64 = u64::from(w);
-                    for d in dimensions {
-                        let crate::ast::types::PackedDimension::Range { left, right, .. } = d
-                        else {
-                            return None;
-                        };
-                        let l = super::elaborate::const_eval_i64_with_params(left, None)?;
-                        let r = super::elaborate::const_eval_i64_with_params(right, None)?;
-                        total = total.checked_mul(l.abs_diff(r) + 1)?;
-                    }
-                    u32::try_from(total).ok()
-                })
+                }
+                _ => None,
             }
-            _ => None,
         };
         // §8.25: a local sized by a class parameter or localparam
         // (`bit [N-1:0] x;` in a method of `C #(N)`) takes the executing
@@ -227,8 +249,17 @@ impl Simulator {
         // defaults to `null`, also when its type is a typedef alias
         // (`vif_t v;`) or an explicit `virtual bus_if v` declaration.
         let is_vif_handle = !is_class_handle && self.decl_is_virtual_iface(data_type);
+        let is_string_type = matches!(
+            self.resolve_dt_ref(data_type),
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        );
         let mut default_v = if is_real_type {
             Value::from_f64(0.0)
+        } else if is_string_type {
+            Value::zero(0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
         {
             Value::zero(w)
@@ -621,6 +652,57 @@ impl Simulator {
         )
     }
 
+    fn static_local_collection_key(&self, name: &str) -> Option<String> {
+        if self.local_dyn.is_empty() {
+            return None;
+        }
+        let raw = self.static_local_storage_key(name)?;
+        let sanitized: String = raw
+            .chars()
+            .map(|c| match c {
+                '[' | ']' | '.' => '_',
+                _ => c,
+            })
+            .collect();
+        Some(format!("$st:{sanitized}"))
+    }
+
+    fn bind_local_dyn(&mut self, bare: &str, key: String) {
+        if let Some(frame) = self.local_dyn.last_mut() {
+            if let Some(slot) = frame.iter_mut().find(|(k, _)| k == bare) {
+                slot.1 = key;
+            } else {
+                frame.push((bare.to_string(), key));
+            }
+        }
+    }
+
+    fn finish_static_local_dyn(&mut self, bare: &str, sk: &str) {
+        if let Some((fields, name, prev)) = self.local_elem_layout.take()
+            && name == bare
+        {
+            self.module.packed_struct_fields.insert(sk.to_string(), fields);
+            match prev {
+                Some(p) => self.module.packed_struct_fields.insert(name, p),
+                None => self.module.packed_struct_fields.remove(&name),
+            };
+        }
+        if let Some(dimensions) = self
+            .module
+            .packed_full_dims
+            .get(bare)
+            .filter(|d| d.len() > 1)
+            .cloned()
+        {
+            self.module.packed_full_dims.insert(sk.to_string(), dimensions);
+            if let Some(width) = self.module.packed_signal_elem_widths.get(bare).copied() {
+                self.module
+                    .packed_signal_elem_widths
+                    .insert(sk.to_string(), width);
+            }
+        }
+    }
+
     #[inline(never)]
     pub(in crate::compiler::simulator) fn exec_stmt_var_decl(
         &mut self,
@@ -636,6 +718,14 @@ impl Simulator {
                 self.claim_local_meta(&d.name.name, stmt);
             }
         }
+        let spec_udims: Vec<crate::ast::types::UnpackedDimension> =
+            super::elaborate::resolve_specialized_class_data_type(
+                data_type,
+                &self.module.parameters,
+                &self.module,
+            )
+            .map(|r| r.unpacked_dims)
+            .unwrap_or_default();
         let (resolved_dt, shape) = self.resolve_var_decl_shape(data_type);
         let data_type: &DataType = resolved_dt.as_ref();
         let VarDeclShape {
@@ -662,10 +752,48 @@ impl Simulator {
         // variable is implicitly static, §6.21); such a declaration keeps
         // running each time, as an automatic one would.
         let explicit_static = matches!(lifetime, Some(crate::ast::types::Lifetime::Static));
+        let in_class_method = matches!(self.class_context_stack.last(), Some(Some(_)));
+        // §6.18/§6.20.3: resolve typedef'd / type-param unpacked dims once per decl.
+        let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !spec_udims.is_empty() {
+            spec_udims
+        } else if !plain_class {
+            if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                let tn = &name.name.name;
+                let concrete = self
+                    .resolve_type_param_binding(tn)
+                    .unwrap_or_else(|| tn.clone());
+                self.module
+                    .typedef_unpacked_dims
+                    .get(&concrete)
+                    .cloned()
+                    .or_else(|| {
+                        let start = name
+                            .scopes
+                            .first()
+                            .map(|s| s.name.name.clone())
+                            .or_else(|| self.class_context_stack.last().cloned().flatten())
+                            .or_else(|| {
+                                self.this_stack.last().copied().flatten().and_then(|h| {
+                                    self.heap
+                                        .get(h)
+                                        .and_then(|x| x.as_ref())
+                                        .map(|i| i.class_name.clone())
+                                })
+                            })?;
+                        Self::typedef_dims_via_tables(&self.module, &start, &concrete)
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         for d in declarators {
             // Set below for an unpacked collection; never carried over.
             self.pending_local_shape = None;
             if explicit_static
+                && !in_class_method
                 && !self.static_local_syncs.is_empty()
                 && self.hoisted_sub_static_names.contains(&d.name.name)
             {
@@ -692,7 +820,8 @@ impl Simulator {
             // the array/queue/assoc bookkeeping so e.g. a scalar `string
             // str` after a previous `string str[$]` isn't still treated
             // as a queue.
-            self.clear_shadowed_collection_meta(&d.name.name, data_type);
+            let is_scalar_decl = d.dimensions.is_empty() && typedef_dims.is_empty();
+            self.clear_shadowed_collection_meta(&d.name.name, data_type, is_scalar_decl, w);
             // Register a *packed*-struct local's field layout so member
             // access (`p.field`) aliases into the whole variable, as
             // module-level packed-struct signals already do. Without
@@ -703,13 +832,8 @@ impl Simulator {
             // `->e` / `@(e)` resolve through module.events. Arrays
             // and queues of events register their BASE name so
             // element refs (`ev_arr[i]`) are recognized as events.
-            if matches!(
-                data_type,
-                crate::ast::types::DataType::Simple {
-                    kind: crate::ast::types::SimpleType::Event,
-                    ..
-                }
-            ) {
+            let is_event_decl = self.is_event_data_type(data_type);
+            if is_event_decl && (!is_scalar_decl || self.local_stack.is_empty() || static_block) {
                 self.module.events.insert(d.name.name.clone());
             }
             // Declared ELEMENT type of a local. `var_decl_types` holds
@@ -972,48 +1096,6 @@ impl Simulator {
                     _ => {}
                 }
             }
-            // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
-            // carries its unpacked dims on the TYPE — `my_array_t a;`
-            // declared inside a task elaborated as a scalar.
-            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !plain_class {
-                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                    let tn = &name.name.name;
-                    let concrete = self
-                        .resolve_type_param_binding(tn)
-                        .unwrap_or_else(|| tn.clone());
-                    self.module
-                        .typedef_unpacked_dims
-                        .get(&concrete)
-                        .cloned()
-                        .or_else(|| {
-                            // CLASS-LOCAL typedef: an explicit
-                            // `C::t_t v;` scope, else the class
-                            // whose method is executing — a
-                            // `Ph::d_t dd;` local bound as a
-                            // scalar, so a later `ref` call saw
-                            // no collection to write back to.
-                            let start = name
-                                .scopes
-                                .first()
-                                .map(|s| s.name.name.clone())
-                                .or_else(|| self.class_context_stack.last().cloned().flatten())
-                                .or_else(|| {
-                                    self.this_stack.last().copied().flatten().and_then(|h| {
-                                        self.heap
-                                            .get(h)
-                                            .and_then(|x| x.as_ref())
-                                            .map(|i| i.class_name.clone())
-                                    })
-                                })?;
-                            Self::typedef_dims_via_tables(&self.module, &start, &concrete)
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
             // §7.4.5: a local with dimensions of its own (`q_t l[$];`) puts
             // them first, then the typedef's, as at module scope; the
             // typedef's were dropped, so each row of `l` held one scalar.
@@ -1089,7 +1171,19 @@ impl Simulator {
                     // per-invocation key in a class method or automatic task.
                     let bare = d.name.name.clone();
                     let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
-                    let name = if (in_method || self.current_auto_task.is_some())
+                    let static_sk = if explicit_static {
+                        self.static_local_collection_key(&bare)
+                    } else {
+                        None
+                    };
+                    let name = if let Some(sk) = &static_sk {
+                        self.bind_local_dyn(&bare, sk.clone());
+                        self.finish_static_local_dyn(&bare, sk);
+                        if !self.static_task_init.insert(sk.clone()) {
+                            continue;
+                        }
+                        sk.clone()
+                    } else if (in_method || self.current_auto_task.is_some())
                         && self.current_static_task.is_none()
                         && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                     {
@@ -1186,7 +1280,19 @@ impl Simulator {
                         // other's.
                         let bare = d.name.name.clone();
                         let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
-                        let name = if (in_method || self.current_auto_task.is_some())
+                        let static_sk = if explicit_static {
+                            self.static_local_collection_key(&bare)
+                        } else {
+                            None
+                        };
+                        let name = if let Some(sk) = &static_sk {
+                            self.bind_local_dyn(&bare, sk.clone());
+                            self.finish_static_local_dyn(&bare, sk);
+                            if !self.static_task_init.insert(sk.clone()) {
+                                continue;
+                            }
+                            sk.clone()
+                        } else if (in_method || self.current_auto_task.is_some())
                             && self.current_static_task.is_none()
                             && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                         {
@@ -1318,8 +1424,38 @@ impl Simulator {
                         // resolve to the signal-keyed assoc storage instead
                         // of being mistaken for a scalar.
                         let bare = d.name.name.clone();
-                        let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-                        {
+                        let static_sk = if explicit_static {
+                            self.static_local_collection_key(&bare)
+                        } else {
+                            None
+                        };
+                        let key_tn = key_dt
+                            .as_ref()
+                            .and_then(|dt| match dt.as_ref() {
+                                crate::ast::types::DataType::TypeReference { name: tn, .. } => {
+                                    Some(tn.name.name.clone())
+                                }
+                                _ => None,
+                            })
+                            .filter(|tn| {
+                                self.module.enum_members.contains_key(tn)
+                                    || self.module.typedef_types.contains_key(tn)
+                            });
+                        let name = if let Some(sk) = &static_sk {
+                            self.bind_local_dyn(&bare, sk.clone());
+                            self.finish_static_local_dyn(&bare, sk);
+                            if !self.static_task_init.insert(sk.clone()) {
+                                if !self.local_type_stack.is_empty() {
+                                    let slot = format!("{}[]", bare);
+                                    self.record_local_typedef_type(
+                                        &slot,
+                                        key_tn.as_deref().unwrap_or(""),
+                                    );
+                                }
+                                continue;
+                            }
+                            sk.clone()
+                        } else if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
                             bare.clone()
                         } else {
                             self.declare_local_dyn(&bare)
@@ -1390,18 +1526,6 @@ impl Simulator {
                         // have that name), so a same-named array elsewhere
                         // keeps its own key type; an unnamed key type records
                         // "" there to shadow an outer entry.
-                        let key_tn = key_dt
-                            .as_ref()
-                            .and_then(|dt| match dt.as_ref() {
-                                crate::ast::types::DataType::TypeReference { name: tn, .. } => {
-                                    Some(tn.name.name.clone())
-                                }
-                                _ => None,
-                            })
-                            .filter(|tn| {
-                                self.module.enum_members.contains_key(tn)
-                                    || self.module.typedef_types.contains_key(tn)
-                            });
                         if self.local_type_stack.is_empty() {
                             match key_tn {
                                 Some(tn) => {
@@ -1485,7 +1609,19 @@ impl Simulator {
                 // key the associative locals already use.
                 let bare = d.name.name.clone();
                 let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
-                let name = if (in_method || self.current_auto_task.is_some())
+                let static_sk = if explicit_static {
+                    self.static_local_collection_key(&bare)
+                } else {
+                    None
+                };
+                let name = if let Some(sk) = &static_sk {
+                    self.bind_local_dyn(&bare, sk.clone());
+                    self.finish_static_local_dyn(&bare, sk);
+                    if !self.static_task_init.insert(sk.clone()) {
+                        continue;
+                    }
+                    sk.clone()
+                } else if (in_method || self.current_auto_task.is_some())
                     && self.current_static_task.is_none()
                     && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                 {
@@ -1678,8 +1814,42 @@ impl Simulator {
                 } else {
                     None
                 };
+                let in_frame = !self.local_stack.is_empty() && !static_block;
+                let is_event_scalar = is_scalar_decl && is_event_decl;
                 let v = if let Some(saved) = saved_static {
                     saved
+                } else if is_event_scalar && in_frame {
+                    let canon = match &d.init {
+                        Some(init_expr) => self
+                            .event_handle_capture_key(init_expr)
+                            .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string()),
+                        None => self.fresh_unbacked_event_key(&d.name.name),
+                    };
+                    self.note_event_handle_live();
+                    Self::encode_event_handle_value(&canon)
+                } else if is_event_scalar {
+                    match &d.init {
+                        Some(init_expr) => {
+                            let target = self
+                                .event_handle_capture_key(init_expr)
+                                .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                            note_event_trigger();
+                            if target == d.name.name {
+                                self.event_aliases.remove(&d.name.name);
+                            } else {
+                                self.event_aliases.insert(d.name.name.clone(), target);
+                            }
+                        }
+                        None => {
+                            if matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)) {
+                                let fresh = self.fresh_unbacked_event_key(&d.name.name);
+                                self.event_aliases.insert(d.name.name.clone(), fresh);
+                            } else {
+                                self.event_aliases.remove(&d.name.name);
+                            }
+                        }
+                    }
+                    Value::new(1)
                 } else if let Some(init_expr) = d
                     .init
                     .as_ref()
@@ -1699,8 +1869,19 @@ impl Simulator {
                             } else {
                                 None
                             };
-                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
-                            Self::fit_local_decl_init(
+                            let mut raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
+                            if matches!(
+                                self.resolve_dt_ref(data_type),
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            ) && !raw.is_real
+                                && !self.operand_has_string_type(init_expr)
+                            {
+                                raw = raw.sv_string_strip_nul();
+                            }
+                            self.fit_local_decl_init(
                                 raw,
                                 eff_w,
                                 data_type,
@@ -2083,7 +2264,19 @@ impl Simulator {
                 .iter()
                 .all(|d| matches!(d, UD::Associative { .. }))
         {
-            let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
+            let static_sk = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
+                self.static_local_collection_key(&d.name.name)
+            } else {
+                None
+            };
+            let name = if let Some(sk) = &static_sk {
+                self.bind_local_dyn(&d.name.name, sk.clone());
+                self.finish_static_local_dyn(&d.name.name, sk);
+                if !self.static_task_init.insert(sk.clone()) {
+                    return true;
+                }
+                sk.clone()
+            } else if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
                 d.name.name.clone()
             } else {
                 self.declare_local_dyn(&d.name.name)
@@ -2127,7 +2320,19 @@ impl Simulator {
             return false;
         };
         let bare = d.name.name.clone();
-        let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
+        let static_sk = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
+            self.static_local_collection_key(&bare)
+        } else {
+            None
+        };
+        let name = if let Some(sk) = &static_sk {
+            self.bind_local_dyn(&bare, sk.clone());
+            self.finish_static_local_dyn(&bare, sk);
+            if !self.static_task_init.insert(sk.clone()) {
+                return true;
+            }
+            sk.clone()
+        } else if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
             bare
         } else {
             self.declare_local_dyn(&bare)

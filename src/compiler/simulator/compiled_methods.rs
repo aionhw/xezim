@@ -305,26 +305,21 @@ impl Simulator {
                     .property_types
                     .get(p)
                     .map(|dt| {
-                        // Step 6: enum-typed properties are integral heap
-                        // Values (width of the enum's base) — loadable.
-                        self.scalar_formal_integral(dt).is_some()
-                            || self.typeref_names_class(dt)
-                            || self.typeref_names_enum(dt)
-                            // class-perf (uvm_lru_cache::get): a member typed
-                            // by a TypeReference that plan time cannot resolve
-                            // (a TYPE PARAMETER — `DATA_T data;` in
-                            // uvm_lru_cache_node — or a parameterized-class
-                            // alias) is still a plain heap slot: the
-                            // interpreter's dotted read fetches
-                            // `properties[name]` verbatim (class_prop_width
-                            // never resizes non-integral members), and
-                            // LoadClassMember does the same. Specializations
-                            // bind such params to class handles (the UVM LRU
-                            // cache binds DATA_T=chandle), so the slot value
-                            // passes through untouched. Only the heap-slot
-                            // SHAPES that are NOT properties-keyed (collections
-                            // above, statics above) stay refused.
-                            || matches!(dt, crate::ast::types::DataType::TypeReference { .. })
+                        // Named events must never lower to LoadClassMember/StoreClassMember.
+                        !self.class_dt_is_event(&cur, dt)
+                            && (
+                                // Step 6: enum-typed properties are integral heap
+                                // Values (width of the enum's base) — loadable.
+                                self.scalar_formal_integral(dt).is_some()
+                                    || self.typeref_names_class(dt)
+                                    || self.typeref_names_enum(dt)
+                                    // class-perf (uvm_lru_cache::get): a member typed
+                                    // by a TypeReference that plan time cannot resolve
+                                    // (a TYPE PARAMETER — `DATA_T data;` in
+                                    // uvm_lru_cache_node — or a parameterized-class
+                                    // alias) is still a plain heap slot.
+                                    || matches!(dt, crate::ast::types::DataType::TypeReference { .. })
+                            )
                     })
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
@@ -1681,6 +1676,21 @@ impl Simulator {
         })
     }
 
+    /// Does `body` declare, at any depth, an `event` local (including typedefs)?
+    fn declares_event_local(&self, cname: &str, body: &[Statement]) -> bool {
+        use crate::ast::stmt::StatementKind;
+        body.iter().any(|s| match &s.kind {
+            StatementKind::VarDecl { data_type, .. } => self.class_dt_is_event(cname, data_type),
+            _ => self.declares_event_local_in(cname, &Self::sub_stmts(s)),
+        })
+    }
+
+    fn declares_event_local_in(&self, cname: &str, stmts: &[&Statement]) -> bool {
+        stmts
+            .iter()
+            .any(|s| self.declares_event_local(cname, std::slice::from_ref(*s)))
+    }
+
     fn declares_vif_local_in(&self, stmts: &[&Statement]) -> bool {
         stmts
             .iter()
@@ -1918,6 +1928,14 @@ impl Simulator {
             // assignment, and an assignment bound nothing.
             if self.declares_vif_local(body) {
                 trace_decline("vif-local");
+                self.compiled_method_skip.insert((cid, mid, spec_id));
+                return None;
+            }
+            if ports.iter().any(|p| self.class_dt_is_event(cname, &p.data_type))
+                || self.declares_event_local(cname, body)
+                || matches!(&kind, CompiledBodyKind::Function(f) if self.class_dt_is_event(cname, &f.return_type))
+            {
+                trace_decline("event-subroutine");
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }
@@ -2310,10 +2328,12 @@ impl Simulator {
                             this_reg,
                             result_reg,
                         }) => {
+                            let needs_decl_meta = Self::method_needs_decl_meta(&block, body);
                             let entry = super::bytecode::CompiledMethodEntry {
                                 block: std::rc::Rc::new(block),
                                 this_reg,
                                 result_reg,
+                                needs_decl_meta,
                             };
                             let rc = std::rc::Rc::new(entry);
                             self.compiled_method_block_cache.insert(
@@ -3529,10 +3549,12 @@ impl Simulator {
                         .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     return None;
                 };
+                let needs_decl_meta = Self::method_needs_decl_meta(&block, body);
                 let entry = super::bytecode::CompiledMethodEntry {
                     block: std::rc::Rc::new(block),
                     this_reg,
                     result_reg,
+                    needs_decl_meta,
                 };
                 let rc = std::rc::Rc::new(entry);
                 self.compiled_method_block_cache.insert(
@@ -3657,24 +3679,30 @@ impl Simulator {
         // the binding loop above. Nested-block decls are NOT pre-recorded
         // (the interpreter records them only when the block runs); the
         // compiler declines a `$cast` with such a destination instead.
-        for st in body {
-            if let crate::ast::stmt::StatementKind::VarDecl {
-                data_type,
-                declarators,
-                ..
-            }
-            | crate::ast::stmt::StatementKind::ParamDecl {
-                data_type,
-                declarators,
-                ..
-            } = &st.kind
-            {
-                let cn = self
-                    .derive_var_decl_class_name(data_type)
-                    .or_else(|| self.resolve_type_param_class_for(handle, cname, data_type));
-                for d in declarators {
-                    if d.dimensions.is_empty() {
-                        self.record_var_decl_type_metadata(data_type, &d.name.name, cn.as_deref());
+        if entry.needs_decl_meta {
+            for st in body {
+                if let crate::ast::stmt::StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                }
+                | crate::ast::stmt::StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } = &st.kind
+                {
+                    let cn = self
+                        .derive_var_decl_class_name(data_type)
+                        .or_else(|| self.resolve_type_param_class_for(handle, cname, data_type));
+                    for d in declarators {
+                        if d.dimensions.is_empty() {
+                            self.record_var_decl_type_metadata(
+                                data_type,
+                                &d.name.name,
+                                cn.as_deref(),
+                            );
+                        }
                     }
                 }
             }
@@ -5715,6 +5743,26 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn method_needs_decl_meta(
+        block: &super::bytecode::CompiledBlock,
+        body: &[crate::ast::stmt::Statement],
+    ) -> bool {
+        use super::bytecode::Insn;
+        use crate::ast::stmt::StatementKind;
+        block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Insn::Cast(..) | Insn::StmtFallback(..) | Insn::EvalExprFallback(..)
+            )
+        }) && body.iter().any(|st| {
+            matches!(
+                st.kind,
+                StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+            )
+        })
     }
 
     /// Find an enum value name with the receiver's own storage names as extra list

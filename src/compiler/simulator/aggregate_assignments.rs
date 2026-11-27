@@ -205,7 +205,7 @@ impl Simulator {
                     .map(|(j, v)| {
                         (
                             j,
-                            Self::fit_local_decl_init(v, width, ty, two_state, real, signed),
+                            self.fit_local_decl_init(v, width, ty, two_state, real, signed),
                         )
                     })
                     .collect()
@@ -2201,7 +2201,7 @@ impl Simulator {
                         );
                         let is_real = self.dt_is_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
-                        let v = Self::fit_local_decl_init(
+                        let v = self.fit_local_decl_init(
                             raw,
                             w,
                             &m.data_type,
@@ -3714,26 +3714,6 @@ impl Simulator {
         }
     }
 
-    /// IEEE 1800-2023 §6.16.6 and Table 6-9 use unsigned byte ordering.
-    /// The text representation stores one Latin-1 character per SV byte.
-    pub(super) fn sv_strcmp(a: &str, b: &str, icase: bool) -> i64 {
-        let byte = |c: char| {
-            let b = c as u8;
-            i64::from(if icase { b.to_ascii_lowercase() } else { b })
-        };
-        for (ca, cb) in a.chars().zip(b.chars()) {
-            let (ca, cb) = (byte(ca), byte(cb));
-            if ca != cb {
-                return ca - cb;
-            }
-        }
-        match a.chars().count().cmp(&b.chars().count()) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }
-    }
-
     /// §6.16: a string character is a `byte` — SIGNED 8-bit. `s[i]` and
     /// `s.getc(i)` of `"\xff"` read -1, and `s[0] + s[1]` is an 8-bit signed
     /// sum.
@@ -3744,35 +3724,123 @@ impl Simulator {
         v
     }
 
-    /// §6.16: a string `Value` built from raw BYTES. The text form of a
-    /// string (`to_sv_string`) holds one Latin-1 char per byte, so bytes
-    /// round-trip through chars, never through UTF-8: `from_utf8_lossy` made
-    /// every byte >= 0x80 a U+FFFD, and `String::into_bytes` of a text form
-    /// yields two bytes for each of them.
+    /// §6.16: a string `Value` built from raw BYTES (big-endian, MSB = byte 0).
     pub(super) fn sv_string_from_bytes(b: &[u8]) -> Value {
-        let s: String = b.iter().map(|&c| char::from(c)).collect();
-        Value::from_string(&s)
+        Value::from_bytes(b)
     }
 
     /// §6.16: integral-to-string conversion removes all NUL characters.
     pub(super) fn sv_string_cast(value: &Value) -> Value {
-        let text: String = value
-            .sv_string_bytes()
-            .into_iter()
-            .filter(|&byte| byte != 0)
-            .map(char::from)
-            .collect();
-        Value::from_string(&text)
+        value.sv_string_strip_nul()
     }
 
-    /// §6.16 `toupper`/`tolower`: ASCII letters only; every other byte,
-    /// including Latin-1 letters, is unchanged (and keeps its one-byte width).
-    pub(super) fn sv_ascii_case(s: &str, upper: bool) -> String {
-        if upper {
-            s.to_ascii_uppercase()
+    /// §6.16.4 / §6.16.8 / §6.16.10: coerce an operand to a 32-bit `int` formal
+    /// (sign-extends signed narrower values, zero-extends unsigned narrower
+    /// values, truncates wider values to low 32 bits, maps X/Z bits to 0).
+    pub(super) fn sv_int_arg(v: &Value) -> i32 {
+        let mut v32 = if v.is_real {
+            Self::real_to_int(v.to_f64(), 32)
         } else {
-            s.to_ascii_lowercase()
+            v.resize_for_assign(32)
+        };
+        if v32.has_xz() {
+            v32 = v32.to_two_state();
         }
+        v32.to_u64().unwrap_or(0) as u32 as i32
+    }
+
+    /// §6.16.10: `itoa` / `hextoa` / `octtoa` / `bintoa` using 32-bit `integer`
+    /// formal casting (`sv_int_arg`).
+    pub(super) fn sv_int_toa(v: &Value, radix: u32) -> Value {
+        let iv = Self::sv_int_arg(v);
+        let text = match radix {
+            16 => format!("{:x}", iv as u32),
+            8 => format!("{:o}", iv as u32),
+            2 => format!("{:b}", iv as u32),
+            _ => format!("{}", iv),
+        };
+        Value::from_bytes(text.as_bytes())
+    }
+
+    /// §6.16.9 `atoreal` — longest valid SystemVerilog real prefix (supporting `_`
+    /// digit separators after a digit), returning `0.0` on no match.
+    pub(super) fn sv_atoreal(v: &Value) -> f64 {
+        let raw = v.to_sv_string();
+        let t = raw.trim();
+        let b = t.as_bytes();
+        let mut i = 0usize;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let mut saw_int_digit = false;
+        let mut valid_end = 0usize;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                saw_int_digit = true;
+                i += 1;
+                valid_end = i;
+            } else if b[i] == b'_' && saw_int_digit {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let mut saw_frac_digit = false;
+        if i < b.len() && b[i] == b'.' && (saw_int_digit || (i + 1 < b.len() && b[i + 1].is_ascii_digit())) {
+            i += 1;
+            if saw_int_digit {
+                valid_end = i;
+            }
+            while i < b.len() {
+                if b[i].is_ascii_digit() {
+                    saw_frac_digit = true;
+                    i += 1;
+                    valid_end = i;
+                } else if b[i] == b'_' && saw_frac_digit {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let has_mantissa = saw_int_digit || saw_frac_digit;
+        if has_mantissa && i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+            let mut j = i + 1;
+            if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                j += 1;
+            }
+            let mut saw_exp_digit = false;
+            while j < b.len() {
+                if b[j].is_ascii_digit() {
+                    saw_exp_digit = true;
+                    j += 1;
+                    valid_end = j;
+                } else if b[j] == b'_' && saw_exp_digit {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !has_mantissa {
+            return 0.0;
+        }
+        let clean: String = t[..valid_end].bytes().filter(|&c| c != b'_').map(char::from).collect();
+        clean.parse::<f64>().unwrap_or(0.0)
+    }
+
+    /// §6.16.3 `s[i]` string indexing: returns signed 8-bit `byte` `0` when `idx`
+    /// contains X/Z or is out of range (`idx < 0` or `idx >= s.len()`).
+    #[inline]
+    pub(super) fn sv_index_read(base: &Value, idx: &Value) -> Value {
+        if idx.has_xz() {
+            return Self::sv_byte(0);
+        }
+        let byte = match idx.to_i64() {
+            Some(i) if i >= 0 => base.sv_string_getc(i as usize),
+            _ => 0,
+        };
+        Self::sv_byte(byte)
     }
 
     /// §6.24.1: pack a call-returned dynamic array/queue (recorded in
@@ -4544,8 +4612,11 @@ impl Simulator {
         // §15.5.5: pushing an event variable stores its synchronization-object
         // KEY (a string), so a handle later pulled out of the container
         // (`e = q[0]`, `q[0].triggered`) still names the same object.
-        if let Some(k) = self.event_ref_key(arg) {
-            let canon = self.resolve_event_key(&k);
+        if !matches!(arg.kind, ExprKind::Null)
+            && self.any_events_possible()
+            && Self::expr_could_be_event(arg)
+            && let Some(canon) = self.event_handle_capture_key(arg)
+        {
             self.set_signal_value_by_name(elem, Value::from_string(&canon));
             return;
         }
@@ -4767,7 +4838,53 @@ impl Simulator {
     /// interface) keeps the value as evaluated.
     #[inline(never)]
     pub(super) fn fit_queue_push_elem(&self, coll: &str, val: Value) -> Value {
-        Self::fit_queue_elem_to(self.integral_queue_elem(coll), val)
+        if let Some(info) = self.integral_queue_elem(coll) {
+            return Self::fit_queue_elem_to(Some(info), val);
+        }
+        if let Some(is_sr) = self.coll_elem_real_kind(coll) {
+            return Value::from_f64(if is_sr {
+                val.to_f64() as f32 as f64
+            } else {
+                val.to_f64()
+            });
+        }
+        val
+    }
+
+    fn coll_elem_real_kind(&self, coll: &str) -> Option<bool> {
+        if let Some((h, member)) = coll.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+        {
+            let member = member.split('[').next().unwrap_or(member);
+            if self.class_prop_shortreal(h, member) {
+                return Some(true);
+            }
+            if self.class_prop_is_real(h, member) {
+                return Some(false);
+            }
+            return None;
+        }
+        let leaf = coll.rsplit('.').next().unwrap_or(coll);
+        let dt = self
+            .module
+            .var_decl_types
+            .get(coll)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| {
+                let bare = coll.strip_prefix('@')?.rsplit_once('#')?.0;
+                self.module.var_decl_types.get(bare)
+            })
+            .or_else(|| {
+                let bare = coll.strip_prefix("$st:")?.rsplit_once("::")?.1;
+                self.module.var_decl_types.get(bare)
+            })?;
+        if super::elaborate::is_type_shortreal_resolved(dt, &self.module.typedef_types) {
+            Some(true)
+        } else if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// `fit_queue_push_elem` for a compiled element store (`StoreCollElem`).
@@ -4806,7 +4923,17 @@ impl Simulator {
                 info
             }
         };
-        Self::fit_queue_elem_to(info, val)
+        if info.is_some() {
+            return Self::fit_queue_elem_to(info, val);
+        }
+        if let Some(is_sr) = self.coll_elem_real_kind(coll) {
+            return Value::from_f64(if is_sr {
+                val.to_f64() as f32 as f64
+            } else {
+                val.to_f64()
+            });
+        }
+        val
     }
 
     /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
@@ -5282,6 +5409,12 @@ impl Simulator {
                         .collect();
                     return Some((target_cls, frags.join(",")));
                 }
+                if tn.scopes.is_empty()
+                    && type_args.is_empty()
+                    && self.module.classes.contains_key(&target_cls)
+                {
+                    return Some((target_cls, String::new()));
+                }
                 if tn.scopes.is_empty() && type_args.is_empty() {
                     alias_name = tn.name.name;
                     continue;
@@ -5374,8 +5507,21 @@ impl Simulator {
         }
         let canon_sig = self.canonicalize_spec_sig(&cls_name, &raw_sig);
 
-        // Walk `cls_name` and its `extends` chain to find `leaf` in `typedef_targets`.
-        let mut cur_cls = cls_name.clone();
+        self.resolve_spec_class_member_dt(&cls_name, &orig_cls_name, &canon_sig, leaf, 0)
+    }
+
+    fn resolve_spec_class_member_dt(
+        &self,
+        cls_name: &str,
+        orig_cls_name: &str,
+        canon_sig: &str,
+        leaf: &str,
+        depth: u32,
+    ) -> Option<DataType> {
+        if depth >= 16 {
+            return None;
+        }
+        let mut cur_cls = cls_name.to_string();
         for _ in 0..32 {
             let cd = self.module.classes.get(&cur_cls)?;
             let bare_cls = cur_cls.rsplit_once("::").map_or(cur_cls.as_str(), |(_, r)| r);
@@ -5395,76 +5541,22 @@ impl Simulator {
                 });
             if let Some(target) = target {
                 let cur_sig = self
-                    .ancestor_spec(&cls_name, &canon_sig, &cur_cls)
-                    .unwrap_or_else(|| canon_sig.clone());
+                    .ancestor_spec(cls_name, canon_sig, &cur_cls)
+                    .unwrap_or_else(|| canon_sig.to_string());
                 let spec_args = Self::split_spec_args(&cur_sig);
-
-                // §8.25: `typedef T cw_t;` where `T` is a class type parameter.
-                if let DataType::TypeReference {
-                    name: tn,
-                    dimensions,
-                    type_args,
-                    ..
-                } = target
-                    && tn.scopes.is_empty()
-                    && type_args.is_empty()
-                    && cd.type_param_names.iter().any(|p| p == &tn.name.name)
-                    && let Some(pos) = cd.param_order.iter().position(|p| p == &tn.name.name)
-                    && let Some(arg) = spec_args.get(pos)
-                    && let Some(mut bound_dt) = self.resolve_type_binding_dt(arg)
-                {
-                    if !dimensions.is_empty() {
-                        match &mut bound_dt {
-                            DataType::IntegerVector {
-                                dimensions: bd, ..
-                            }
-                            | DataType::Implicit { dimensions: bd, .. }
-                            | DataType::TypeReference { dimensions: bd, .. } => {
-                                let mut merged = dimensions.clone();
-                                merged.extend(bd.drain(..));
-                                *bd = merged;
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Some(bound_dt);
-                }
-
-                // §8.25: `typedef logic [W-1:0] vec_t;` where packed dims
-                // reference a value parameter of the specialized class.
-                let has_value_params = cd
-                    .param_order
-                    .iter()
-                    .any(|p| !cd.type_param_names.iter().any(|tp| tp == p));
-                if has_value_params && Self::data_type_has_packed_dims(target) {
-                    let mut val_params: HashMap<String, Value> = HashMap::default();
-                    for (pn, init) in &cd.param_defaults {
-                        if let Some(init) = init
-                            && let Some(v) = super::elaborate::const_eval_i64_with_params(
-                                init,
-                                Some(&self.module.parameters),
-                            )
-                        {
-                            let mut val = Value::from_u64(v as u64, 32);
-                            val.is_signed = true;
-                            val_params.insert(pn.clone(), val);
-                        }
-                    }
-                    for (i, arg) in spec_args.iter().enumerate() {
-                        if let Some(pn) = cd.param_order.get(i)
-                            && !cd.type_param_names.iter().any(|tp| tp == pn)
-                            && let Ok(v) = arg.trim().parse::<i64>()
-                        {
-                            let mut val = Value::from_u64(v as u64, 32);
-                            val.is_signed = true;
-                            val_params.insert(pn.clone(), val);
-                        }
-                    }
-                    if !val_params.is_empty() {
-                        return Some(Self::fold_packed_dims_with_params(target, &val_params));
-                    }
-                }
-                return Some(target.clone());
+                let val_params = self.build_class_spec_val_params(cd, &spec_args);
+                return Some(self.subst_spec_class_member_dt(
+                    target,
+                    cd,
+                    &cur_cls,
+                    cls_name,
+                    orig_cls_name,
+                    canon_sig,
+                    &cur_sig,
+                    &spec_args,
+                    &val_params,
+                    depth + 1,
+                ));
             }
             let Some(next) = cd.extends.as_ref() else {
                 break;
@@ -5474,13 +5566,158 @@ impl Simulator {
         None
     }
 
-    fn data_type_has_packed_dims(dt: &DataType) -> bool {
-        match dt {
-            DataType::IntegerVector { dimensions, .. }
-            | DataType::Implicit { dimensions, .. }
-            | DataType::TypeReference { dimensions, .. } => !dimensions.is_empty(),
-            _ => false,
+    fn build_class_spec_val_params(
+        &self,
+        cd: &crate::elaborate::ElaboratedClass,
+        spec_args: &[String],
+    ) -> HashMap<String, Value> {
+        let mut val_params: HashMap<String, Value> = HashMap::default();
+        for (i, arg) in spec_args.iter().enumerate() {
+            if let Some(pn) = cd.param_order.get(i)
+                && !cd.type_param_names.iter().any(|tp| tp == pn)
+            {
+                let trimmed = arg.trim();
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    let mut val = Value::from_u64(v as u64, 32);
+                    val.is_signed = true;
+                    val_params.insert(pn.clone(), val);
+                } else if let Some(pv) = self.module.parameters.get(trimmed) {
+                    val_params.insert(pn.clone(), pv.clone());
+                }
+            }
         }
+        for (pn, init) in &cd.param_defaults {
+            if val_params.contains_key(pn) {
+                continue;
+            }
+            if let Some(init) = init {
+                let v = super::elaborate::eval_const_expr_val_env(
+                    init,
+                    &super::elaborate::ParamEnv::Overlay {
+                        base: &self.module.parameters,
+                        top: &val_params,
+                    },
+                );
+                val_params.insert(pn.clone(), v);
+            }
+        }
+        val_params
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subst_spec_class_member_dt(
+        &self,
+        target: &DataType,
+        cd: &crate::elaborate::ElaboratedClass,
+        cur_cls: &str,
+        root_cls: &str,
+        orig_cls: &str,
+        root_canon_sig: &str,
+        cur_sig: &str,
+        spec_args: &[String],
+        val_params: &HashMap<String, Value>,
+        depth: u32,
+    ) -> DataType {
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: val_params,
+        };
+        let flat_params: HashMap<String, Value> = super::elaborate::ParamLookup::rows(&env)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        match target {
+            DataType::TypeReference {
+                name: tn,
+                dimensions,
+                type_args,
+                ..
+            } if tn.scopes.is_empty() && type_args.is_empty() => {
+                if cd.type_param_names.iter().any(|p| p == &tn.name.name)
+                    && let Some(pos) = cd.param_order.iter().position(|p| p == &tn.name.name)
+                    && let Some(arg) = spec_args.get(pos)
+                    && let Some(bound_dt) = self.resolve_type_binding_dt(arg)
+                {
+                    let expanded = super::elaborate::apply_outer_packed_dims_dt(
+                        bound_dt,
+                        dimensions,
+                        &flat_params,
+                    );
+                    return Self::fold_packed_dims_with_params(&expanded, &flat_params);
+                }
+                if depth < 16
+                    && let Some(sib_dt) = self.resolve_spec_class_member_dt(
+                        cur_cls,
+                        cur_cls,
+                        cur_sig,
+                        &tn.name.name,
+                        depth + 1,
+                    )
+                {
+                    let expanded = super::elaborate::apply_outer_packed_dims_dt(
+                        sib_dt,
+                        dimensions,
+                        &flat_params,
+                    );
+                    return Self::fold_packed_dims_with_params(&expanded, &flat_params);
+                }
+                let _ = (root_cls, orig_cls, root_canon_sig);
+                Self::fold_packed_dims_with_params(target, &flat_params)
+            }
+            DataType::Struct(su) => {
+                let mut out = su.clone();
+                for m in &mut out.members {
+                    m.data_type = self.subst_spec_class_member_dt(
+                        &m.data_type,
+                        cd,
+                        cur_cls,
+                        root_cls,
+                        orig_cls,
+                        root_canon_sig,
+                        cur_sig,
+                        spec_args,
+                        val_params,
+                        depth + 1,
+                    );
+                }
+                let wrapped = DataType::Struct(out);
+                Self::fold_packed_dims_with_params(&wrapped, &flat_params)
+            }
+            DataType::Enum(et) => {
+                let mut out = et.clone();
+                if let Some(bt) = &et.base_type {
+                    out.base_type = Some(Box::new(self.subst_spec_class_member_dt(
+                        bt,
+                        cd,
+                        cur_cls,
+                        root_cls,
+                        orig_cls,
+                        root_canon_sig,
+                        cur_sig,
+                        spec_args,
+                        val_params,
+                        depth + 1,
+                    )));
+                }
+                let wrapped = DataType::Enum(out);
+                Self::fold_packed_dims_with_params(&wrapped, &flat_params)
+            }
+            _ => Self::fold_packed_dims_with_params(target, &flat_params),
+        }
+    }
+
+    pub(super) fn try_eval_specialized_named_cast(
+        &mut self,
+        call_expr: &Expression,
+        type_expr: &Expression,
+        val_expr: &Expression,
+        ctx_width: u32,
+    ) -> Option<Value> {
+        let dt = self.resolve_specialized_class_typedef_expr(type_expr)?;
+        let type_lit = Expression::new(ExprKind::TypeLiteral(Box::new(dt)), type_expr.span);
+        let args = vec![type_lit, val_expr.clone()];
+        let name = String::from("$__xz_type_cast");
+        Some(self.eval_expr_system_call(call_expr, ctx_width, &name, &args))
     }
 
     fn fold_packed_dims_with_params(
@@ -5535,6 +5772,18 @@ impl Simulator {
             | DataType::Implicit { dimensions, .. }
             | DataType::TypeReference { dimensions, .. } => {
                 *dimensions = fold_dims(dimensions);
+            }
+            DataType::Struct(su) => {
+                su.dimensions = fold_dims(&su.dimensions);
+                for m in &mut su.members {
+                    m.data_type = Self::fold_packed_dims_with_params(&m.data_type, params);
+                }
+            }
+            DataType::Enum(et) => {
+                et.dimensions = fold_dims(&et.dimensions);
+                if let Some(bt) = &mut et.base_type {
+                    **bt = Self::fold_packed_dims_with_params(bt, params);
+                }
             }
             _ => {}
         }

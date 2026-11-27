@@ -203,7 +203,7 @@ fn class_packages_and_interface_class() {
              pure virtual function string kind();\n  endclass\n\
              class simple_obj extends base_obj;\n\
              function string kind(); return \"simple\"; endfunction\n  endclass\n\
-             typedef class fwd_only;\nendpackage\n",
+             typedef class fwd_only;\n  class fwd_only; endclass\nendpackage\n",
         ),
         (
             "agent_pkg.sv",

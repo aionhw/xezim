@@ -324,6 +324,239 @@ impl Simulator {
         Some((names, ew))
     }
 
+    /// Pack an unpacked array / queue / slice streaming operand into a single
+    /// `Value` in `O(N * W)` using `Value::concat_refs` and a single scratch
+    /// name buffer, avoiding `O(N^2 * W)` repeated `concat_with` and per-element
+    /// `String` allocations.
+    pub(super) fn stream_operand_packed(&mut self, p: &Expression) -> Option<Value> {
+        let inner = match &p.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            _ => p,
+        };
+        enum Sel<'a> {
+            All,
+            Single(&'a Expression),
+            Range {
+                kind: RangeKind,
+                left: &'a Expression,
+                right: &'a Expression,
+            },
+        }
+        let (base_expr, sel) = match &inner.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => (inner, Sel::All),
+            ExprKind::Index { expr, index } => (expr.as_ref(), Sel::Single(index)),
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (
+                expr.as_ref(),
+                Sel::Range {
+                    kind: *kind,
+                    left,
+                    right,
+                },
+            ),
+            _ => return None,
+        };
+        let name = self
+            .array_operand_name(base_expr)
+            .or_else(|| match &base_expr.kind {
+                ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
+                    Some(self.resolve_hier_name(h).to_string())
+                }
+                _ => None,
+            })?;
+        match sel {
+            Sel::All => {
+                if !self.module.dynamic_arrays.contains(&name)
+                    && !self.module.queue_vars.contains(&name)
+                    && !self.module.associative_arrays.contains_key(&name)
+                    && !self.module.arrays_2d.contains_key(&name)
+                    && !self.module.arrays_nd.contains_key(&name)
+                    && let Some(&(alo, ahi, ew)) = self.module.arrays.get(&name)
+                {
+                    let ew = ew.max(1);
+                    let (lo, hi) = (alo.min(ahi), alo.max(ahi));
+                    let count = (hi - lo + 1).max(0) as usize;
+                    if count == 0 || count > (1 << 20) {
+                        return None;
+                    }
+                    let descending = self
+                        .module
+                        .unpacked_decl_dims
+                        .get(&name)
+                        .is_some_and(|d| d.len() == 1 && d[0].0 > d[0].1)
+                        || self.module.descending_arrays.contains(&name);
+                    if !self.module.parameters.contains_key(&name)
+                        && !self.module.interconnect_nets.contains(&name)
+                        && !name.contains('.')
+                        && self.local_stack.is_empty()
+                        && self.name_resolve_hint.borrow().is_none()
+                        && let Some(&(first_id, flo, fhi)) = self.array_first_id.get(name.as_str())
+                        && flo == lo
+                        && fhi == hi
+                    {
+                        let mut vals = Vec::with_capacity(count);
+                        if descending {
+                            for idx in (lo..=hi).rev() {
+                                let id = first_id + (idx - lo) as usize;
+                                let v = if is_packed_id(id) {
+                                    self.packed.read(id)
+                                } else {
+                                    self.signal_table[id].clone()
+                                };
+                                vals.push(v);
+                            }
+                        } else {
+                            for id in first_id..first_id + count {
+                                let v = if is_packed_id(id) {
+                                    self.packed.read(id)
+                                } else {
+                                    self.signal_table[id].clone()
+                                };
+                                vals.push(v);
+                            }
+                        }
+                        return Some(Value::concat_refs(vals.iter()));
+                    }
+                    let mut vals = Vec::with_capacity(count);
+                    let mut buf = String::with_capacity(name.len() + 16);
+                    if descending {
+                        for idx in (lo..=hi).rev() {
+                            use std::fmt::Write;
+                            buf.clear();
+                            let _ = write!(&mut buf, "{name}[{idx}]");
+                            vals.push(
+                                self.get_signal_value_by_name(&buf)
+                                    .unwrap_or_else(|| Value::zero(ew)),
+                            );
+                        }
+                    } else {
+                        for idx in lo..=hi {
+                            use std::fmt::Write;
+                            buf.clear();
+                            let _ = write!(&mut buf, "{name}[{idx}]");
+                            vals.push(
+                                self.get_signal_value_by_name(&buf)
+                                    .unwrap_or_else(|| Value::zero(ew)),
+                            );
+                        }
+                    }
+                    return Some(Value::concat_refs(vals.iter()));
+                }
+                if self.module.dynamic_arrays.contains(&name)
+                    && !self.module.arrays_2d.contains_key(&name)
+                    && !self.module.arrays_nd.contains_key(&name)
+                {
+                    let len = self.get_queue_size(&name) as usize;
+                    let mut buf = String::with_capacity(name.len() + 16);
+                    {
+                        use std::fmt::Write;
+                        let _ = write!(&mut buf, "{name}[0]");
+                    }
+                    let ew = self
+                        .lookup_signal_width(&buf)
+                        .or_else(|| self.module.arrays.get(&name).map(|t| t.2))
+                        .unwrap_or(8)
+                        .max(1);
+                    let mut vals = Vec::with_capacity(len);
+                    for i in 0..len {
+                        use std::fmt::Write;
+                        buf.clear();
+                        let _ = write!(&mut buf, "{name}[{i}]");
+                        vals.push(
+                            self.get_signal_value_by_name(&buf)
+                                .unwrap_or_else(|| Value::zero(ew)),
+                        );
+                    }
+                    return Some(Value::concat_refs(vals.iter()));
+                }
+                let (names, ew) = self.stream_elem_order(&name)?;
+                let mut vals = Vec::with_capacity(names.len());
+                for en in &names {
+                    vals.push(
+                        self.get_signal_value_by_name(en)
+                            .unwrap_or_else(|| Value::zero(ew)),
+                    );
+                }
+                Some(Value::concat_refs(vals.iter()))
+            }
+            Sel::Single(idx) => {
+                let i = self.eval_expr(idx).to_i64()?;
+                self.stream_ranged_packed(&name, i, i)
+            }
+            Sel::Range { kind, left, right } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                if r < 0 && matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
+                    return None;
+                }
+                let (lo, hi) = match kind {
+                    RangeKind::Constant => (l.min(r), l.max(r)),
+                    RangeKind::IndexedUp => (l, l + r - 1),
+                    RangeKind::IndexedDown => (l - r + 1, l),
+                };
+                self.stream_ranged_packed(&name, lo, hi)
+            }
+        }
+    }
+
+    fn stream_ranged_packed(&mut self, name: &str, lo: i64, hi: i64) -> Option<Value> {
+        let dynamic = self.module.dynamic_arrays.contains(name);
+        let descending = if dynamic {
+            false
+        } else if let Some(&(alo, ahi, _)) = self.module.arrays.get(name) {
+            let (l0, r0) = match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 1 => d[0],
+                _ if self.module.descending_arrays.contains(name) => (ahi, alo),
+                _ => (alo, ahi),
+            };
+            l0 > r0
+        } else {
+            return None;
+        };
+        let lo = if dynamic { lo.max(0) } else { lo };
+        let mut buf = String::with_capacity(name.len() + 16);
+        {
+            use std::fmt::Write;
+            let _ = write!(&mut buf, "{name}[0]");
+        }
+        let ew = self
+            .lookup_signal_width(&buf)
+            .or_else(|| self.module.arrays.get(name).map(|t| t.2))
+            .unwrap_or(8)
+            .max(1);
+        if lo > hi {
+            return Some(Value::zero(0));
+        }
+        let count = (hi - lo + 1).max(0) as usize;
+        let mut vals = Vec::with_capacity(count);
+        if descending {
+            for i in (lo..=hi).rev() {
+                use std::fmt::Write;
+                buf.clear();
+                let _ = write!(&mut buf, "{name}[{i}]");
+                vals.push(
+                    self.get_signal_value_by_name(&buf)
+                        .unwrap_or_else(|| Value::zero(ew)),
+                );
+            }
+        } else {
+            for i in lo..=hi {
+                use std::fmt::Write;
+                buf.clear();
+                let _ = write!(&mut buf, "{name}[{i}]");
+                vals.push(
+                    self.get_signal_value_by_name(&buf)
+                        .unwrap_or_else(|| Value::zero(ew)),
+                );
+            }
+        }
+        Some(Value::concat_refs(vals.iter()))
+    }
+
     /// §6.24.3: the operand of a cast to an integral type may be an
     /// UNPACKED array or queue (`int'(barr)`, `24'(q)`): its elements are
     /// packed left to right, which is `{>>{operand}}`. The operand read the
@@ -4123,69 +4356,6 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(vname) {
             if let Some(tn) = self.signal_type_names.get(&id) {
                 return Some(tn.clone());
-            }
-        }
-        None
-    }
-
-    /// Resolve a declared `DataType` to the ENUM typedef name it names, if it
-    /// is (or aliases to) an enum — following typedef chains. Used by `$cast`
-    /// to range-check a value against an enum destination whose variable is a
-    /// class-member / method-local (not tracked by `type_name_of_var`).
-    pub(super) fn data_type_enum_name(&self, dt: &crate::ast::types::DataType) -> Option<String> {
-        use crate::ast::types::DataType;
-        let mut cur = dt.clone();
-        let mut seen: Vec<String> = Vec::new();
-        loop {
-            match &cur {
-                DataType::TypeReference { name, .. } => {
-                    let n = name.name.name.clone();
-                    if self.module.enum_members.contains_key(&n) {
-                        return Some(n);
-                    }
-                    if seen.contains(&n) {
-                        return None; // typedef cycle
-                    }
-                    seen.push(n.clone());
-                    // Follow an aliasing typedef to its underlying type.
-                    match self.module.typedef_types.get(&n) {
-                        Some(next) => cur = next.clone(),
-                        None => return None,
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    /// Resolve a variable to its ENUM typedef name, if any, for `$cast` range
-    /// validation. Tries every type registry in order — module signal / local
-    /// (`type_name_of_var`), a runtime-recorded method-local declaration
-    /// (`var_decl_types`), and a property of the current `this` object (a
-    /// class member like `uvm_report_handler::l_verbosity`).
-    pub(super) fn enum_typename_of_var(&self, vname: &str) -> Option<String> {
-        if let Some(tn) = self.type_name_of_var(vname) {
-            if self.module.enum_members.contains_key(&tn) {
-                return Some(tn);
-            }
-        }
-        if let Some(dt) = self.module.var_decl_types.get(vname).cloned() {
-            if let Some(tn) = self.data_type_enum_name(&dt) {
-                return Some(tn);
-            }
-        }
-        if let Some(h) = self.this_stack.last().copied().flatten() {
-            if let Some(cls) = self
-                .heap
-                .get(h)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name.clone())
-            {
-                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
-                    if self.module.enum_members.contains_key(&tn) {
-                        return Some(tn);
-                    }
-                }
             }
         }
         None

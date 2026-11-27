@@ -1644,10 +1644,10 @@ impl Simulator {
                     }
                     return Some(out);
                 }
-                // One-keyword built-ins only: a vector's key text
-                // (`logicsigned[15:0]`) is read back as a type downstream
-                // (`$typename(T)`), where the typedef name renders better.
-                DataType::IntegerAtom { signing: None, .. }
+                // Built-in scalar/vector atoms and reals canonicalize to match
+                // direct spellings (`typedef int unsigned u32_t` -> `bit[31:0]`).
+                DataType::IntegerAtom { .. }
+                | DataType::IntegerVector { .. }
                 | DataType::Real { .. }
                 | DataType::Simple { .. } => {
                     return crate::elaborate::data_type_to_spec_fragment(&dt);
@@ -1813,7 +1813,7 @@ impl Simulator {
                 {
                     return self.type_key_of_elem(&t, depth + 1);
                 }
-                Some(n)
+                Some(crate::elaborate::canonicalize_builtin_type_fragment(&n).unwrap_or(n))
             }
             _ => crate::elaborate::data_type_to_spec_fragment(dt),
         }
@@ -3543,7 +3543,7 @@ impl Simulator {
                     super::elaborate::is_type_two_state_resolved(&mdt, &self.module.typedef_types);
                 let is_real = self.dt_is_real(&mdt);
                 let signed = self.type_is_signed_concrete(&mdt);
-                let v = Self::fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
+                let v = self.fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
                     inst.properties.insert(key, v);
                 }

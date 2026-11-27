@@ -15,16 +15,154 @@
 use super::*;
 use crate::ast::types::UnpackedDimension as UD;
 
-/// An enumeration type as the methods need it.
+/// An enumeration type as the methods (and `$cast`) need it.
 pub(crate) struct EnumRecvType {
-    /// The members in declaration order, which is the method order.
-    members: Vec<(String, u64)>,
+    /// The members in declaration order (`(name, pre-resolved Value)`).
+    /// Each `Value` carries the member's 4-state / wide bits, base width,
+    /// and base signedness.
+    members: Vec<(String, Value)>,
+    /// Pre-built string values returned by `.name()`, indexed like `members`.
+    name_vals: Vec<Value>,
+    /// O(1) lookup of 2-state low-64-bit member values (masked to `width`) -> index.
+    val_to_idx: HashMap<u64, usize>,
+    /// Indices in `members` whose value carries X or Z bits.
+    xz_indices: Vec<usize>,
     /// The width of the base type.
     width: u32,
     /// Whether the base type is signed.
     signed: bool,
     /// Whether the base type is 2-state.
     two_state: bool,
+}
+
+impl EnumRecvType {
+    fn new(members: Vec<(String, Value)>, width: u32, signed: bool, two_state: bool) -> Self {
+        let width = width.max(1);
+        let mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let mut name_vals = Vec::with_capacity(members.len());
+        let mut val_to_idx = HashMap::default();
+        let mut xz_indices = Vec::new();
+        for (i, (nm, mv)) in members.iter().enumerate() {
+            name_vals.push(Value::from_string(nm));
+            if mv.has_xz() {
+                xz_indices.push(i);
+            } else if width <= 64
+                && let Some(u) = mv.to_u64()
+            {
+                val_to_idx.entry(u & mask).or_insert(i);
+            }
+        }
+        Self {
+            members,
+            name_vals,
+            val_to_idx,
+            xz_indices,
+            width,
+            signed,
+            two_state,
+        }
+    }
+
+    fn position(&self, v: &Value) -> Option<usize> {
+        if v.has_xz() {
+            let vw = v.resize_for_assign(self.width);
+            return self.xz_indices.iter().copied().find(|&i| {
+                self.members[i]
+                    .1
+                    .case_eq(&vw)
+                    .to_u64()
+                    == Some(1)
+            });
+        }
+        if self.width <= 64 {
+            let mask = if self.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << self.width) - 1
+            };
+            let cur = v.to_u64()? & mask;
+            return self.val_to_idx.get(&cur).copied();
+        }
+        let vw = v.resize_for_assign(self.width);
+        self.members
+            .iter()
+            .position(|(_, mv)| !mv.has_xz() && mv.case_eq(&vw).to_u64() == Some(1))
+    }
+
+    /// IEEE 1800-2023 §6.24.2: whether `src` equals a member value of this
+    /// enumeration (checking 4-state X/Z bits, signedness, and width).
+    pub(crate) fn matches_cast_src(&self, src: &Value) -> bool {
+        if src.is_real || self.members.is_empty() {
+            return false;
+        }
+        let w = self.width.max(src.width).max(1);
+        let src_w = if src.is_fill || (self.signed && src.is_signed) || src.width >= w {
+            src.resize_for_assign(w)
+        } else {
+            let mut z = src.clone();
+            z.is_signed = false;
+            z.resize_for_assign(w)
+        };
+        if src.has_xz() {
+            return self.xz_indices.iter().any(|&i| {
+                let mv = &self.members[i].1;
+                if w <= mv.width {
+                    mv.case_eq(&src_w).to_u64() == Some(1)
+                } else {
+                    let mut z = mv.clone();
+                    z.is_signed = false;
+                    z.resize(w).case_eq(&src_w).to_u64() == Some(1)
+                        || (self.signed
+                            && src.is_signed
+                            && mv.resize(w).case_eq(&src_w).to_u64() == Some(1))
+                }
+            });
+        }
+        if w <= 64 {
+            let Some(sv) = src_w.to_u64() else {
+                return false;
+            };
+            let w_mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let sv = sv & w_mask;
+            let e_mask = if self.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << self.width) - 1
+            };
+            // High bits above `self.width` are zero: matches zero-extended member.
+            if (sv & !e_mask) == 0 && self.val_to_idx.contains_key(&(sv & e_mask)) {
+                return true;
+            }
+            // High bits match sign extension of a negative signed enum member
+            // when the source is also signed.
+            if self.signed && src.is_signed && self.width < w {
+                let sign_ext = w_mask & !e_mask;
+                if (sv & sign_ext) == sign_ext {
+                    let candidate = sv & e_mask;
+                    let sign_bit = 1u64 << (self.width - 1);
+                    if (candidate & sign_bit) != 0 && self.val_to_idx.contains_key(&candidate) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        self.members.iter().any(|(_, mv)| {
+            if mv.has_xz() {
+                return false;
+            }
+            let mut z = mv.clone();
+            z.is_signed = false;
+            z.resize(w).case_eq(&src_w).to_u64() == Some(1)
+                || (self.signed
+                    && src.is_signed
+                    && mv.resize(w).case_eq(&src_w).to_u64() == Some(1))
+        })
+    }
 }
 
 /// How many unpacked selects an expression still takes before it denotes
@@ -102,66 +240,34 @@ impl Simulator {
         {
             let _ = self.eval_expr(recv);
         }
-        let mask: u64 = if ty.width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << ty.width) - 1
-        };
-        let mk = |raw: u64| {
-            let mut v = Value::from_u64(raw & mask, ty.width);
-            v.is_signed = ty.signed;
-            v
-        };
-        // The value of member `i`: its constant when that holds x or z bits.
-        let member = |sim: &Self, i: usize| -> Value {
-            match sim.module.parameters.get(&ty.members[i].0) {
-                Some(mv) if mv.has_xz() => {
-                    let mut v = mv.resize(ty.width);
-                    v.is_signed = ty.signed;
-                    v
-                }
-                _ => mk(ty.members[i].1),
-            }
-        };
-        // §6.19: a member of a 4-state enumeration may hold x or z bits; a
-        // value with such bits is that member when every bit is the same.
-        let xz_position = |sim: &Self, v: &Value| -> Option<usize> {
-            ty.members.iter().position(|(name, _)| {
-                sim.module.parameters.get(name).is_some_and(|mv| {
-                    mv.has_xz()
-                        && mv.resize(ty.width).case_eq(&v.resize(ty.width)).to_u64() == Some(1)
-                })
-            })
-        };
-        let position = |sim: &Self, v: &Value| -> Option<usize> {
-            if v.has_xz() {
-                return xz_position(sim, v);
-            }
-            let cur = v.to_u64()?;
-            ty.members
-                .iter()
-                .position(|(_, mv)| (*mv & mask) == (cur & mask))
-        };
         Some(match m {
             "num" => Self::int_count(ty.members.len() as u64),
-            "first" => member(self, 0),
-            "last" => member(self, ty.members.len() - 1),
+            "first" => ty.members[0].1.clone(),
+            "last" => ty.members[ty.members.len() - 1].1.clone(),
             "name" => {
                 let v = self.eval_expr(recv);
                 // §6.19.5.6: a value that is not a member has the empty name.
-                match position(self, &v) {
-                    Some(p) => Value::from_string(&ty.members[p].0),
+                match ty.position(&v) {
+                    Some(p) => ty.name_vals[p].clone(),
                     None => Value::from_string(""),
                 }
             }
             "next" | "prev" => {
                 let step = match args.first() {
-                    Some(a) => self.eval_expr(a).to_u64().unwrap_or(1),
+                    Some(a) => {
+                        let av = self.eval_expr(a);
+                        if av.is_real {
+                            av.to_f64().round() as i64 as u32 as u64
+                        } else {
+                            // §6.19.5.4: step formal is `int unsigned` (32 bits).
+                            av.resize_for_assign(32).to_u64().unwrap_or(1) as u32 as u64
+                        }
+                    }
                     None => 1,
                 };
                 let v = self.eval_expr(recv);
                 let n = ty.members.len();
-                match position(self, &v) {
+                match ty.position(&v) {
                     Some(p) => {
                         let step = (step % n as u64) as usize;
                         let q = if m == "next" {
@@ -169,7 +275,7 @@ impl Simulator {
                         } else {
                             (p + n - step) % n
                         };
-                        member(self, q)
+                        ty.members[q].1.clone()
                     }
                     // §6.19.5.3: from a value that is not a member, the
                     // default initial value of the base type.
@@ -182,7 +288,10 @@ impl Simulator {
     }
 
     /// The enumeration type the receiver `recv` is declared with.
-    fn enum_receiver_type(&mut self, recv: &Expression) -> Option<std::rc::Rc<EnumRecvType>> {
+    pub(super) fn enum_receiver_type(
+        &mut self,
+        recv: &Expression,
+    ) -> Option<std::rc::Rc<EnumRecvType>> {
         // A plain variable or property keeps the resolution the rest of the
         // simulator uses for it (the frame's own declaration first), with a
         // typedef alias followed to the enumeration it names.
@@ -191,17 +300,25 @@ impl Simulator {
             && h.path[0].selects.is_empty()
         {
             let name = h.path[0].name.name.as_str();
-            if let Some(ty) = self
+            if self.local_class_type_of(name).is_some() {
+                return None;
+            }
+            if let Some(tn) = self
                 .local_typedef_type_of(name)
                 .or_else(|| self.get_expr_type_name(recv))
-                .and_then(|tn| self.enum_type_named(&tn))
             {
-                // A whole queue, dynamic or associative array has methods
-                // of the same names (§7.9, §7.10), and they are not these.
-                if self.plain_name_is_collection(h, name) {
+                if let Some(ty) = self.enum_type_named(&tn) {
+                    // A whole queue, dynamic or associative array has methods
+                    // of the same names (§7.9, §7.10), and they are not these.
+                    if self.plain_name_is_collection(h, name) {
+                        return None;
+                    }
+                    return Some(ty);
+                }
+                let base = tn.split('#').next().unwrap_or(&tn);
+                if self.module.classes.contains_key(base) {
                     return None;
                 }
-                return Some(ty);
             }
         } else if !matches!(recv.kind, ExprKind::Index { .. })
             && let Some(n) = self.expr_assoc_name(recv)
@@ -267,21 +384,39 @@ impl Simulator {
             self.enum_recv_cache.clear();
             self.enum_recv_cache_gen = self.type_tables_gen;
         }
-        // A typedef of a class may hide a global one of the same name.
-        if self.class_context_stack.last().is_none_or(|c| c.is_none())
-            && let Some(hit) = self.enum_recv_cache.get(tn)
-        {
+        let ctx_key: &str = match self.class_context_stack.last() {
+            Some(Some(c)) => c.as_str(),
+            _ => "",
+        };
+        if let Some(hit) = self.enum_recv_cache.get(ctx_key).and_then(|m| m.get(tn)) {
             return hit.clone();
         }
         let found = (self.module.enum_members.contains_key(tn)
             || self.lookup_typedef_target(tn).is_some())
-        .then(|| self.enum_type_of(&Self::class_type_ref(tn)))
+        .then(|| self.enum_type_of(&Self::scoped_type_ref(tn)))
         .flatten()
         .map(std::rc::Rc::new);
-        if self.class_context_stack.last().is_none_or(|c| c.is_none()) {
-            self.enum_recv_cache.insert(tn.to_string(), found.clone());
-        }
+        self.enum_recv_cache
+            .entry(ctx_key.to_string())
+            .or_default()
+            .insert(tn.to_string(), found.clone());
         found
+    }
+
+    fn class_ctx_typedef_target(&self, nm: &str) -> Option<DataType> {
+        let mut cur = self.class_context_stack.last().and_then(|c| c.as_deref());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c).filter(|_| guard < 64) else {
+                break;
+            };
+            if let Some(dt) = cd.typedef_targets.get(nm) {
+                return Some(dt.clone());
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
     }
 
     /// The enumeration `dt` denotes, through typedef aliases and array
@@ -290,13 +425,31 @@ impl Simulator {
         let mut cur = dt.clone();
         // The member table of a named enumeration, when one is reached.
         let mut named: Option<&Vec<(String, u64)>> = None;
+        let mut named_key: Option<String> = None;
         for _ in 0..16 {
             match &cur {
                 DataType::Enum(_) => break,
                 DataType::TypeReference { name, .. } => {
+                    if !name.has_scope()
+                        && let Some(class_dt) = self.class_ctx_typedef_target(&name.name.name)
+                    {
+                        cur = class_dt;
+                        continue;
+                    }
                     if named.is_none() {
-                        named =
-                            super::elaborate::lookup_scoped_type(name, &self.module.enum_members);
+                        let em = if name.has_scope() {
+                            self.module.enum_members.get(&name.qualified())
+                        } else {
+                            self.module.enum_members.get(&name.name.name)
+                        };
+                        if let Some(m) = em {
+                            named = Some(m);
+                            named_key = Some(if name.has_scope() {
+                                name.qualified()
+                            } else {
+                                name.name.name.clone()
+                            });
+                        }
                     }
                     let next = if name.has_scope() {
                         super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)
@@ -312,13 +465,9 @@ impl Simulator {
                 _ => return None,
             }
         }
-        let members = match (named, &cur) {
-            (Some(m), _) => m.clone(),
-            (None, DataType::Enum(_)) => {
-                super::elaborate::anon_enum_members_ordered(&cur, &self.module.parameters)?
-            }
-            _ => return None,
-        };
+        if named.is_none() && !matches!(cur, DataType::Enum(_)) {
+            return None;
+        }
         let (width, signed, two_state) = if matches!(cur, DataType::Enum(_)) {
             let tt = &self.module.typedef_types;
             let w = super::elaborate::resolve_type_width(
@@ -334,24 +483,57 @@ impl Simulator {
         } else {
             // The declaration is not in reach (a class-scoped typedef): the
             // member constants carry the base type.
-            let first = members.first()?.0.as_str();
+            let first = named?.first()?.0.as_str();
             let w = self
                 .signal_name_to_id
                 .get(first)
                 .and_then(|id| self.signal_widths.get(*id).copied())
-                .unwrap_or(32);
+                .or_else(|| self.module.parameters.get(first).map(|v| v.width))
+                .unwrap_or(32)
+                .max(1);
             (
                 w,
-                self.lookup_signal_signed(first),
+                self.lookup_signal_signed(first)
+                    || self.module.parameters.get(first).is_some_and(|v| v.is_signed),
                 self.module.two_state_signals.contains(first),
             )
         };
-        Some(EnumRecvType {
-            members,
-            width,
-            signed,
-            two_state,
-        })
+        let members: Vec<(String, Value)> = match (named, &cur) {
+            (Some(raw), _) => {
+                let prefix = named_key.as_deref().and_then(|k| {
+                    k.rfind("::")
+                        .map(|i| &k[..=i + 1])
+                        .or_else(|| k.rfind('.').map(|i| &k[..=i]))
+                });
+                raw.iter()
+                    .map(|(nm, val)| {
+                        let pv = prefix
+                            .and_then(|pfx| self.module.parameters.get(&format!("{pfx}{nm}")))
+                            .or_else(|| {
+                                self.module.parameters.get(nm).filter(|mv| {
+                                    mv.has_xz() || width > 64 || mv.to_u64() == Some(*val)
+                                })
+                            });
+                        let mut v = match pv {
+                            Some(mv) if !mv.is_real && (mv.has_xz() || width > 64) => {
+                                mv.resize(width)
+                            }
+                            _ => Value::from_u64(*val, width),
+                        };
+                        v.is_signed = signed;
+                        (nm.clone(), v)
+                    })
+                    .collect()
+            }
+            (None, DataType::Enum(et)) => {
+                super::elaborate::enum_members_values(et, width, signed, &self.module.parameters)
+                    .into_iter()
+                    .map(|(nm, _val, v)| (nm, v))
+                    .collect()
+            }
+            _ => return None,
+        };
+        Some(EnumRecvType::new(members, width, signed, two_state))
     }
 
     /// The declared type of the expression `e` and how many unpacked
@@ -363,6 +545,17 @@ impl Simulator {
         }
         match &e.kind {
             ExprKind::Paren(inner) => self.receiver_decl_type(inner, depth + 1),
+            ExprKind::SystemCall { name, args }
+                if (name == "$__xz_named_cast" || name == "$__xz_type_cast") && args.len() == 2 =>
+            {
+                let tn = self.named_cast_key(&args[0])?;
+                if !self.module.enum_members.contains_key(&tn)
+                    && self.lookup_typedef_target(&tn).is_none()
+                {
+                    return None;
+                }
+                Some(self.with_typedef_rank(Self::scoped_type_ref(&tn), Rank::Fixed(0)))
+            }
             ExprKind::This => {
                 let cn = self.class_context_stack.last().cloned().flatten()?;
                 Some((Self::class_type_ref(&cn), Rank::Fixed(0)))
@@ -642,7 +835,6 @@ impl Simulator {
                 let mut dt = dt.clone();
                 if let DataType::TypeReference { name, .. } = &dt
                     && !name.has_scope()
-                    && !self.module.enum_members.contains_key(&name.name.name)
                     && let Some(target) = cd.typedef_targets.get(&name.name.name)
                     && cd
                         .typedef_unpacked_dims

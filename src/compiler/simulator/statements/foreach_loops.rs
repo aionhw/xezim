@@ -1560,7 +1560,7 @@ impl Simulator {
                     // never applied (`string_signals` won because the
                     // collection-carried registration; the char count
                     // of the unbuilt queue was 0).
-                    let len = self.eval_expr(array).sv_string_bytes().len() as u64;
+                    let len = self.eval_expr(array).sv_string_len() as u64;
                     for i in 0..len {
                         if self.finished {
                             break;
@@ -1700,7 +1700,7 @@ impl Simulator {
                     // in a fixed-width container (e.g. 1024 bits), so
                     // `width/8` is the container size (128), not the
                     // string length — the loop ran 128 times over "hi".
-                    let len = self.eval_expr(array).sv_string_bytes().len() as u64;
+                    let len = self.eval_expr(array).sv_string_len() as u64;
                     for i in 0..len {
                         if self.finished {
                             break;

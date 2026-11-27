@@ -2015,7 +2015,7 @@ impl Simulator {
         if self.time == 0 && !self.pending_t0_triggers.is_empty() {
             let evs = std::mem::take(&mut self.pending_t0_triggers);
             for ev in evs {
-                self.fire_named_event(&ev);
+                self.fire_canon_event(&ev);
             }
         }
         // §23.3.3: a time-0 port or alias update the active loop above did

@@ -2535,6 +2535,7 @@ impl Simulator {
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
         dir: PortDirection,
+        elem_width_override: Option<u32>,
     ) -> Option<(String, String)> {
         use crate::ast::types::UnpackedDimension;
         self.meta_note(pname);
@@ -2552,6 +2553,7 @@ impl Simulator {
                 &selected,
                 queue_data_type,
                 dir,
+                elem_width_override,
             );
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
@@ -2604,8 +2606,8 @@ impl Simulator {
         }
         if let Some(parts) = literal_elems {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            let width = self
-                .declared_collection_elem_width(queue_data_type)
+            let width = elem_width_override
+                .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(32);
             self.module.arrays.insert(key.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(key.clone());
@@ -2647,8 +2649,8 @@ impl Simulator {
         }
         if let Some((vals, w)) = self.collection_slice_values(arg) {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            let w = self
-                .declared_collection_elem_width(queue_data_type)
+            let w = elem_width_override
+                .or_else(|| self.declared_collection_elem_width(queue_data_type))
                 .unwrap_or(w);
             self.module.arrays.insert(key.clone(), (0, -1, w));
             self.module.dynamic_arrays.insert(key.clone());
@@ -2698,8 +2700,8 @@ impl Simulator {
             self.get_queue_size(&cname)
         };
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
-        let w = self
-            .declared_collection_elem_width(queue_data_type)
+        let w = elem_width_override
+            .or_else(|| self.declared_collection_elem_width(queue_data_type))
             .unwrap_or(w);
         let key = self.formal_dyn_key(pname, queue_data_type);
         self.register_formal_shape(&key, dims);
@@ -3244,7 +3246,15 @@ impl Simulator {
                 }
             }
         }
-        self.eval_expr(arg)
+        let v = self.eval_expr(arg);
+        if self.is_string_collection(container_name)
+            && !v.is_real
+            && !self.operand_has_string_type(arg)
+        {
+            v.sv_string_strip_nul()
+        } else {
+            v
+        }
     }
 
     /// §7.12.3: a reduction's result has the ELEMENT type — width AND
@@ -3639,7 +3649,7 @@ impl Simulator {
                 .or_else(|| self.get_signal_value_by_name(obj_name));
 
             if let Some(base) = base_val {
-                return Some(Self::int_count(base.sv_string_bytes().len() as u64));
+                return Some(Self::int_count(base.sv_string_len() as u64));
             }
             return Some(Self::int_count(0));
         }
@@ -3649,15 +3659,13 @@ impl Simulator {
         // wildcards were never detected.
         if bm == BuiltinM::Getc {
             if let Some(idx_arg) = args.first() {
-                let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
-                // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
-                let b = self
-                    .get_local_signal_or_static(obj_name)
-                    .map(|v| v.sv_string_bytes())
-                    .unwrap_or_default()
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(0);
+                let idx = Self::sv_int_arg(&self.eval_expr(idx_arg));
+                let b = if idx >= 0 {
+                    self.get_local_signal_or_static(obj_name)
+                        .map_or(0, |v| v.sv_string_getc(idx as usize))
+                } else {
+                    0
+                };
                 return Some(Self::sv_byte(b));
             }
             return Some(Value::zero(8));
@@ -3665,26 +3673,12 @@ impl Simulator {
         if bm == BuiltinM::Substr {
             if let Some(first) = args.first() {
                 if let Some(second) = args.get(1) {
-                    let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
-                    let end = self.eval_expr(second).to_u64().unwrap_or(0) as usize;
-
-                    let base_val = self.get_local_signal_or_static(obj_name);
-
-                    if let Some(base) = base_val {
-                        let mut highest_bit = 0;
-                        for i in (0..base.width as usize).rev() {
-                            if base.get_bit(i) != LogicBit::Zero {
-                                highest_bit = i;
-                                break;
-                            }
-                        }
-                        let actual_len = highest_bit.div_ceil(8);
-                        if actual_len > 0 && start < actual_len && end < actual_len && start <= end
-                        {
-                            let l = (actual_len - 1 - start) * 8 + 7;
-                            let r = (actual_len - 1 - end) * 8;
-                            return Some(base.range_select(l, r));
-                        }
+                    let start = Self::sv_int_arg(&self.eval_expr(first));
+                    let end = Self::sv_int_arg(&self.eval_expr(second));
+                    if start >= 0 && end >= start
+                        && let Some(base) = self.get_local_signal_or_static(obj_name)
+                    {
+                        return Some(base.sv_string_slice(start as usize, end as usize));
                     }
                 }
             }

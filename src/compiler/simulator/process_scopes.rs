@@ -3310,7 +3310,9 @@ impl Simulator {
                         let cached = self.forever_sens_cache.get(&key).cloned();
                         let (resolved, is_clk_ev) = match cached {
                             Some(c) => c,
-                            None if self.event_needs_indexed_class_waiter(event) => {
+                            None if self.event_needs_indexed_class_waiter(event)
+                                || self.event_control_event_key(event).is_some() =>
+                            {
                                 (Vec::new(), false)
                             }
                             None => {
@@ -4395,7 +4397,10 @@ impl Simulator {
         if low.saturating_add(elem_width as usize) > self.signal_widths[id] as usize {
             return true;
         }
-        let piece = val.resize_for_assign(elem_width);
+        let mut piece = val.resize_for_assign(elem_width);
+        if self.signal_two_state.get(id).copied().unwrap_or(false) && piece.has_xz() {
+            piece = piece.to_two_state();
+        }
         if let Some(entry_index) = self.nba_fast_index.get(id) {
             self.nba_fast[entry_index]
                 .value
@@ -4856,7 +4861,11 @@ impl Simulator {
         if !self.pending_nba_triggers.is_empty() {
             let evs = std::mem::take(&mut self.pending_nba_triggers);
             for ev in evs {
-                self.fire_named_event(&ev);
+                if let Some(canon) = ev.strip_prefix('\x05') {
+                    self.fire_canon_event(canon);
+                } else {
+                    self.fire_named_event(&ev);
+                }
             }
         }
         if !self.pending_nba_instance_triggers.is_empty() {
@@ -4876,7 +4885,8 @@ impl Simulator {
     pub(super) fn fit_value_to_signal(&self, id: usize, val: &Value) -> Value {
         let width = self.signal_widths[id];
         if self.signal_real[id] {
-            let mut r = if self.shortreal_signals.contains(&id) {
+            let mut r = if !self.shortreal_signals.is_empty() && self.shortreal_signals.contains(&id)
+            {
                 Value::from_f64(val.to_f64() as f32 as f64)
             } else if val.is_real {
                 val.clone()

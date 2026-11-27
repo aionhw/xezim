@@ -282,14 +282,18 @@ impl Simulator {
                 module.typedef_types.insert(k, nd);
             }
         }
-        let mut keys: Vec<String> = module.var_decl_types.keys().cloned().collect();
-        keys.sort();
-        for k in keys {
-            if let Some(dt) = module.var_decl_types.get(&k)
-                && let Some(nd) = Self::inline_member_coll_dt(module, "", dt, 0)
-            {
-                module.var_decl_types.insert(k, nd);
-            }
+        let mut cache = HashMap::default();
+        let updates: Vec<(String, std::rc::Rc<DataType>)> = module
+            .var_decl_types
+            .as_map()
+            .iter()
+            .filter_map(|(k, dt)| {
+                Self::inline_member_coll_dt_rc(module, "", dt, &mut cache)
+                    .map(|nd| (k.to_string(), nd))
+            })
+            .collect();
+        for (k, nd) in updates {
+            module.var_decl_types.insert_shared(k, nd);
         }
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
         classes.sort();
@@ -368,6 +372,24 @@ impl Simulator {
             }
         }
         out.map(DataType::Struct)
+    }
+
+    /// Memoized wrapper around [`inline_member_coll_dt`] keyed by `Rc::as_ptr`
+    /// for identical `start` scopes. Callers must ensure cached `Rc<DataType>`
+    /// keys remain alive for the cache's lifetime.
+    fn inline_member_coll_dt_rc(
+        module: &ElaboratedModule,
+        start: &str,
+        dt: &std::rc::Rc<DataType>,
+        cache: &mut HashMap<*const DataType, Option<std::rc::Rc<DataType>>>,
+    ) -> Option<std::rc::Rc<DataType>> {
+        let key = std::rc::Rc::as_ptr(dt);
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+        let res = Self::inline_member_coll_dt(module, start, dt, 0).map(std::rc::Rc::new);
+        cache.insert(key, res.clone());
+        res
     }
 
     /// The ELEMENT type a dimensioned typedef names (its `typedef_types` /
@@ -3038,10 +3060,9 @@ impl Simulator {
                             .and_then(|ty| module.typedef_types.get(ty.as_str()))
                     });
                     if sig.type_name.as_deref().map(String::as_str) == Some("shortreal")
-                        || declared.is_some_and(|dt| matches!(
-                            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
-                            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
-                        ))
+                        || declared.is_some_and(|dt| {
+                            super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types)
+                        })
                     {
                         shortreal_signals.insert(id);
                         val = Value::from_f64(val.to_f64() as f32 as f64);
@@ -3587,11 +3608,51 @@ impl Simulator {
                 // right). Everything keying on per-element `signal_real`
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
+                    let is_shortreal =
+                        super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                     for id in first_id..signal_table.len() {
                         // §6.8, Table 6-7: real/shortreal cells start at real
                         // 0.0; the value tag must agree with the metadata.
                         signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
+                        if is_shortreal {
+                            shortreal_signals.insert(id);
+                        }
+                    }
+                } else if matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                ) {
+                    for id in first_id..signal_table.len() {
+                        signal_table[id] = Value::zero(0);
+                    }
+                }
+            }
+            if !module.interconnect_elem_types.is_empty()
+                && module.interconnect_nets.contains(base.as_str())
+            {
+                for idx in lo..=hi {
+                    elem_name_buf.clear();
+                    elem_name_buf.push_str(base);
+                    elem_name_buf.push('[');
+                    Self::push_i64(&mut elem_name_buf, idx);
+                    elem_name_buf.push(']');
+                    if let Some(&(ew, is_real, _)) =
+                        module.interconnect_elem_types.get(elem_name_buf.as_str())
+                    {
+                        let elem_id = first_id + (idx - lo) as usize;
+                        if elem_id < signal_table.len() {
+                            signal_widths_vec[elem_id] = ew;
+                            signal_real_vec[elem_id] = is_real;
+                            signal_table[elem_id] = if is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                Value::all_z(ew)
+                            };
+                        }
                     }
                 }
             }
@@ -3793,12 +3854,29 @@ impl Simulator {
                 }
             }
             // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
-                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
-            }) {
+            if let Some(dt) = module.var_decl_types.get(base)
+                && super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            {
+                let is_shortreal =
+                    super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
+                    if is_shortreal {
+                        shortreal_signals.insert(id);
+                    }
+                }
+            } else if let Some(dt) = module.var_decl_types.get(base)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(0);
                 }
             }
         }
@@ -3857,12 +3935,29 @@ impl Simulator {
                 }
             }
             // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
-                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
-            }) {
+            if let Some(dt) = module.var_decl_types.get(base)
+                && super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            {
+                let is_shortreal =
+                    super::elaborate::is_type_shortreal_resolved(dt, &module.typedef_types);
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
+                    if is_shortreal {
+                        shortreal_signals.insert(id);
+                    }
+                }
+            } else if let Some(dt) = module.var_decl_types.get(base)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(0);
                 }
             }
         }
@@ -3870,31 +3965,71 @@ impl Simulator {
         // parameter, §6.20.2). Deliberately after the 2-D / N-D creation
         // loops: those rebuild storage for their names, so restoring earlier
         // left a multi-dimensional parameter array zero-filled.
-        for (nm, v) in array_elem_inits {
+        for (nm, mut v) in array_elem_inits {
             if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
+                if v.is_real && shortreal_signals.contains(&id) {
+                    v = Value::from_f64(v.to_f64() as f32 as f64);
+                }
                 signal_table[id] = v;
             }
         }
-        // §6.8 again for the 2-D / N-D element storage (named slots).
-        for base in module.two_state_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
-            }
-            let prefix = format!("{}[", base);
-            for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+        // §6.8 again for the 2-D / N-D element storage (named slots): walk
+        // `signal_name_to_id` at most once across all 2-D/N-D entries instead of
+        // scanning every signal per declaration (`O(N)` instead of `O(K*N)`).
+        let ts_nd: HashSet<&str> = module
+            .two_state_signals
+            .iter()
+            .filter(|b| module.arrays_2d.contains_key(*b) || module.arrays_nd.contains_key(*b))
+            .map(String::as_str)
+            .collect();
+        let zi_nd: HashSet<&str> = module
+            .z_init_signals
+            .iter()
+            .filter(|b| module.arrays_2d.contains_key(*b) || module.arrays_nd.contains_key(*b))
+            .map(String::as_str)
+            .collect();
+        if !ts_nd.is_empty() || !zi_nd.is_empty() {
+            let mut ts_any_bracket = false;
+            for b in &ts_nd {
+                if b.contains('[') {
+                    ts_any_bracket = true;
+                    break;
                 }
             }
-        }
-        for base in module.z_init_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
+            let mut zi_any_bracket = false;
+            for b in &zi_nd {
+                if b.contains('[') {
+                    zi_any_bracket = true;
+                    break;
+                }
             }
-            let prefix = format!("{}[", base);
+            fn find_nd_base<'a>(
+                set: &HashSet<&'a str>,
+                any_bracket: bool,
+                name: &str,
+            ) -> Option<&'a str> {
+                if set.is_empty() {
+                    return None;
+                }
+                if !any_bracket {
+                    let pos = name.find('[')?;
+                    let cand = &name[..pos];
+                    return set.get(cand).copied();
+                }
+                for (pos, _) in name.match_indices('[') {
+                    let cand = &name[..pos];
+                    if let Some(&hit) = set.get(cand) {
+                        return Some(hit);
+                    }
+                }
+                None
+            }
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                if find_nd_base(&ts_nd, ts_any_bracket, name).is_some() && !signal_real_vec[id] {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+                if let Some(base) = find_nd_base(&zi_nd, zi_any_bracket, name) {
+                    signal_table[id] = match module.resolved_net_kinds.get(base) {
                         Some(
                             super::elaborate::ResolvedNetKind::Tri0
                             | super::elaborate::ResolvedNetKind::Supply0,

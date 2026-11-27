@@ -436,6 +436,10 @@ pub(super) struct PreboundCompiledMethod {
     pub writeback_formals: std::rc::Rc<Vec<String>>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
 /// register ids of its seeded `this` / result cells. One entry per compiled
 /// (class, method, width-signature); shared across all calls to that method
@@ -445,6 +449,10 @@ pub struct CompiledMethodEntry {
     pub block: std::rc::Rc<CompiledBlock>,
     pub this_reg: crate::compiler::bytecode::RegId,
     pub result_reg: crate::compiler::bytecode::RegId,
+    /// Whether top-level VarDecl/ParamDecl metadata in the AST body must be
+    /// recorded on entry (needed only when `$cast` or an AST fallback runs).
+    #[serde(default = "default_true")]
+    pub needs_decl_meta: bool,
 }
 
 /// Result of probing / populating the compiled-class-method cache for a
@@ -1285,6 +1293,10 @@ pub struct BytecodeCompiler<'a> {
     /// input and never re-trigger when the real scoped input changes. Set via
     /// `set_packed_struct_fields`.
     packed_struct_fields: Option<&'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
+    /// Declared named-event variables (`module.events`), so bytecode bails on
+    /// event operands/assignments rather than reading/writing their 1-bit
+    /// backing signals directly.
+    events: Option<&'a HashSet<String>>,
 }
 
 /// Where `packed_path_dyn_range` places a store in its root signal.
@@ -1465,6 +1477,7 @@ impl<'a> BytecodeCompiler<'a> {
             dynamic_arrays: None,
             queue_vars: None,
             packed_struct_fields: None,
+            events: None,
         }
     }
 
@@ -1557,6 +1570,92 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_typedef_types(&mut self, types: &'a HashMap<String, crate::ast::types::DataType>) {
         self.typedef_types = Some(types);
+    }
+
+    pub fn set_events(&mut self, events: &'a HashSet<String>) {
+        self.events = Some(events);
+    }
+
+    pub(super) fn is_event_dt(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::Simple {
+                    kind: SimpleType::Event,
+                    ..
+                } => return true,
+                DataType::TypeReference { name, .. } => {
+                    let next = if name.scopes.is_empty() {
+                        self.local_typedef_types
+                            .get(&name.name.name)
+                            .or_else(|| self.typedef_types.and_then(|t| t.get(&name.name.name)))
+                    } else {
+                        let q = name.qualified();
+                        self.typedef_types
+                            .and_then(|t| t.get(&q).or_else(|| t.get(&name.name.name)))
+                    };
+                    match next {
+                        Some(n) => cur = n,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    pub(super) fn is_event_ident(&self, hier: &HierarchicalIdentifier) -> bool {
+        let Some(events) = self.events else {
+            return false;
+        };
+        if hier.path.is_empty() {
+            return false;
+        }
+        if hier.path.len() == 1 {
+            let bare = hier.path[0].name.name.as_str();
+            if events.contains(bare) {
+                return true;
+            }
+            if let Some(scope) = self.scope_hint.as_deref()
+                && !scope.is_empty()
+            {
+                return with_dotted(scope, bare, |k| events.contains(k));
+            }
+            return false;
+        }
+        let raw = Self::hier_raw_cow(hier);
+        if events.contains(raw.as_ref()) {
+            return true;
+        }
+        if let Some(top) = self.top_module_name.as_deref()
+            && let Some(rest) = raw
+                .strip_prefix(top)
+                .and_then(|r| r.strip_prefix('.'))
+            && events.contains(rest)
+        {
+            return true;
+        }
+        if hier.path.len() >= 2 && hier.path[0].selects.is_empty() {
+            let pkg_qual = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+            if events.contains(&pkg_qual) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn is_event_expr(&self, e: &Expression) -> bool {
+        let mut cur = e;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner;
+        }
+        match &cur.kind {
+            ExprKind::Ident(h) => self.is_event_ident(h),
+            ExprKind::Index { expr, .. } => self.is_event_expr(expr),
+            _ => false,
+        }
     }
 
     pub fn set_local_typedef_types(&mut self, types: HashMap<String, crate::ast::types::DataType>) {

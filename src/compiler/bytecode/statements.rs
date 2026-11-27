@@ -73,6 +73,12 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("VarDecl_offset_range");
             return false;
         }
+        if let StatementKind::VarDecl { data_type, .. } = &stmt.kind
+            && self.is_event_dt(data_type)
+        {
+            self.bail("VarDecl_event");
+            return false;
+        }
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
@@ -642,6 +648,10 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nba_unpacked_collection");
                     return self.emit_fallback(stmt);
                 }
+                if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
@@ -727,6 +737,10 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("coll_elem_store");
                     return self.emit_fallback(stmt);
                 }
+                if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
@@ -769,16 +783,28 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::AssignPendingColl(key.into_boxed_str(), val_reg));
                         return true;
                     }
-                    if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
-                        // §10.7, §6.12.1: a real stored into an integral
-                        // variable is rounded (`l = r;` with `longint l`).
-                        if !self.value_may_be_real(lvalue) {
-                            self.emit_real_to_int_fit(val_reg, rvalue, width);
-                        } else if self.lvalue_is_real(lvalue) {
-                            self.emit_real_target_fit(val_reg, rvalue);
+                    let lhs_is_str = self.lvalue_is_string_target_static(lvalue);
+                    let store_reg = if lhs_is_str {
+                        if !self.expr_has_string_type_static(rvalue) {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(tr, StrOpKind::ToStr, Box::new(vec![val_reg])));
+                            tr
+                        } else {
+                            val_reg
                         }
-                        self.emit(Insn::Resize(val_reg, width));
-                    }
+                    } else {
+                        if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
+                            // §10.7, §6.12.1: a real stored into an integral
+                            // variable is rounded (`l = r;` with `longint l`).
+                            if !self.value_may_be_real(lvalue) {
+                                self.emit_real_to_int_fit(val_reg, rvalue, width);
+                            } else if self.lvalue_is_real(lvalue) {
+                                self.emit_real_target_fit(val_reg, rvalue);
+                            }
+                            self.emit(Insn::Resize(val_reg, width));
+                        }
+                        val_reg
+                    };
                     // class-perf P2: STRING member store (`m_leaf_name = name`)
                     // whose RHS is from the string-valued expr universe. The
                     // heap round-trip is exact for string Values — the store
@@ -789,12 +815,12 @@ impl<'a> BytecodeCompiler<'a> {
                     if self.method_mode
                         && width == 0
                         && !via_new
-                        && self.expr_is_string_static(rvalue)
-                        && self.method_string_store_target(lvalue, val_reg)
+                        && (lhs_is_str || self.expr_is_string_static(rvalue))
+                        && self.method_string_store_target(lvalue, store_reg)
                     {
                         return true;
                     }
-                    if self.compile_blocking_target(lvalue, val_reg, width) {
+                    if self.compile_blocking_target(lvalue, store_reg, width) {
                         return true;
                     }
                     self.bail("blocking_target");
@@ -1489,7 +1515,11 @@ impl<'a> BytecodeCompiler<'a> {
                 for fi in init {
                     match fi {
                         ForInit::Assign { lvalue, rvalue } => {
-                            let width = self.infer_lhs_width(lvalue);
+                            if self.is_event_expr(lvalue) {
+                    self.bail("event_assign");
+                    return self.emit_fallback(stmt);
+                }
+                let width = self.infer_lhs_width(lvalue);
                             let val_reg = match self.compile_expr(rvalue, width) {
                                 Some(r) => r,
                                 None => {
@@ -1497,10 +1527,26 @@ impl<'a> BytecodeCompiler<'a> {
                                     return false;
                                 }
                             };
-                            if width > 0 && !self.expr_is_string_static(rvalue) {
-                                self.emit(Insn::Resize(val_reg, width));
-                            }
-                            if !self.compile_blocking_target(lvalue, val_reg, width) {
+                            let lhs_is_str = self.lvalue_is_string_target_static(lvalue);
+                            let store_reg = if lhs_is_str {
+                                if !self.expr_has_string_type_static(rvalue) {
+                                    let tr = self.alloc_reg();
+                                    self.emit(Insn::StrOp(
+                                        tr,
+                                        StrOpKind::ToStr,
+                                        Box::new(vec![val_reg]),
+                                    ));
+                                    tr
+                                } else {
+                                    val_reg
+                                }
+                            } else {
+                                if width > 0 && !self.expr_is_string_static(rvalue) {
+                                    self.emit(Insn::Resize(val_reg, width));
+                                }
+                                val_reg
+                            };
+                            if !self.compile_blocking_target(lvalue, store_reg, width) {
                                 self.bail("For_init_target");
                                 return false;
                             }
@@ -1828,10 +1874,26 @@ impl<'a> BytecodeCompiler<'a> {
                             return false;
                         }
                     };
-                    if width > 0 && !self.expr_is_string_static(rhs) {
-                        self.emit(Insn::Resize(val_reg, width));
-                    }
-                    if !self.compile_blocking_target(lhs, val_reg, width) {
+                    let lhs_is_str = self.lvalue_is_string_target_static(lhs);
+                    let store_reg = if lhs_is_str {
+                        if !self.expr_has_string_type_static(rhs) {
+                            let tr = self.alloc_reg();
+                            self.emit(Insn::StrOp(
+                                tr,
+                                StrOpKind::ToStr,
+                                Box::new(vec![val_reg]),
+                            ));
+                            tr
+                        } else {
+                            val_reg
+                        }
+                    } else {
+                        if width > 0 && !self.expr_is_string_static(rhs) {
+                            self.emit(Insn::Resize(val_reg, width));
+                        }
+                        val_reg
+                    };
+                    if !self.compile_blocking_target(lhs, store_reg, width) {
                         self.bail("For_step_target");
                         return false;
                     }

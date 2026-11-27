@@ -585,11 +585,22 @@ impl Simulator {
         self.randc_used.retain(|(h, _), _| !dead_handle(*h));
         self.randc_pending.retain(|(h, _), _| !dead_handle(*h));
         self.dist_decks.retain(|(h, _), _| !dead_handle(*h));
+        self.event_aliases.retain(|k, _| {
+            !Self::parse_instance_event_slot_key(k)
+                .is_some_and(|(h, _)| h != 0 && dead_handle(h))
+        });
         self.event_obj_ids.retain(|(h, _), _| !dead_handle(*h));
         for slots in self.event_obj_slots.values_mut() {
             slots.retain(|(h, _)| !dead_handle(*h));
         }
         self.event_obj_slots.retain(|_, slots| !slots.is_empty());
+        let obj_slots = &self.event_obj_slots;
+        let now = self.time;
+        self.event_triggered_time.prune_dead_instance_stamps(
+            dead_handle,
+            |oid| obj_slots.contains_key(&oid),
+            now,
+        );
         let mut released = 0;
         for &handle in dead_list {
             if self.heap.get_mut(handle).and_then(Option::take).is_some() {

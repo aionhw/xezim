@@ -16,39 +16,30 @@ impl Simulator {
         use super::bytecode::StrOpKind as K;
         let v = |i: usize| -> &Value { &regs[args[i] as usize] };
         match kind {
-            K::Len => Self::int_count(v(0).sv_string_bytes().len() as u64),
+            K::Len => Self::int_count(v(0).sv_string_len() as u64),
             K::GetC => {
-                let idx = v(1).to_u64().unwrap_or(0) as usize;
-                let b = v(0).sv_string_bytes().get(idx).copied().unwrap_or(0);
+                let idx = Self::sv_int_arg(v(1));
+                let b = if idx >= 0 {
+                    v(0).sv_string_getc(idx as usize)
+                } else {
+                    0
+                };
                 Self::sv_byte(b)
             }
+            K::Index => Self::sv_index_read(v(0), v(1)),
             K::Substr => {
-                // Mirror of the AST rule: length from the highest set bit,
-                // inclusive [start, end] byte slice, "" out of range.
-                let base = v(0);
-                let start = v(1).to_u64().unwrap_or(0) as usize;
-                let end = v(2).to_u64().unwrap_or(0) as usize;
-                let mut highest_bit = 0usize;
-                for i in (0..base.width as usize).rev() {
-                    if base.get_bit(i) != LogicBit::Zero {
-                        highest_bit = i;
-                        break;
-                    }
-                }
-                let actual_len = highest_bit.div_ceil(8);
-                if actual_len > 0 && start < actual_len && end < actual_len && start <= end {
-                    let l = (actual_len - 1 - start) * 8 + 7;
-                    let r = (actual_len - 1 - end) * 8;
-                    base.range_select(l, r)
-                } else {
+                let start = Self::sv_int_arg(v(1));
+                let end = Self::sv_int_arg(v(2));
+                if start < 0 || end < start {
                     Value::zero(0)
+                } else {
+                    v(0).sv_string_slice(start as usize, end as usize)
                 }
             }
-            K::ToUpper => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), true)),
-            K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
+            K::ToUpper => v(0).sv_string_ascii_case(true),
+            K::ToLower => v(0).sv_string_ascii_case(false),
             K::Compare | K::ICompare | K::Order => {
-                let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
-                let d = Self::sv_strcmp(&a, &b, matches!(kind, K::ICompare));
+                let d = v(0).sv_string_cmp(v(1), matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
                 out.is_signed = true;
                 out
@@ -57,38 +48,21 @@ impl Simulator {
             K::AToHex => sv_ato_value(&v(0).to_sv_string(), 16),
             K::AToOct => sv_ato_value(&v(0).to_sv_string(), 8),
             K::AToBin => sv_ato_value(&v(0).to_sv_string(), 2),
-            K::Concat => {
-                let mut bytes: Vec<u8> = Vec::new();
-                for &r in args {
-                    bytes.extend(regs[r as usize].sv_string_bytes());
-                }
-                let text: String = bytes.into_iter().map(|b| b as char).collect();
-                Value::from_string(&text)
-            }
+            K::Concat => Value::sv_string_concat_refs(args.iter().map(|&r| &regs[r as usize])),
             K::PutC => {
-                let mut b = v(0).sv_string_bytes();
-                let idx = v(1).to_i64().unwrap_or(-1);
-                let ch = (v(2).to_u64().unwrap_or(0) & 0xFF) as u8;
-                if idx >= 0 && (idx as usize) < b.len() && ch != 0 {
-                    b[idx as usize] = ch;
-                    Self::sv_string_from_bytes(&b)
-                } else {
-                    v(0).clone()
+                let idx = Self::sv_int_arg(v(1));
+                let mut cv = v(2).resize_for_assign(8);
+                if cv.has_xz() {
+                    cv = cv.to_two_state();
                 }
+                let ch = (cv.to_u64().unwrap_or(0) & 0xFF) as u8;
+                v(0).sv_string_putc(i64::from(idx), ch)
             }
-            K::IToA => {
-                let x = v(0);
-                let text = if x.width > 32 {
-                    format!("{}", x.to_i64().unwrap_or(0))
-                } else {
-                    format!("{}", x.to_u64().unwrap_or(0) as u32 as i32)
-                };
-                Value::from_string(&text)
-            }
-            K::HexToA => Value::from_string(&format!("{:x}", v(0).to_u64().unwrap_or(0))),
-            K::OctToA => Value::from_string(&format!("{:o}", v(0).to_u64().unwrap_or(0))),
-            K::BinToA => Value::from_string(&format!("{:b}", v(0).to_u64().unwrap_or(0))),
-            K::ToStr => Self::sv_string_cast(v(0)),
+            K::IToA => Self::sv_int_toa(v(0), 10),
+            K::HexToA => Self::sv_int_toa(v(0), 16),
+            K::OctToA => Self::sv_int_toa(v(0), 8),
+            K::BinToA => Self::sv_int_toa(v(0), 2),
+            K::ToStr => v(0).sv_string_strip_nul(),
         }
     }
 
@@ -618,24 +592,76 @@ impl Simulator {
         }
     }
 
-    /// §28.12.2: combine two strength ranges point by point.
+    /// §28.12.2: combine two strength ranges point by point in O(1).
     pub(super) fn combine_strength(a: (i8, i8), b: (i8, i8), wired_and: Option<bool>) -> (i8, i8) {
+        if a.0 > a.1 || b.0 > b.1 {
+            return (i8::MAX, i8::MIN);
+        }
+        let (a0, a1) = (a.0 as i16, a.1 as i16);
+        let (b0, b1) = (b.0 as i16, b.1 as i16);
         let (mut lo, mut hi) = (i8::MAX, i8::MIN);
-        for p in a.0..=a.1 {
-            for q in b.0..=b.1 {
-                let outs: [i8; 2] = if p.abs() > q.abs() {
-                    [p, p]
-                } else if q.abs() > p.abs() {
-                    [q, q]
-                } else if let Some(and) = wired_and {
-                    let value = if and { p.min(q) } else { p.max(q) };
-                    [value, value]
-                } else {
-                    [p, q]
-                };
-                for o in outs {
-                    lo = lo.min(o);
-                    hi = hi.max(o);
+        let mut include = |x: i16| {
+            let x = x as i8;
+            lo = lo.min(x);
+            hi = hi.max(x);
+        };
+        let min_abs = |l: i16, h: i16| -> i16 {
+            if l <= 0 && h >= 0 {
+                0
+            } else {
+                l.abs().min(h.abs())
+            }
+        };
+        let mb = min_abs(b0, b1);
+        if a0 < -mb {
+            include(a0);
+            include(a1.min(-(mb + 1)));
+        }
+        if a1 > mb {
+            include(a0.max(mb + 1));
+            include(a1);
+        }
+        let ma = min_abs(a0, a1);
+        if b0 < -ma {
+            include(b0);
+            include(b1.min(-(ma + 1)));
+        }
+        if b1 > ma {
+            include(b0.max(ma + 1));
+            include(b1);
+        }
+        let a_pos = (a0.max(0), a1);
+        let a_neg = ((-a1).max(0), -a0);
+        let b_pos = (b0.max(0), b1);
+        let b_neg = ((-b1).max(0), -b0);
+        let (pp0, pp1) = (a_pos.0.max(b_pos.0), a_pos.1.min(b_pos.1));
+        if pp0 <= pp1 {
+            include(pp0);
+            include(pp1);
+        }
+        let (nn0, nn1) = (a_neg.0.max(b_neg.0), a_neg.1.min(b_neg.1));
+        if nn0 <= nn1 {
+            include(-nn1);
+            include(-nn0);
+        }
+        for (o0, o1) in [
+            (a_pos.0.max(b_neg.0), a_pos.1.min(b_neg.1)),
+            (a_neg.0.max(b_pos.0), a_neg.1.min(b_pos.1)),
+        ] {
+            if o0 <= o1 {
+                match wired_and {
+                    None => {
+                        include(-o1);
+                        include(o1);
+                    }
+                    Some(true) => {
+                        include(-o1);
+                        include(-o0);
+                    }
+                    Some(false) => {
+                        include(o0);
+                        include(o1);
+                    }
                 }
             }
         }
@@ -864,6 +890,9 @@ impl Simulator {
             let cn = cn.as_str();
             if let Some(sig) = cd.properties.get(prop) {
                 if sig.is_real
+                    || self.class_prop_decl_type(cd, prop).is_some_and(|dt| {
+                        super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+                    })
                     || sig
                         .type_name
                         .as_ref()
@@ -956,6 +985,9 @@ impl Simulator {
             return Some(None);
         };
         if sig.is_real
+            || self.class_prop_decl_type(cd, prop).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+            })
             || sig
                 .type_name
                 .as_ref()
@@ -1127,7 +1159,13 @@ impl Simulator {
                     f.is_signed = self.class_prop_signed_of(handle, prop);
                     f
                 }
-                None => val.clone(),
+                None => {
+                    if self.may_name_real_class_prop(prop) && self.class_prop_shortreal(handle, prop) {
+                        Value::from_f64(val.to_f64() as f32 as f64)
+                    } else {
+                        val.clone()
+                    }
+                }
             };
         }
         let fitted = match self.heap_prop_width(handle, prop) {
@@ -1136,7 +1174,17 @@ impl Simulator {
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
-            None => val.clone(),
+            None => {
+                if self.may_name_real_class_prop(prop) {
+                    if self.class_prop_shortreal(handle, prop) {
+                        return Value::from_f64(val.to_f64() as f32 as f64);
+                    }
+                    if self.class_prop_is_real(handle, prop) {
+                        return Value::from_f64(val.to_f64());
+                    }
+                }
+                val.clone()
+            }
         };
         // §6.11.1/§10.7: a 2-state property drops X/Z on every write.
         if fitted.has_xz() && self.class_prop_two_state(handle, prop) {
@@ -1285,6 +1333,65 @@ impl Simulator {
         false
     }
 
+    pub(super) fn class_prop_shortreal(&self, handle: usize, prop: &str) -> bool {
+        if !self.may_name_real_class_prop(prop) {
+            return false;
+        }
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        let mut cur = Some(start);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                if let DataType::TypeReference { name, .. } = dt
+                    && !name.has_scope()
+                    && cd.type_param_names.iter().any(|t| *t == name.name.name)
+                    && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
+                {
+                    let b = b.trim();
+                    let td = cd
+                        .typedef_targets
+                        .get(b)
+                        .or_else(|| self.module.typedef_types.get(b))
+                        .or_else(|| {
+                            b.rsplit_once("::")
+                                .and_then(|(_, t)| self.module.typedef_types.get(t))
+                        });
+                    return b == "shortreal"
+                        || td.is_some_and(|td| {
+                            super::elaborate::is_type_shortreal_resolved(
+                                td,
+                                &self.module.typedef_types,
+                            )
+                        });
+                }
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
+                return super::elaborate::is_type_shortreal_resolved(
+                    bound.as_ref().unwrap_or(dt),
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     /// §8.4: `var.prop` where `var` is a DECLARED class handle currently
     /// null and `prop` is an instance property of that class — a runtime
     /// fatal. Emits the error and terminates; returns true when it fired.
@@ -1385,5 +1492,60 @@ impl Simulator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod combine_strength_tests {
+    use super::Simulator;
+
+    fn combine_strength_ref(a: (i8, i8), b: (i8, i8), wired_and: Option<bool>) -> (i8, i8) {
+        let (mut lo, mut hi) = (i8::MAX, i8::MIN);
+        for p in a.0..=a.1 {
+            for q in b.0..=b.1 {
+                let outs: [i8; 2] = if p.abs() > q.abs() {
+                    [p, p]
+                } else if q.abs() > p.abs() {
+                    [q, q]
+                } else if let Some(and) = wired_and {
+                    let value = if and { p.min(q) } else { p.max(q) };
+                    [value, value]
+                } else {
+                    [p, q]
+                };
+                for o in outs {
+                    lo = lo.min(o);
+                    hi = hi.max(o);
+                }
+            }
+        }
+        (lo, hi)
+    }
+
+    #[test]
+    fn combine_strength_exhaustive_43200() {
+        let mut count = 0usize;
+        for a0 in -7i8..=7 {
+            for a1 in a0..=7 {
+                for b0 in -7i8..=7 {
+                    for b1 in b0..=7 {
+                        for wired_and in [None, Some(true), Some(false)] {
+                            assert_eq!(
+                                Simulator::combine_strength((a0, a1), (b0, b1), wired_and),
+                                combine_strength_ref((a0, a1), (b0, b1), wired_and),
+                                "mismatch for ({a0}, {a1}), ({b0}, {b1}), {wired_and:?}"
+                            );
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 43_200);
+        // Empty intervals match reference sentinel.
+        assert_eq!(
+            Simulator::combine_strength((3, 1), (0, 5), None),
+            combine_strength_ref((3, 1), (0, 5), None)
+        );
     }
 }

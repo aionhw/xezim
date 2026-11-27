@@ -4022,7 +4022,7 @@ impl Simulator {
     /// is assignment-compatible with `dest`'s declared class type. Permissive
     /// when types are unknown (null src, non-class handle, untracked dest type)
     /// so only a definite type mismatch fails (IEEE 1800-2023 §8.16).
-    pub(super) fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+    pub(super) fn cast_type_ok(&mut self, dest: &Expression, src: &Value) -> bool {
         self.cast_type_ok_ex(dest, src, None)
     }
 
@@ -4032,33 +4032,21 @@ impl Simulator {
     /// Ident arm; all downstream checks (type-param resolution, value-param
     /// specialization, hierarchy) are unchanged.
     pub(super) fn cast_type_ok_ex(
-        &self,
+        &mut self,
         dest: &Expression,
         src: &Value,
         ovr: Option<&str>,
     ) -> bool {
-        // §6.24.1: casting to an ENUM succeeds only when the value is one of
-        // its members. Checked before the class logic, whose "not a live class
-        // object" escape hatch would otherwise wave every integer through.
-        if let ExprKind::Ident(hh) = &dest.kind {
-            if hh.path.len() == 1 {
-                // Resolve the destination variable's ENUM type name through
-                // every available registry (module signal/local, recorded
-                // method-local decl, or a property of the current `this`
-                // object) and validate the source against that enum's members.
-                if let Some(tn) = self.enum_typename_of_var(&hh.path[0].name.name) {
-                    if let Some(members) = self.module.enum_members.get(&tn) {
-                        // An x or z bit matches no member.
-                        if src.has_xz() {
-                            return false;
-                        }
-                        return match src.to_u64() {
-                            Some(x) => members.iter().any(|(_, mv)| *mv == x),
-                            None => false,
-                        };
-                    }
-                }
-            }
+        // §6.24.2: casting to an ENUM succeeds only when the value matches one
+        // of its members. Resolve `dest`'s declared type through scalar vars,
+        // struct/class fields, array elements, and typedef aliases (avoiding
+        // stale overlay lookups when `ovr` names a known class handle local).
+        let ovr_is_class = ovr.is_some_and(|c| {
+            let base = c.split('#').next().unwrap_or(c);
+            self.module.classes.contains_key(base)
+        });
+        if !ovr_is_class && let Some(ty) = self.enum_receiver_type(dest) {
+            return ty.matches_cast_src(src);
         }
         let h = src.to_u64().unwrap_or(0) as usize;
         if h == 0 {
@@ -4385,11 +4373,11 @@ impl Simulator {
             &cd.param_order
         };
         let is_type_param = |n: &str| cd.type_param_names.iter().any(|t| t == n);
-        let value_positions: Vec<(usize, String)> = order
+        let value_positions: Vec<(usize, &str)> = order
             .iter()
             .enumerate()
             .filter(|(_, n)| !is_type_param(n))
-            .map(|(i, n)| (i, n.clone()))
+            .map(|(i, n)| (i, n.as_str()))
             .collect();
         if value_positions.is_empty() {
             return true;
@@ -4397,37 +4385,30 @@ impl Simulator {
         // Dest specialization args: prefer the resolved name's `#(...)`
         // (type-param-dest case), else the dest var's declared type_args
         // (direct-decl case).
-        let dest_args_text = match spec_args_from_name {
-            Some(a) => Some(a.to_string()),
-            None => {
-                if let ExprKind::Ident(h) = &dest.kind {
-                    if h.path.len() == 1 {
-                        let dvar = &h.path[0].name.name;
-                        self.var_type_args.get(dvar).and_then(|ta| {
-                            let frags: Vec<String> = ta
-                                .iter()
-                                .filter_map(|e| self.expr_to_spec_fragment(e))
-                                .collect();
-                            if frags.is_empty() {
-                                None
-                            } else {
-                                Some(frags.join(","))
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let dest_args: Vec<String> = match dest_args_text {
-            Some(t) => Self::split_spec_args(&t)
+        let dest_args: Vec<String> = match spec_args_from_name {
+            Some(a) => Self::split_spec_args(a)
                 .into_iter()
                 .map(|s| s.trim().to_string())
                 .collect(),
-            None => return true, // can't determine dest specialization → permissive
+            None => {
+                let ExprKind::Ident(h) = &dest.kind else {
+                    return true;
+                };
+                if h.path.len() != 1 {
+                    return true;
+                }
+                let Some(ta) = self.var_type_args.get(&h.path[0].name.name) else {
+                    return true;
+                };
+                let args: Vec<String> = ta
+                    .iter()
+                    .filter_map(|e| self.expr_to_spec_fragment(e).map(|s| s.trim().to_string()))
+                    .collect();
+                if args.is_empty() {
+                    return true;
+                }
+                args
+            }
         };
         let src_inst = match self.heap.get(src_handle).and_then(|o| o.as_ref()) {
             Some(i) => i,
@@ -4438,7 +4419,7 @@ impl Simulator {
                 Some(s) => s.as_str(),
                 None => continue,
             };
-            let sval = match src_inst.properties.get(vp) {
+            let sval = match src_inst.properties.get(*vp) {
                 Some(v) => v,
                 None => continue,
             };

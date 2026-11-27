@@ -324,6 +324,13 @@ impl Simulator {
         }
         if let Some(locals) = self.local_stack.last() {
             if let Some(v) = locals.get(name) {
+                if let Some(canon) = Self::decode_event_handle_value(v) {
+                    return Some(if canon == Self::EVENT_NULL_KEY {
+                        Value::zero(1)
+                    } else {
+                        Value::ones(1)
+                    });
+                }
                 return Some(v.clone());
             }
         }
@@ -432,6 +439,7 @@ impl Simulator {
         if names.vif_props.contains(n)
             || names.params.contains(n)
             || names.static_or_param.contains(m)
+            || names.ident_slow.contains(m)
             || self.struct_prop_name_possible(n)
             || self.struct_prop_name_possible(m)
         {
@@ -714,7 +722,14 @@ impl Simulator {
                     return false;
                 }
                 // `ev == null` compares event identities.
-                if matches!(other.kind, ExprKind::Null) && self.module.events.contains(n) {
+                if matches!(other.kind, ExprKind::Null)
+                    && (self.module.events.contains(n)
+                        || self.local_event_handle(n).is_some()
+                        || (!self.ref_binding_stack.is_empty()
+                            && self.ref_bound_event_key(n).is_some())
+                        || (self.this_stack.last().copied().flatten().is_some()
+                            && self.class_event_names().contains(n)))
+                {
                     return false;
                 }
             }
@@ -734,6 +749,7 @@ impl Simulator {
                         .vif_props
                         .contains(member.name.as_str())
                     || self.struct_prop_name_possible(&member.name)
+                    || self.class_event_names().contains(member.name.as_str())
                 {
                     return false;
                 }
@@ -759,6 +775,9 @@ impl Simulator {
             || self.coll_member_possible(n)
             || self.module.dynamic_arrays.contains(n)
             || self.module.events.contains(n)
+            || self.local_event_handle(n).is_some()
+            || (!self.ref_binding_stack.is_empty()
+                && self.ref_binding_stack.last().is_some_and(|m| m.contains_key(n)))
             || self.dyn_name_lookup(n).is_some()
             || self
                 .module
@@ -801,6 +820,16 @@ impl Simulator {
             ExprKind::StringLiteral(_) => false,
             ExprKind::Paren(inner) => self.operand_has_string_type(inner),
             ExprKind::Concatenation(parts) => parts.iter().any(|e| self.operand_has_string_type(e)),
+            ExprKind::Replication { exprs, .. } => {
+                exprs.iter().any(|e| self.operand_has_string_type(e))
+            }
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.operand_has_string_type(then_expr) || self.operand_has_string_type(else_expr)
+            }
             _ => self.operand_is_string(e),
         }
     }

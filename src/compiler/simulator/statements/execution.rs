@@ -418,6 +418,7 @@ impl Simulator {
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
                     (None, _) => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
+                let val = self.fit_rhs_for_string_target(packed_lvalue, rvalue, val);
                 let val = self.fill_into_real_target(lvalue, val);
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
@@ -1819,7 +1820,13 @@ impl Simulator {
                     // class-property collection (`return q[i];`) or a
                     // subroutine local (`return r;`) has no container value;
                     // assemble it from its leaves.
-                    let v = if self.pending_ret_collection.is_some() {
+                    let v = if self.return_frame_is_event() {
+                        self.note_event_handle_live();
+                        let canon = self
+                            .event_handle_capture_key(e)
+                            .unwrap_or_else(|| Self::EVENT_NULL_KEY.to_string());
+                        Self::encode_event_handle_value(&canon)
+                    } else if self.pending_ret_collection.is_some() {
                         // §13.4.1: an unpacked return has already been read
                         // into its collection snapshot. Evaluating its bare
                         // function-name variable as a scalar would call the
@@ -2412,6 +2419,13 @@ impl Simulator {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
+                    if self.try_force_unpacked_struct(
+                        lvalue,
+                        rvalue,
+                        matches!(pc, ProceduralContinuous::Force { .. }),
+                    ) {
+                        return;
+                    }
                     // LRM §10.6.2 `force` / §10.6.1 procedural continuous
                     // `assign`: the override supersedes ordinary procedural
                     // assignments and continuous drivers until the matching
@@ -2478,6 +2492,12 @@ impl Simulator {
                     }
                 }
                 ProceduralContinuous::Release(lvalue) | ProceduralContinuous::Deassign(lvalue) => {
+                    if self.try_release_unpacked_struct(
+                        lvalue,
+                        matches!(pc, ProceduralContinuous::Release(_)),
+                    ) {
+                        return;
+                    }
                     // LRM §10.6.2 `release`: a VARIABLE keeps the forced
                     // value until the next procedural assignment — so we
                     // only lift the override and leave the stored value
@@ -2600,6 +2620,32 @@ impl Simulator {
                 target,
                 ..
             } => {
+                // §15.5: a procedural-local or by-value formal `event` handle
+                // shadows module/class members (`local_stack` holds its encoded
+                // canonical target key).
+                let is_bare_target = target.as_deref().is_none_or(|t| {
+                    matches!(&t.kind, ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty())
+                });
+                if is_bare_target && let Some(canon) = self.local_event_handle(&name.name) {
+                    if *nonblocking {
+                        self.pending_nba_triggers.push(format!("\x05{canon}"));
+                    } else {
+                        self.fire_canon_event(&canon);
+                    }
+                    return;
+                }
+                if is_bare_target
+                    && !self.ref_binding_stack.is_empty()
+                    && !self.is_shadowed_by_non_event_local(&name.name)
+                    && let Some(canon) = self.ref_bound_event_key(&name.name)
+                {
+                    if *nonblocking {
+                        self.pending_nba_triggers.push(format!("\x05{canon}"));
+                    } else {
+                        self.fire_canon_event(&canon);
+                    }
+                    return;
+                }
                 // §15.5: `-> h.evs[i]` — an element of a class event array.
                 if let Some(key) = target
                     .as_deref()
@@ -2675,7 +2721,7 @@ impl Simulator {
                 }
                 if !self.module.events.contains(name.name.as_str()) {
                     if let Some(k) = self.ref_bound_event_key(&name.name) {
-                        self.fire_named_event(&k);
+                        self.fire_canon_event(&k);
                         return;
                     }
                 }

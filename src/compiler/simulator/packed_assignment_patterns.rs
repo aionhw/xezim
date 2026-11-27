@@ -104,6 +104,7 @@ impl Simulator {
         compiler.set_typedef_unpacked_dims(&module.typedef_unpacked_dims);
         compiler.set_param_decl_types(&module.param_decl_types);
         compiler.set_port_aliases(&module.port_aliases);
+        compiler.set_events(&module.events);
     }
 
     /// `e` evaluated as the source of an assignment to `dt` (§10.8), when
@@ -246,6 +247,9 @@ impl Simulator {
     /// The `fn_ret_frames` entry of a call of `fd`.
     pub(super) fn return_pattern_type(&mut self, fd: &FunctionDeclaration) -> ReturnPatternType {
         let dt = &fd.return_type;
+        if self.is_event_data_type(dt) {
+            return ReturnPatternType::Event;
+        }
         if !Self::ret_may_take_pattern(dt) {
             return ReturnPatternType::NotPacked;
         }
@@ -291,7 +295,7 @@ impl Simulator {
     /// replaced by the type the specialization binds to it (§8.25).
     pub(super) fn return_frame_type(&self) -> Option<DataType> {
         let dt = match self.fn_ret_frames.last()? {
-            ReturnPatternType::NotPacked => return None,
+            ReturnPatternType::NotPacked | ReturnPatternType::Event => return None,
             ReturnPatternType::Func(dt) => (**dt).clone(),
             ReturnPatternType::Method(m) => match &m.kind {
                 crate::ast::decl::ClassMethodKind::Function(f) => f.return_type.clone(),
@@ -306,6 +310,10 @@ impl Simulator {
             name.name.name = bound;
         }
         Some(dt)
+    }
+
+    pub(super) fn return_frame_is_event(&self) -> bool {
+        matches!(self.fn_ret_frames.last(), Some(ReturnPatternType::Event))
     }
 
     /// The value `e` assigns to the formal `port` when `e` holds a pattern

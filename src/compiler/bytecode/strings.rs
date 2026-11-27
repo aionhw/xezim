@@ -3,55 +3,6 @@
 use super::*;
 
 impl<'a> BytecodeCompiler<'a> {
-    /// Static-only heuristic: does this expression CLEARLY produce a string?
-    /// Used to bail string-concat to the interpreter (which has byte-level
-    /// concat semantics). We can only see syntactic clues at compile time —
-    /// the full `string_signals` set lives on the simulator, not the
-    /// bytecode compiler. A string-literal operand is always a string; a
-    /// `$sformatf` / `$psprintf` call returns a string, as does a
-    /// `string'(x)` cast (§6.24.3) and a function-LOCAL `string` variable
-    /// (`out` in {out, string'(c)}). Other bare idents whose declared type
-    /// we don't have here remain false — those cases get folded into the
-    /// bit-vector concat path, which is the existing behavior. The
-    /// interpreter side's special-case is what carries the LRM-correct
-    /// path when the compiler can't see the type.
-    pub(super) fn expr_is_string_concat_operand(&self, e: &Expression) -> bool {
-        match &e.kind {
-            ExprKind::StringLiteral(_) => true,
-            ExprKind::Paren(inner) => self.expr_is_string_concat_operand(inner),
-            ExprKind::Concatenation(parts) => {
-                parts.iter().any(|p| self.expr_is_string_concat_operand(p))
-            }
-            ExprKind::SystemCall { name, args } => match name.as_str() {
-                "$sformatf" | "$psprintf" => true,
-                // §6.24.3: `string'(x)` compiles to a string value (ToStr),
-                // so it is a string operand of an §11.4.12 concat.
-                "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
-                _ => false,
-            },
-            ExprKind::Ident(h) => {
-                if self.local_var_is_string.contains(&Self::hier_raw_name(h)) {
-                    return true;
-                }
-                if let Some(set) = self.string_signals {
-                    let last = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                    if set.contains(last) {
-                        return true;
-                    }
-                    // Try scope-qualified form too.
-                    if let Some(scope) = &self.scope_hint {
-                        let q = format!("{}.{}", scope, last);
-                        if set.contains(&q) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
     /// Is this expression statically known to produce a STRING value?
     /// (Literal, `string` signal, `string`-bound formal, or a nested
     /// `$sformatf`.) Conservative: false means "unknown", not "packed".
@@ -62,6 +13,17 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Paren(inner) => self.expr_has_string_type_static(inner),
             ExprKind::Concatenation(parts) => {
                 parts.iter().any(|e| self.expr_has_string_type_static(e))
+            }
+            ExprKind::Replication { exprs, .. } => {
+                exprs.iter().any(|e| self.expr_has_string_type_static(e))
+            }
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.expr_has_string_type_static(then_expr)
+                    || self.expr_has_string_type_static(else_expr)
             }
             _ => self.expr_is_string_static(e),
         }
@@ -593,6 +555,48 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Call { func, args } => {
                 self.touches_string_formal(func)
                     || args.iter().any(|a| self.touches_string_formal(a))
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn lvalue_is_string_target_static(&self, mut lhs: &Expression) -> bool {
+        while let ExprKind::Paren(inner) = &lhs.kind {
+            lhs = inner;
+        }
+        match &lhs.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let bare = h.path[0].name.name.as_str();
+                if self.local_var_regs.contains_key(bare) {
+                    return self.local_var_is_string.contains(bare);
+                }
+                if self.method_mode && self.string_member_names.contains(bare) {
+                    return !self.member_string_coll(lhs);
+                }
+                self.lookup_signal_id(h).is_some()
+                    && self.signal_is_string_name(h)
+                    && self.lookup_array_name(h).is_none()
+            }
+            ExprKind::Ident(h) => {
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    return self.dotted_string_member(
+                        &Self::dotted_head_expr(h),
+                        &h.path[1].name.name,
+                    );
+                }
+                self.lookup_signal_id(h).is_some()
+                    && self.signal_is_string_name(h)
+                    && h.path.last().is_some_and(|s| s.selects.is_empty())
+                    && self.lookup_array_name(h).is_none()
+            }
+            ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
+                self.dotted_string_member(base, &member.name)
             }
             _ => false,
         }
