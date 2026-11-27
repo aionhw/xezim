@@ -581,3 +581,5 @@ mod instance_array_packed_actual_slices_1488;
 mod package_imports_in_instances_1530;
 #[path = "hierarchy/identity_net_time0_update_1532.rs"]
 mod identity_net_time0_update_1532;
+#[path = "hierarchy/struct_array_variable_ports.rs"]
+mod struct_array_variable_ports;
