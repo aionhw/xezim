@@ -393,8 +393,8 @@ impl Simulator {
                 continue;
             };
             for arc in arcs {
-                let src = self.signal_name_to_id.get(arc.input.port.as_str());
-                if src.is_none() || src == Some(&id) {
+                let src = self.sdf_interconnect_source(&arc.input.port);
+                if src.is_none() || src == Some(id) {
                     unmatched += 1;
                     continue;
                 }
@@ -408,6 +408,24 @@ impl Simulator {
         if unmatched != 0 {
             eprintln!("[SDF] {unmatched} delay entries matched no path");
         }
+    }
+
+    /// An SDF INTERCONNECT source may identify one bit of a vector port
+    /// (§32.4.4). The packed vector has a signal ID, but its bits do not.
+    fn sdf_interconnect_source(&self, terminal: &str) -> Option<usize> {
+        if let Some(id) = self.resolve_signal_id(terminal) {
+            return Some(id);
+        }
+        let (base, select) = terminal.strip_suffix(']')?.rsplit_once('[')?;
+        let base = base.strip_suffix('\\').unwrap_or(base);
+        let label = select.strip_suffix('\\').unwrap_or(select).parse::<i64>().ok()?;
+        let id = self.resolve_signal_id(base)?;
+        if self.signal_real[id] {
+            return None;
+        }
+        let width = self.signal_widths[id];
+        let (left, right) = super::event_bits::vector_decl_dim(&self.module, base, width)?;
+        (left.min(right)..=left.max(right)).contains(&label).then_some(id)
     }
 
     /// When the path's inputs last changed on a qualifying edge.

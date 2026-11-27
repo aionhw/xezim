@@ -883,35 +883,14 @@ impl Simulator {
                         } else {
                             self.cancel_delayed(id);
                         }
-                    } else if let Some((base_id, lo, sel_w)) = self.delayed_lhs_select_range(lhs) {
-                        // Select-LHS delayed assign — same fix as the other
-                        // ContAssign eval site (see delayed_lhs_select_range):
-                        // this used to DROP the write silently. Composes
-                        // against the PENDING delayed value (issue #143).
-                        let sel_val = val.resize(sel_w);
-                        // §10.3.3 / §28.16: the select's own transition
-                        // delay, from the selected bits' current value.
-                        let delay = match delay_target {
-                            Some(DelayTarget {
-                                vector,
-                                select_delays: Some((fall, off)),
-                                ..
-                            }) => {
-                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
-                                let hi = (lo + sel_w - 1) as usize;
-                                let old = self.signal_table[base_id].range_select(hi, lo as usize);
-                                Self::transition_delay(
-                                    &sel_val,
-                                    &old,
-                                    delay,
-                                    fall,
-                                    off,
-                                    vector || sel_w > 1,
-                                )
-                            }
-                            _ => delay,
-                        };
-                        self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
+                    } else {
+                        self.schedule_delayed_cont_lhs(
+                            lhs,
+                            &val,
+                            delay,
+                            delay_target,
+                            runtime.map(|[_, fall, off]| (fall, off)),
+                        );
                     }
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
@@ -968,6 +947,62 @@ impl Simulator {
                 self.prof_settle_ab_count += 1;
             }
             _ => {}
+        }
+    }
+
+    /// §10.3.3: a delayed assignment captures each destination and its bits
+    /// at evaluation time. Use the same physical offsets as clocking drives.
+    fn schedule_delayed_cont_lhs(
+        &mut self,
+        lhs: &Expression,
+        value: &Value,
+        rise: u64,
+        target: Option<DelayTarget>,
+        runtime: Option<(Option<u64>, Option<u64>)>,
+    ) {
+        match &lhs.kind {
+            ExprKind::Paren(inner) => {
+                self.schedule_delayed_cont_lhs(inner, value, rise, target, runtime);
+                return;
+            }
+            ExprKind::Concatenation(parts) => {
+                let mut low = 0usize;
+                for part in parts.iter().rev() {
+                    let width = self.infer_lhs_width(part) as usize;
+                    if width != 0 {
+                        let bits = value.range_select(low + width - 1, low);
+                        self.schedule_delayed_cont_lhs(part, &bits, rise, None, runtime);
+                        low += width;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let slice = self
+            .packed_struct_member_slice(lhs)
+            .and_then(|(name, lo, width)| Some((self.resolve_signal_id(&name)?, lo, width)))
+            .or_else(|| self.drive_select_bits(lhs).map(|(id, lo, width, _)| (id, lo, width)));
+        if let Some((id, lo, width)) = slice {
+            let value = value.resize(width);
+            let fall_off = runtime.or(target.and_then(|t| t.select_delays));
+            let delay = if let Some((fall, off)) = fall_off {
+                let old = self.signal_table[id]
+                    .range_select((lo + width - 1) as usize, lo as usize);
+                let vector = width > 1 || target.is_some_and(|t| t.vector);
+                Self::transition_delay(&value, &old, rise, fall, off, vector)
+            } else {
+                rise
+            };
+            self.schedule_delayed_slice(id, lo, width, &value, delay);
+        } else if let Some(id) = self.get_lhs_signal_id(lhs) {
+            let value = self.fit_value_to_signal(id, value);
+            if self.signal_table[id] == value {
+                self.cancel_delayed(id);
+            } else if !self.delayed_update_pending_is(id, &value) {
+                self.schedule_delayed_transition(id, value, rise, target, runtime);
+            }
         }
     }
 

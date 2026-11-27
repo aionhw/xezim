@@ -424,10 +424,8 @@ impl Simulator {
     /// [`Self::named_cast_key`] there is NO suffix fallback — used where a
     /// partial match would capture a same-named local.
     /// §8.9/§8.25: the store of a class-scoped static array receiver of an
-    /// element select — `Cls::fa` (a static fixed array: its declaring
-    /// class's `Cls::fa`) or `alias_t::q` through a typedef of a
-    /// specialization (that specialization's store, `C#int::q`). None for
-    /// any other receiver.
+    /// element select. Fixed arrays and dynamic collections both use the
+    /// same store reached through an object handle or the declaring class.
     pub(super) fn class_scoped_elem_store(&mut self, e: &Expression) -> Option<String> {
         if self.class_member_names().static_or_param.is_empty() {
             return None;
@@ -458,7 +456,9 @@ impl Simulator {
             return None;
         }
         if self.module.classes.contains_key(head) {
-            return self.static_fixed_key_in(head, member);
+            return self
+                .static_fixed_key_in(head, member)
+                .or_else(|| self.class_scoped_static_coll(head, member));
         }
         let (base, sig) = self.scope_prefix_spec(head)?;
         if let Some(k) = self.static_fixed_key_in(&base, member) {
@@ -2573,6 +2573,11 @@ impl Simulator {
         // array concatenation. An array operand contributes all of its
         // elements; there is no storage to copy back.
         if let ExprKind::Concatenation(parts) = &Self::unparen(arg).kind {
+            if let [_, UD::Unsized(_)] = dims.as_slice()
+                && port.direction == PortDirection::Input
+            {
+                return self.bind_dynamic_rows_input(port, &dims, parts, lo, hi, descending);
+            }
             if dims.len() != 1 {
                 return None;
             }
@@ -2902,6 +2907,64 @@ impl Simulator {
                 _ => None,
             })
             .collect()
+    }
+
+    /// §7.4.5, §10.10, §13.5.1: each dynamic array in a concatenation
+    /// contributes a whole row to a fixed array whose element is a dynamic
+    /// array. Copy the rows into the call frame with their own sizes.
+    fn bind_dynamic_rows_input(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        dims: &[crate::ast::types::UnpackedDimension],
+        parts: &[Expression],
+        lo: i64,
+        hi: i64,
+        descending: bool,
+    ) -> Option<(String, String, i64, i64)> {
+        if hi.checked_sub(lo)?.checked_add(1)? != i64::try_from(parts.len()).ok()? {
+            return None;
+        }
+        let rows: Vec<String> = parts
+            .iter()
+            .map(|part| {
+                self.array_actual_storage(part)
+                    .filter(|name| self.module.dynamic_arrays.contains(name))
+            })
+            .collect::<Option<_>>()?;
+        let width = super::elaborate::resolve_type_width(
+            &port.data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        )
+        .max(1);
+        let decl = crate::ast::stmt::VarDeclarator {
+            decl: Default::default(),
+            name: port.name.clone(),
+            dimensions: Vec::new(),
+            init: None,
+            span: port.span,
+        };
+        let folded = self.scope_sized_local_dims(dims);
+        if !self.declare_local_coll_array(
+            &decl,
+            &port.data_type,
+            folded.as_deref().unwrap_or(dims),
+            1,
+            width,
+            Some(crate::ast::types::Lifetime::Automatic),
+        ) {
+            return None;
+        }
+        let name = self
+            .dyn_name_lookup_innermost(&port.name.name)
+            .unwrap_or(&port.name.name)
+            .to_owned();
+        self.note_formal_direction(&name, descending);
+        for (i, src) in rows.into_iter().enumerate() {
+            let index = if descending { hi - i as i64 } else { lo + i as i64 };
+            self.copy_whole_queue(&Self::name_with_index(&name, index), &src);
+        }
+        Some((name, String::new(), lo, hi))
     }
 
     /// Element suffixes of a name registered as a multi-dimensional array.

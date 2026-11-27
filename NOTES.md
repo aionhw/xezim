@@ -10,6 +10,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Copy dynamic rows passed to a fixed-array input and preserve suspension in
+  `foreach` over a selected row (§7.4.5, §12.7.3, §13.5.1, #1646).
+
+- Size operands of enum casts in constant functions to the enum's base width
+  (§6.19.4, §6.24.1, #1636).
+- Resolve undelayed whole-array drivers of user-defined nettypes per element
+  when elaborating a child lazily (§6.6.7, §7.6, #1655).
+
+- Share class-scoped and handle-based storage for members of static collection
+  elements (§7.8, §7.10, §8.9, §8.23, #1685).
+- Dispatch class methods on indexed handles instead of treating them as string
+  methods (§6.16.6, §8.6, #1639).
+- Resolve generated continuous-assignment delay expressions in their declaring
+  scopes and schedule delayed member, part-select, and concatenation writes
+  (§10.3.3, §23.9, §27.4–§27.5, #1656, #1657).
+- Match SDF interconnect sources that select a bit of a packed vector port
+  (§32.4.4, #1650).
+
 - Preserve the minus sign on negative zero (`-0.0`) in `%g` / `%G` formatting
   and `string.realtoa()` (§6.16.15, §21.2.1.1, §21.3.3).
 - Preserve the sign of zero in unary minus on `real`, `shortreal`, and
@@ -229,6 +247,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Compile dotted collection method calls using the owning object's handle
+  (§7.10, §8.10, #1666).
 
 - Dispatch lowered clocked blocks through the two-state arena after native
   dispatch, and update the live event-waiter index as signals enter or leave it.

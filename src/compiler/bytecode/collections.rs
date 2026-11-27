@@ -958,7 +958,7 @@ impl<'a> BytecodeCompiler<'a> {
         // Resolve the receiver shape FIRST (pure, no emission), so a
         // rejection leaves the insn stream untouched. (A row-3 local
         // receiver is an OWNED marked key — `\x01name` — hence the Cow.)
-        let (coll, bare): (std::borrow::Cow<'_, str>, bool) = match &recv.kind {
+        let (coll, base): (std::borrow::Cow<'_, str>, Option<&Expression>) = match &recv.kind {
             // `q.meth()` — the receiver IS `this.q`.
             crate::ast::expr::ExprKind::Ident(h)
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
@@ -976,9 +976,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // the interpreter's per-call `@name#id` store instead of
                 // the `this` member (a same-named member is shadowed).
                 if self.local_coll_names.contains(name) {
-                    (std::borrow::Cow::Owned(Self::local_coll_key(name)), true)
+                    (std::borrow::Cow::Owned(Self::local_coll_key(name)), None)
                 } else {
-                    (std::borrow::Cow::Borrowed(name), true)
+                    (std::borrow::Cow::Borrowed(name), None)
                 }
             }
             // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
@@ -992,10 +992,11 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.method_handle_chain_class(inner).is_none() {
                     return None;
                 }
-                (std::borrow::Cow::Borrowed(member.name.as_str()), false)
+                (std::borrow::Cow::Borrowed(member.name.as_str()), Some(inner))
             }
             _ => return None,
         };
+        let bare = base.is_none();
         // Instance collection (assoc/queue keys, statics excluded) — bare
         // receivers may additionally be a STATIC collection of the chain.
         // A marked local receiver is always admitted (row 3).
@@ -1007,15 +1008,13 @@ impl<'a> BytecodeCompiler<'a> {
         }
         // Receiver handle register: bare => `this`; dotted => the base's
         // handle (a bare member base emits its LoadClassMember here).
-        let handle_reg = if bare {
-            self.method_this_reg?
-        } else {
-            match self.method_member_handle_reg(recv) {
+        let handle_reg = if let Some(base) = base {
+            match self.method_member_handle_reg(base) {
                 Some(r) => r,
-                // `recv` is a MemberAccess chain passing chain_ok — lower it
-                // through the ordinary rvalue path (loads class members).
-                None => self.compile_expr(recv, 0)?,
+                None => self.compile_expr(base, 0)?,
             }
+        } else {
+            self.method_this_reg?
         };
         // Args as pre-evaluated values in contiguous slots (same protocol
         // as CallMethod).

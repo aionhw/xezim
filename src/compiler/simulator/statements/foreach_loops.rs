@@ -36,7 +36,7 @@ impl Simulator {
     /// probe cannot repeat an index expression's side effects.
     #[cold]
     #[inline(never)]
-    fn foreach_selected_collection(&mut self, array: &Expression) -> Option<String> {
+    pub(in crate::compiler::simulator) fn foreach_selected_collection(&mut self, array: &Expression) -> Option<String> {
         let selected = match &array.kind {
             ExprKind::Ident(h) if h.path.iter().any(|p| !p.selects.is_empty()) => {
                 std::borrow::Cow::Owned(Self::hier_select_chain(h, array.span))
