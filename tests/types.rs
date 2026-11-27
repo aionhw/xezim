@@ -400,6 +400,8 @@ mod unpacked_struct_func_arg;
 mod unpacked_struct_multidim_members;
 #[path = "types/unpacked_struct_pattern_return.rs"]
 mod unpacked_struct_pattern_return;
+#[path = "types/unary_neg_real_zero.rs"]
+mod unary_neg_real_zero;
 #[path = "types/untyped_param_width.rs"]
 mod untyped_param_width;
 #[path = "types/valparam_spec_cycle.rs"]
