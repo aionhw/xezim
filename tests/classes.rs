@@ -386,6 +386,8 @@ mod covergroup_class_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_bin_intervals.rs"]
+mod covergroup_real_bin_intervals;
 #[path = "classes/covergroup_real_bins.rs"]
 mod covergroup_real_bins;
 #[path = "classes/covergroup_sample_args.rs"]
