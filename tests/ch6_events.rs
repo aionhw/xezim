@@ -96,15 +96,15 @@ endmodule
 fn event_boolean_conversion_ignores_toggle_and_handles_null() {
     let src = r#"
 class Runner;
-  function int check_bool(event e, int do_trig);
+  function int check_null(event e, int do_trig);
     int b_if, b_tern, b_not, b_and, b_or;
     if (do_trig) -> e;
     b_if = 0;
-    if (e) b_if = 1;
-    b_tern = e ? 1 : 0;
-    b_not = !e;
-    b_and = (e && 1'b1);
-    b_or = (e || 1'b0);
+    if (e != null) b_if = 1;
+    b_tern = (e != null) ? 1 : 0;
+    b_not = (e == null);
+    b_and = ((e != null) && 1'b1);
+    b_or = ((e != null) || 1'b0);
     return 100000 + b_if * 10000 + b_tern * 1000 + b_not * 100 + b_and * 10 + b_or;
   endfunction
 endclass
@@ -120,22 +120,24 @@ module top;
     for (i = 0; i < 4; i++) begin
       int bf = 0;
       if (i > 0) -> e;
-      if (e) bf = 1;
+      if (e != null) bf = 1;
       $display("ITER%0d:%0d:%0d:%0d:%0d:%0d:%0d",
-               i, bf, (e ? 1 : 0), !e, (e && 1'b1), (e || 1'b0),
-               r.check_bool(e, 1));
+               i, bf, ((e != null) ? 1 : 0), (e == null),
+               ((e != null) && 1'b1), ((e != null) || 1'b0),
+               r.check_null(e, 1));
     end
 
     en = null;
     $display("NULL:%0d:%0d:%0d:%0d:%0d:%0d",
-             (en ? 1 : 0), !en, (en && 1'b1), (en || 1'b0),
-             (en == null), r.check_bool(en, 0));
+             ((en != null) ? 1 : 0), (en == null),
+             ((en != null) && 1'b1), ((en != null) || 1'b0),
+             (en == null), r.check_null(en, 0));
 
-    while (e) begin
+    while (e != null) begin
       loop_cnt++;
       e = null;
     end
-    while (en) begin
+    while (en != null) begin
       null_cnt++;
     end
     $display("WHILE:%0d:%0d:%0d", loop_cnt, null_cnt, (e == null));
@@ -154,6 +156,21 @@ endmodule
             "WHILE:1:0:1",
         ]
     );
+
+    // IEEE 1800-2023 §6.17 / §11.4.7: bare event handles cannot be operands of !, &&, ||.
+    for bad in [
+        "module top; event e; initial if (!e) $display(\"x\"); endmodule",
+        "module top; event e; initial if (e && 1'b1) $display(\"x\"); endmodule",
+        "module top; event e; initial if (e || 1'b0) $display(\"x\"); endmodule",
+    ] {
+        let Err(err) = simulate(bad, 100) else {
+            panic!("expected failure for `{bad}`");
+        };
+        assert!(
+            err.contains("event") && err.contains("6.17"),
+            "unexpected error for `{bad}`: {err}"
+        );
+    }
 }
 
 #[test]
@@ -561,7 +578,7 @@ module top;
     for (i = 0; i < 600; i++) begin
       automatic Ephemeral e = new();
       -> e.ev;
-      if (e.ev && e.ev.triggered && (e.nil_ev == null) && !e.nil_ev) begin
+      if ((e.ev != null) && e.ev.triggered && (e.nil_ev == null)) begin
         ok++;
       end
       if ((i % 200) == 0) #1;

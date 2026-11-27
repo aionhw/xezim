@@ -2544,8 +2544,36 @@ impl<'a> Ck<'a> {
                     self.operand_errors(a, false, out);
                 }
             }
-            ExprKind::Unary { operand, .. } => self.operand_errors(operand, false, out),
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Unary { op, operand } => {
+                if matches!(op, UnaryOp::LogNot) && matches!(self.ty_of(operand), Ty::Event) {
+                    out.push((
+                        operand.span,
+                        "an event cannot be used as an operand of '!' \
+                         (IEEE 1800-2023 §6.17, §11.4.7)"
+                            .into(),
+                    ));
+                }
+                self.operand_errors(operand, false, out);
+            }
+            ExprKind::Binary { op, left, right } => {
+                if matches!(
+                    op,
+                    BinaryOp::LogAnd
+                        | BinaryOp::LogOr
+                        | BinaryOp::LogImplies
+                        | BinaryOp::LogEquiv
+                ) {
+                    for side in [left.as_ref(), right.as_ref()] {
+                        if matches!(self.ty_of(side), Ty::Event) {
+                            out.push((
+                                side.span,
+                                "an event cannot be used as an operand of a logical operator \
+                                 (IEEE 1800-2023 §6.17, §11.4.7)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 self.operand_errors(left, false, out);
                 self.operand_errors(right, false, out);
             }

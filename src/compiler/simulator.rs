@@ -197,7 +197,8 @@ thread_local! {}
 // Delayed struct assignments retain nested collection members.
 // Implicit-logic collection elements have integral types in compiled methods.
 // Unpacked NBA copies use the interpreter; dotted collection elements retain their width.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318c;
+// Chapter 6 data-type lowering (enums, shortreal, strings, events, typedefs, parameterized types, UDNs).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_318d;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
