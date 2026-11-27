@@ -642,3 +642,6 @@ mod delayed_nested_collections;
 
 #[path = "scheduling/unpacked_slice_nba_1644.rs"]
 mod unpacked_slice_nba_1644;
+
+#[path = "scheduling/intra_delay_signed_exponent.rs"]
+mod intra_delay_signed_exponent;
