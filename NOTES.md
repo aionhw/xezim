@@ -33,6 +33,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   blocks (loop iterations, or a generate branch beside a module-level
   instance) as having multiple continuous drivers, as two explicit
   instances already were (§6.5, §23.3.3, §27.4, aionhw/xezim-core#306).
+- Reject a pass or fail action of a deferred assertion (`assert #0`,
+  `assert final`, and the `assume` and `cover` forms) that is not a single
+  subroutine call (§16.4, aionhw/xezim-core#309).
 - Preserve full packed offsets in native slice reads and case-arm masking,
   and restore dynamic dependency masks with their controller state
   (§11.5.1, §12.5, Annex D.9).
