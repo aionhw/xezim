@@ -10,6 +10,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Scan `%t` and `%T` time fields in `$sscanf` and `$fscanf` using `$timeformat`
+  precision and the calling scope's time unit (§21.3.4.3, §20.4.3, #1694).
 - Copy dynamic rows passed to a fixed-array input and preserve suspension in
   `foreach` over a selected row (§7.4.5, §12.7.3, §13.5.1, #1646).
 
