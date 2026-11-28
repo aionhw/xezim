@@ -1744,7 +1744,9 @@ impl Simulator {
                     "always@*"
                 }
             }
-            CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => "assign",
+            CombItem::ContAssign { .. }
+            | CombItem::CompiledContAssign { .. }
+            | CombItem::BulkArrayCopy { .. } => "assign",
             _ => "comb",
         };
         let writes: Vec<&str> = entry
@@ -3891,8 +3893,12 @@ impl Simulator {
                         &self.signal_name_to_id,
                     ) {
                         Some(eid) if is_packed_id(eid) => {
-                            let (v, x, _) = self.packed.raw(eid);
-                            Value::from_inline(v, x, *width)
+                            if self.packed.is_wide(eid) {
+                                self.packed.read(eid).resize_for_assign(*width)
+                            } else {
+                                let (v, x, _) = self.packed.raw(eid);
+                                Value::from_inline(v, x, *width)
+                            }
                         }
                         Some(eid) => self.signal_table[eid].resize_for_assign(*width),
                         None => Value::new((*width).max(1)),
@@ -4521,8 +4527,12 @@ impl Simulator {
                         // XEZIM_ARRAY_SOA_SHADOW=1 also assert coherence with
                         // the canonical signal_table before trusting it.
                         if is_packed_id(eid) {
-                            let (v, x, w, signed) = self.packed.raw_signed(eid);
-                            vm_store(&mut self.vm_regs[*dest as usize], v, x, w, signed);
+                            if self.packed.is_wide(eid) {
+                                self.vm_regs[*dest as usize] = self.packed.read(eid);
+                            } else {
+                                let (v, x, w, signed) = self.packed.raw_signed(eid);
+                                vm_store(&mut self.vm_regs[*dest as usize], v, x, w, signed);
+                            }
                         } else if eid < soa_len && self.soa_read_ok[eid] {
                             let [v, x] = self.signal_inline_bits[eid];
                             if self.soa_shadow {
@@ -4592,8 +4602,13 @@ impl Simulator {
                             // a packed RAM must mature in the NBA region like
                             // any other, or a same-timestep reader in another
                             // edge block sees it a delta early.
-                            let (bv, bx) = val.raw_bits();
-                            self.queue_packed_nba(eid, bv, bx);
+                            let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
+                            if self.packed.is_wide(eid) {
+                                self.queue_packed_wide_nba(eid, val);
+                            } else {
+                                let (bv, bx) = val.raw_bits();
+                                self.queue_packed_nba(eid, bv, bx);
+                            }
                         } else if let Some(i) = self.nba_fast_index.get(eid) {
                             self.nba_fast[i].value = val;
                         } else if self.signal_table[eid] != val {
@@ -4622,8 +4637,12 @@ impl Simulator {
                     ) {
                         if is_packed_id(eid) {
                             let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
-                            let (bv, bx) = val.raw_bits();
-                            self.packed_store(eid, bv, bx);
+                            if self.packed.is_wide(eid) {
+                                self.packed_store_value(eid, &val);
+                            } else {
+                                let (bv, bx) = val.raw_bits();
+                                self.packed_store(eid, bv, bx);
+                            }
                         } else {
                             let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                             // §6.11.2/§10.7: a 2-state element (`int a[4]`)
@@ -4671,19 +4690,36 @@ impl Simulator {
                                 pc += 1;
                                 continue;
                             }
-                            let (mut cv, mut cx) =
-                                match self.packed_nba.iter().find(|(i, _, _)| *i == eid) {
-                                    Some(&(_, v, x)) => (v, x),
-                                    None => {
-                                        let (v, x, _) = self.packed.raw(eid);
-                                        (v, x)
-                                    }
-                                };
                             let high_eff = high.min(cell_w.saturating_sub(1));
-                            let (sv, sx) = val.raw_bits();
-                            cv = splice_bits(cv, sv, low, high_eff);
-                            cx = splice_bits(cx, sx, low, high_eff);
-                            self.queue_packed_nba(eid, cv, cx);
+                            if self.packed.is_wide(eid) {
+                                let mut cur = self
+                                    .packed_wide_nba
+                                    .iter()
+                                    .rev()
+                                    .find(|(i, _)| *i == eid)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| self.packed.read(eid));
+                                for bit_pos in low..=high_eff {
+                                    cur.set_bit(
+                                        bit_pos as usize,
+                                        val.get_bit((bit_pos - low) as usize),
+                                    );
+                                }
+                                self.queue_packed_wide_nba(eid, cur);
+                            } else {
+                                let (mut cv, mut cx) =
+                                    match self.packed_nba.iter().find(|(i, _, _)| *i == eid) {
+                                        Some(&(_, v, x)) => (v, x),
+                                        None => {
+                                            let (v, x, _) = self.packed.raw(eid);
+                                            (v, x)
+                                        }
+                                    };
+                                let (sv, sx) = val.raw_bits();
+                                cv = splice_bits(cv, sv, low, high_eff);
+                                cx = splice_bits(cx, sx, low, high_eff);
+                                self.queue_packed_nba(eid, cv, cx);
+                            }
                             // Advance past the store (see the blocking arm):
                             // a bare `continue` re-ran this NBA forever.
                             pc += 1;
@@ -4785,16 +4821,28 @@ impl Simulator {
                             // Blocking splice into a packed cell — immediate,
                             // like assign_value's packed path; the per-signal
                             // indexing below would panic on the arena id.
-                            let (mut cv, mut cx, cell_w) = self.packed.raw(eid);
+                            let cell_w = self.packed.width(eid);
                             if oob_write_discard(high as i64, low as i64, cell_w) {
                                 pc += 1;
                                 continue;
                             }
                             let high_eff = high.min(cell_w.saturating_sub(1));
-                            let (sv, sx) = val.raw_bits();
-                            cv = splice_bits(cv, sv, low, high_eff);
-                            cx = splice_bits(cx, sx, low, high_eff);
-                            self.packed_store(eid, cv, cx);
+                            if self.packed.is_wide(eid) {
+                                let mut cur = self.packed.read(eid);
+                                for bit_pos in low..=high_eff {
+                                    cur.set_bit(
+                                        bit_pos as usize,
+                                        val.get_bit((bit_pos - low) as usize),
+                                    );
+                                }
+                                self.packed_store_value(eid, &cur);
+                            } else {
+                                let (mut cv, mut cx, _) = self.packed.raw(eid);
+                                let (sv, sx) = val.raw_bits();
+                                cv = splice_bits(cv, sv, low, high_eff);
+                                cx = splice_bits(cx, sx, low, high_eff);
+                                self.packed_store(eid, cv, cx);
+                            }
                             // Advance past the store: `continue` without it
                             // re-executed this instruction forever (the C906
                             // testbench's memory-image loop never finished

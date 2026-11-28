@@ -645,6 +645,63 @@ impl Simulator {
         if let Some(v) = self.missing_struct_elem_member(expr, &member.name) {
             return v;
         }
+        // Unpacked-struct element member read (`arr[i].field` for assoc,
+        // dynamic/queue, or fixed unpacked-struct arrays): must run BEFORE
+        // `self.eval_expr(expr)` + packed layout guessing below, because an
+        // OOB element read of a single-field 32-bit unpacked struct returns
+        // a 32-bit `x` whose width happens to match the struct width.
+        if let ExprKind::Index {
+            expr: idx_base,
+            index,
+        } = &expr.kind
+        {
+            if let ExprKind::Ident(hier) = &idx_base.kind {
+                let mut an = self.resolve_hier_name(hier);
+                if let Some(scoped) = self.instance_assoc_member(&an) {
+                    an = std::borrow::Cow::Owned(scoped);
+                } else if !self.is_associative_array(&an)
+                    && !self.module.dynamic_arrays.contains(&*an)
+                    && !self.module.arrays.contains_key(&*an)
+                {
+                    // Through an object handle (`c.slices[0].path`).
+                    an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
+                }
+                if self.is_associative_array(&an) {
+                    let idx_val = self.eval_expr(index);
+                    let key_str = self.assoc_key_str(&an, &idx_val);
+                    let target = format!("{}[{}].{}", an, key_str, member.name);
+                    if let Some(v) = self.get_signal_value_by_name(&target) {
+                        return v;
+                    }
+                } else if (self.module.dynamic_arrays.contains(&*an)
+                    || self.module.arrays.contains_key(&*an))
+                    && self.queue_elem_struct(&an).is_some()
+                {
+                    let an_owned = an.into_owned();
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        return self
+                            .unpacked_struct_member_oob_default(&an_owned, &member.name)
+                            .unwrap_or_else(|| Value::new(1));
+                    };
+                    let target = format!("{}[{}].{}", an_owned, i, member.name);
+                    if let Some(v) = self.get_signal_value_by_name(&target) {
+                        return v;
+                    }
+                    let is_oob = if self.module.dynamic_arrays.contains(&an_owned) {
+                        i < 0 || (i as u64) >= self.get_queue_size(&an_owned)
+                    } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&an_owned) {
+                        i < lo || i > hi
+                    } else {
+                        false
+                    };
+                    if is_oob {
+                        return self
+                            .unpacked_struct_member_oob_default(&an_owned, &member.name)
+                            .unwrap_or_else(|| Value::new(1));
+                    }
+                }
+            }
+        }
         {
             let base_val = self.eval_expr(expr);
             // §7.2.1/§8.4: an ELEMENT of a fixed rand/class array whose
@@ -1025,80 +1082,6 @@ impl Simulator {
                                 return out;
                             }
                         }
-                    }
-                }
-            }
-        }
-        // Associative-array element struct-member read:
-        // `assoc[key].field` (element = unpacked struct). Mirror of the
-        // assign-side handler — reads the dotted signal
-        // `assoc[keystr].field`. Guarded by signal presence, so a
-        // class-handle element (`rtab[nm].method`/`.prop`) where no such
-        // signal exists correctly falls through to the handle path.
-        if let ExprKind::Index {
-            expr: idx_base,
-            index,
-        } = &expr.kind
-        {
-            if let ExprKind::Ident(hier) = &idx_base.kind {
-                let mut an = self.resolve_hier_name(hier);
-                if let Some(scoped) = self.instance_assoc_member(&an) {
-                    an = std::borrow::Cow::Owned(scoped);
-                } else if !self.is_associative_array(&an)
-                    && !self.module.dynamic_arrays.contains(&*an)
-                    && !self.module.arrays.contains_key(&*an)
-                {
-                    // Through an object handle (`c.slices[0].path`).
-                    an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
-                }
-                if self.is_associative_array(&an) {
-                    let idx_val = self.eval_expr(index);
-                    let key_str = self.assoc_key_str(&an, &idx_val);
-                    let target = format!("{}[{}].{}", an, key_str, member.name);
-                    if let Some(v) = self.get_signal_value_by_name(&target) {
-                        return v;
-                    }
-                } else if (self.module.dynamic_arrays.contains(&*an)
-                    || self.module.arrays.contains_key(&*an))
-                    && self.queue_elem_struct(&an).is_some()
-                {
-                    // Same leaf read for a DYNAMIC/fixed collection of
-                    // unpacked structs reached through an instance
-                    // scope (`<h>#slices[0].path`) — the bare
-                    // flattened name misses the storage, so a
-                    // class-member `slices[t].path` read x while the
-                    // write (fixed above) landed correctly.
-                    let Some(i) = self.eval_expr(index).to_index() else {
-                        if let Some(su) = self.queue_elem_struct(&an) {
-                            for m in &su.members {
-                                if m.declarators.iter().any(|d| d.name.name == member.name) {
-                                    let w = resolve_type_width(
-                                        &m.data_type,
-                                        Some(&self.module.parameters),
-                                        Some(&self.module.typedefs),
-                                    )
-                                    .max(1);
-                                    let mut v = if super::elaborate::is_type_two_state_resolved(
-                                        &m.data_type,
-                                        &self.module.typedef_types,
-                                    ) {
-                                        Value::zero(w)
-                                    } else {
-                                        Value::new(w)
-                                    };
-                                    v.is_signed = super::elaborate::is_type_signed_resolved(
-                                        &m.data_type,
-                                        &self.module.typedef_types,
-                                    );
-                                    return v;
-                                }
-                            }
-                        }
-                        return Value::new(1);
-                    };
-                    let target = format!("{}[{}].{}", an, i, member.name);
-                    if let Some(v) = self.get_signal_value_by_name(&target) {
-                        return v;
                     }
                 }
             }

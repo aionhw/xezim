@@ -721,6 +721,55 @@ impl Simulator {
         true
     }
 
+    /// §7.4.6 Table 7-1: assign declared member defaults when reading an
+    /// out-of-bounds / missing element of a flat/module unpacked-struct array.
+    /// Class-property collections return `false` so they fall through to
+    /// [`Self::assign_struct_memberwise`].
+    fn try_assign_oob_struct_defaults(
+        &mut self,
+        dst: &str,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) -> bool {
+        let ExprKind::Index { expr: base_e, .. } = &rvalue.kind else {
+            return false;
+        };
+        if !Self::cond_expr_is_effect_free(base_e, false)
+            || self.class_prop_struct_of(base_e).is_some()
+        {
+            return false;
+        }
+        let Some(bn) = self.flat_member_name(base_e) else {
+            return false;
+        };
+        if bn.contains('#')
+            || self.instance_assoc_member(&bn).is_some()
+            || self.resolve_locator_storage(&bn) != bn
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .is_some_and(|h| self.class_prop_struct(h, &bn).is_some())
+        {
+            return false;
+        }
+        if !(self.module.arrays.contains_key(&bn)
+            || self.module.arrays_2d.contains_key(&bn)
+            || self.module.arrays_nd.contains_key(&bn)
+            || self.module.dynamic_arrays.contains(&bn)
+            || self.is_associative_array(&bn))
+        {
+            return false;
+        }
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaf_defaults(dst, su, 0, &mut leaves);
+        for (k, dv, _) in leaves {
+            self.set_signal_value_by_name(&k, dv);
+        }
+        true
+    }
+
     /// The full path's step after evaluating a call RHS: a collection the
     /// call just returned (`pending_ret_collection`) is copied whole into a
     /// collection target. `true` when the assignment is done.
@@ -2677,12 +2726,16 @@ impl Simulator {
                             }
                             let dst_s = format!("{}{}", cont_s, &dst[cut..]);
                             let src = eval_rflat(self, &mut rflat_cache);
-                            if let Some(src) = src {
-                                if self.struct_storage_exists(&src, &su) {
-                                    self.copy_unpacked_struct(&dst_s, &src, &su);
+                            if let Some(src) = &src {
+                                if self.struct_storage_exists(src, &su) {
+                                    self.copy_unpacked_struct(&dst_s, src, &su);
                                     self.settle_after_proc_write();
                                     return;
                                 }
+                            }
+                            if self.try_assign_oob_struct_defaults(&dst_s, rvalue, &su) {
+                                self.settle_after_proc_write();
+                                return;
                             }
                             if Self::is_struct_elem_ref(rvalue) {
                                 self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
@@ -2737,12 +2790,19 @@ impl Simulator {
                     return;
                 }
                 let src = eval_rflat(self, &mut rflat_cache);
-                if let Some(src) = src {
-                    if src != dst && self.struct_storage_exists(&src, &su) {
-                        self.copy_unpacked_struct(&dst, &src, &su.clone());
-                        self.settle_after_proc_write();
-                        return;
-                    }
+                if let Some(src) = &src
+                    && *src != dst
+                    && self.struct_storage_exists(src, &su)
+                {
+                    self.copy_unpacked_struct(&dst, src, &su.clone());
+                    self.settle_after_proc_write();
+                    return;
+                }
+                if !dst_is_collection
+                    && self.try_assign_oob_struct_defaults(&dst, rvalue, &su)
+                {
+                    self.settle_after_proc_write();
+                    return;
                 }
                 // §7.2: an element of a CLASS-PROPERTY collection
                 // (`r = q[i]` in a method, `r = c.q[i]`) has its
@@ -5045,8 +5105,19 @@ impl Simulator {
         }
         if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
             let desc = self.module.descending_arrays.contains(&dst);
-            let cap = (hi - lo + 1) as u64;
-            let n = self.get_queue_size(&src).min(cap);
+            let cap = (hi - lo + 1).max(0) as u64;
+            let rsize = self.get_queue_size(&src);
+            if rsize != cap {
+                self.emit_severity_text(
+                    "Error",
+                    &format!(
+                        "Dynamic array size mismatch assigning '{}' (size {}) to fixed array '{}' (size {})",
+                        src, rsize, dst, cap
+                    ),
+                );
+                return;
+            }
+            let n = rsize;
             let su = self
                 .queue_elem_struct(&src)
                 .or_else(|| self.queue_elem_struct(&dst));
@@ -5118,8 +5189,23 @@ impl Simulator {
             {
                 let (llo, lhi, _) = self.module.arrays[&*lname];
                 let (rlo, rhi, _) = self.module.arrays[&*rname];
-                let lsize = (lhi - llo + 1) as usize;
-                let rsize = (rhi - rlo + 1) as usize;
+                let lsize = (lhi - llo + 1).max(0) as usize;
+                let rsize = (rhi - rlo + 1).max(0) as usize;
+                if !self.module.dynamic_arrays.contains(&*lname)
+                    && self.module.dynamic_arrays.contains(&*rname)
+                {
+                    let dsz = self.get_queue_size(&rname);
+                    if dsz != lsize as u64 {
+                        self.emit_severity_text(
+                            "Error",
+                            &format!(
+                                "Dynamic array size mismatch assigning '{}' (size {}) to fixed array '{}' (size {})",
+                                rname, dsz, lname, lsize
+                            ),
+                        );
+                        return;
+                    }
+                }
                 // §7.2 / §7.6: an unpacked struct element consists of
                 // member leaves; its container scalar carries no value.
                 if let Some(su) = self.queue_elem_struct(&rname) {

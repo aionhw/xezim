@@ -810,14 +810,29 @@ impl Simulator {
                 let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                 if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                     if rev_idxs.len() == shape.len() {
-                        let mut name = base_name.clone();
-                        for i in (0..rev_idxs.len()).rev() {
-                            let v = self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                            name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
+                        // §7.4.6: any X/Z or out-of-bounds index writes nothing.
+                        let mut name = base_name.to_string();
+                        for (ix, &(left, right)) in rev_idxs.iter().rev().zip(&shape) {
+                            let Some(v) = self.eval_expr(ix).to_index() else {
+                                return false;
+                            };
+                            if !(left.min(right)..=left.max(right)).contains(&v) {
+                                return false;
+                            }
+                            name.push('[');
+                            Self::push_i64(&mut name, v);
+                            name.push(']');
                         }
-                        if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
-                            let width = self.signal_widths[id];
-                            let resized = val.resize_for_assign(width);
+                        if let Some(id) = self
+                            .signal_name_to_id
+                            .get(name.as_str())
+                            .copied()
+                            .or_else(|| resolve_nd_array_elem_id(name.as_str(), &self.array_nd_first_id))
+                        {
+                            if is_packed_id(id) {
+                                return self.packed_store_value(id, val);
+                            }
+                            let resized = self.fit_value_to_signal(id, val);
                             let changed = self.signal_table[id] != resized;
                             if changed {
                                 if !self.dirty_signals[id] {
@@ -830,12 +845,120 @@ impl Simulator {
                             }
                             return changed;
                         }
-                        let changed = self.signals.get(&*name).is_none_or(|p| *p != *val);
+                        let changed = self.signals.get(&name).is_none_or(|p| *p != *val);
                         if changed {
-                            self.signals.insert(name.to_string(), val.clone());
+                            self.signals.insert(name.clone(), val.clone());
                             self.mark_dirty(&name);
                         }
                         return changed;
+                    }
+                } else if rev_idxs.len() >= 3 {
+                    // Mixed fixed-outer + dynamic/fixed-inner (e.g., `int m23[2][][3]`).
+                    let root = self.resolve_hier_name(hier);
+                    for split in 1..rev_idxs.len() {
+                        let mut pref = root.to_string();
+                        let mut oob = false;
+                        for ix in rev_idxs[rev_idxs.len() - split..].iter().rev() {
+                            if split == 1
+                                && let Some(&(lo, hi, _)) = self.module.arrays.get(pref.as_str())
+                            {
+                                if let Some(k) = self.eval_expr(ix).to_index()
+                                    && (lo.min(hi)..=lo.max(hi)).contains(&k)
+                                {
+                                    pref.push('[');
+                                    Self::push_i64(&mut pref, k);
+                                    pref.push(']');
+                                } else {
+                                    oob = true;
+                                    break;
+                                }
+                            } else if let Some(k) = self.eval_expr(ix).to_index() {
+                                pref.push('[');
+                                Self::push_i64(&mut pref, k);
+                                pref.push(']');
+                            } else {
+                                oob = true;
+                                break;
+                            }
+                        }
+                        if oob {
+                            return false;
+                        }
+                        let rem = rev_idxs.len() - split;
+                        if rem == 2 && let Some(&(rows, cols, _)) = self.module.arrays_2d.get(pref.as_str()) {
+                            let dyn_outer = self.module.dynamic_arrays.contains(pref.as_str());
+                            let (Some(i), Some(j)) = (
+                                self.eval_expr(rev_idxs[1]).to_index(),
+                                self.eval_expr(rev_idxs[0]).to_index(),
+                            ) else {
+                                return false;
+                            };
+                            let (olo, ohi) = if dyn_outer {
+                                (0, self.get_queue_size(&pref) as i64 - 1)
+                            } else {
+                                (rows.0.min(rows.1), rows.0.max(rows.1))
+                            };
+                            if i < olo || i > ohi || j < cols.0.min(cols.1) || j > cols.0.max(cols.1) {
+                                return false;
+                            }
+                            let elem_name = format!("{}[{}][{}]", pref, i, j);
+                            if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
+                                let resized = self.fit_value_to_signal(id, val);
+                                let changed = self.signal_table[id] != resized;
+                                if changed {
+                                    if !self.dirty_signals[id] {
+                                        self.dirty_signals[id] = true;
+                                        self.dirty_list.push(id);
+                                    }
+                                    self.dirty_any = true;
+                                    write_sig!(self, id, resized);
+                                    self.table_modified = true;
+                                }
+                                return changed;
+                            }
+                            let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
+                            if changed {
+                                self.signals.insert(elem_name, val.clone());
+                                self.touch_queue(&pref);
+                            }
+                            return changed;
+                        }
+                        if let Some((shape, _)) = self.module.arrays_nd.get(pref.as_str()).cloned()
+                            && rem == shape.len()
+                        {
+                            let mut elem_name = pref.clone();
+                            for (ix, &(l, r)) in rev_idxs[..rem].iter().rev().zip(&shape) {
+                                let Some(v) = self.eval_expr(ix).to_index() else {
+                                    return false;
+                                };
+                                if !(l.min(r)..=l.max(r)).contains(&v) {
+                                    return false;
+                                }
+                                elem_name.push('[');
+                                Self::push_i64(&mut elem_name, v);
+                                elem_name.push(']');
+                            }
+                            if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
+                                let resized = self.fit_value_to_signal(id, val);
+                                let changed = self.signal_table[id] != resized;
+                                if changed {
+                                    if !self.dirty_signals[id] {
+                                        self.dirty_signals[id] = true;
+                                        self.dirty_list.push(id);
+                                    }
+                                    self.dirty_any = true;
+                                    write_sig!(self, id, resized);
+                                    self.table_modified = true;
+                                }
+                                return changed;
+                            }
+                            let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
+                            if changed {
+                                self.signals.insert(elem_name, val.clone());
+                                self.mark_dirty(&pref);
+                            }
+                            return changed;
+                        }
                     }
                 }
                 // §7.4.5 / §11.5.1: one index MORE than a 2-D/N-D array has
@@ -1063,9 +1186,20 @@ impl Simulator {
                         return false;
                     }
                     let elem_name = format!("{}[{}][{}]", name, i, j);
-                    if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                        let width = self.signal_widths[id];
-                        let resized = val.resize_for_assign(width);
+                    if let Some(id) = self
+                        .signal_name_to_id
+                        .get(elem_name.as_str())
+                        .copied()
+                        .or_else(|| {
+                            (!self.module.dynamic_arrays.contains(&*name))
+                                .then(|| resolve_nd_array_elem_id(elem_name.as_str(), &self.array_nd_first_id))
+                                .flatten()
+                        })
+                    {
+                        if is_packed_id(id) {
+                            return self.packed_store_value(id, val);
+                        }
+                        let resized = self.fit_value_to_signal(id, val);
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             if !self.dirty_signals[id] {

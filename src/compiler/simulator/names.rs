@@ -25,12 +25,17 @@ pub struct NameMap {
     /// Registered 1-D arrays whose element names are virtual:
     /// base -> (first_id, lo, hi).
     arrays: HashMap<Arc<str>, (usize, i64, i64)>,
+    /// Registered multi-D arrays whose element names are virtual:
+    /// base -> (first_id, shape).
+    nd_arrays: HashMap<Arc<str>, (usize, Vec<(i64, i64)>)>,
     /// Virtual element count (for `len`).
     virtual_len: usize,
     /// `identity[i] == i` for every virtual element id.
     identity: Vec<usize>,
     /// first_id -> (count, base, lo), for id -> element name.
     spans: std::collections::BTreeMap<usize, (usize, Arc<str>, i64)>,
+    /// first_id -> (count, base, shape), for id -> multi-D element name.
+    nd_spans: std::collections::BTreeMap<usize, (usize, Arc<str>, Vec<(i64, i64)>)>,
     /// Bit `len % 64` set for every virtual base's byte length: rejects most
     /// non-element `…]` names (queue slots, class properties) before the
     /// second hash lookup a real element needs.
@@ -150,13 +155,55 @@ impl NameMap {
         self.arrays.insert(base, (first, lo, hi));
     }
 
+    /// Register the elements of multi-D array `base` (ids `first..first+count`)
+    /// as virtual names.
+    pub fn add_virtual_nd_array(&mut self, base: Arc<str>, first: usize, shape: Vec<(i64, i64)>) {
+        self.generation += 1;
+        let mut n = 1usize;
+        for &(lo, hi) in &shape {
+            if hi < lo {
+                return;
+            }
+            n = n.saturating_mul((hi - lo + 1) as usize);
+        }
+        if n == 0 {
+            return;
+        }
+        let end = first + n;
+        if self.identity.len() < end {
+            let start = self.identity.len();
+            self.identity.extend(start..end);
+        }
+        self.virtual_len += n;
+        self.base_len_mask |= 1u64 << (base.len() % 64);
+        self.nd_spans.insert(first, (n, base.clone(), shape.clone()));
+        self.nd_arrays.insert(base, (first, shape));
+    }
+
     /// The virtual element name of signal `id`, if it is one.
     pub fn virtual_name_of(&self, id: usize) -> Option<String> {
-        let (&first, (n, base, lo)) = self.spans.range(..=id).next_back()?;
+        if let Some((&first, (n, base, lo))) = self.spans.range(..=id).next_back()
+            && id < first + n
+        {
+            return Some(format!("{}[{}]", base, lo + (id - first) as i64));
+        }
+        let (&first, (n, base, shape)) = self.nd_spans.range(..=id).next_back()?;
         if id >= first + n {
             return None;
         }
-        Some(format!("{}[{}]", base, lo + (id - first) as i64))
+        let mut rem = id - first;
+        let mut idxs = vec![0i64; shape.len()];
+        for (k, &(lo, hi)) in shape.iter().enumerate().rev() {
+            let span = (hi - lo + 1) as usize;
+            idxs[k] = lo + (rem % span) as i64;
+            rem /= span;
+        }
+        let mut out = base.to_string();
+        for idx in idxs {
+            use std::fmt::Write as _;
+            let _ = write!(out, "[{}]", idx);
+        }
+        Some(out)
     }
 
     /// The id of a virtual element name, if `name` is one.
@@ -181,15 +228,53 @@ impl NameMap {
             return None;
         }
         let br = br - 1;
-        if self.base_len_mask & (1u64 << (br % 64)) == 0 {
+        if self.base_len_mask & (1u64 << (br % 64)) != 0
+            && let Some(idx) = canonical_index(&name[br + 1..name.len() - 1])
+            && let Some(&(first, lo, hi)) = self.arrays.get(&name[..br])
+        {
+            if idx < lo || idx > hi {
+                return None;
+            }
+            return Some(first + (idx - lo) as usize);
+        }
+        if self.nd_arrays.is_empty() {
             return None;
         }
-        let idx = canonical_index(&name[br + 1..name.len() - 1])?;
-        let &(first, lo, hi) = self.arrays.get(&name[..br])?;
-        if idx < lo || idx > hi {
-            return None;
+        let mut idxs: [i64; 8] = [0; 8];
+        let mut n = 0usize;
+        let mut end = name.len();
+        while end > 0 && b[end - 1] == b']' && n < 8 {
+            let mut pos = end - 1;
+            while pos > 0 && (b[pos - 1].is_ascii_digit() || b[pos - 1] == b'-') {
+                pos -= 1;
+            }
+            if pos == 0 || b[pos - 1] != b'[' {
+                return None;
+            }
+            let open = pos - 1;
+            let idx = canonical_index(&name[open + 1..end - 1])?;
+            idxs[n] = idx;
+            n += 1;
+            end = open;
+            if n >= 2
+                && self.base_len_mask & (1u64 << (end % 64)) != 0
+                && let Some((first, shape)) = self.nd_arrays.get(&name[..end])
+            {
+                if shape.len() != n {
+                    return None;
+                }
+                let mut off = 0usize;
+                for (k, &(lo, hi)) in shape.iter().enumerate() {
+                    let idx = idxs[n - 1 - k];
+                    if idx < lo || idx > hi {
+                        return None;
+                    }
+                    off = off * (hi - lo + 1) as usize + (idx - lo) as usize;
+                }
+                return Some(*first + off);
+            }
         }
-        Some(first + (idx - lo) as usize)
+        None
     }
 
     /// The id of `name`: a stored name, else a virtual element name. The

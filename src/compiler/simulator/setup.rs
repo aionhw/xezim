@@ -3319,6 +3319,7 @@ impl Simulator {
             CombItem::Noop => 0,
             CombItem::FastDirectCopy { .. } => 1,
             CombItem::DirectCopy { .. } => 2,
+            CombItem::BulkArrayCopy { .. } => 2,
             CombItem::FastDirectFanout { .. } => 3,
             CombItem::FusedBufFanout { .. } => 4,
             CombItem::FusedAndFanout { .. } => 5,
@@ -3970,9 +3971,9 @@ impl Simulator {
                         CombItem::FusedGate { .. } => "FusedGate",
                         CombItem::CompiledContAssign { .. } => "CompiledCA",
                         CombItem::CompiledAlwaysBlock { .. } => "CompiledAB",
-                        CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. } => {
-                            "DirectCopy"
-                        }
+                        CombItem::DirectCopy { .. }
+                        | CombItem::FastDirectCopy { .. }
+                        | CombItem::BulkArrayCopy { .. } => "DirectCopy",
                         CombItem::FastDirectFanout { .. }
                         | CombItem::FusedBufFanout { .. }
                         | CombItem::FusedAndFanout { .. } => "Fanout",

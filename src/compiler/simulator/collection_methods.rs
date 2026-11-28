@@ -3494,12 +3494,22 @@ impl Simulator {
             self.map_formal_dyn(pname, &cname);
             return Some((cname, String::new()));
         }
+        let caller_fixed = (!self.module.dynamic_arrays.contains(&*cname)
+            && !self.module.associative_arrays.contains_key(&*cname))
+        .then(|| self.module.arrays.get(&*cname).copied())
+        .flatten()
+        .map(|(lo, hi, w)| (lo, hi, w, self.module.descending_arrays.contains(&*cname)));
         let size = if matches!(dir, PortDirection::Output) {
             0
+        } else if let Some((clo, chi, _, _)) = caller_fixed {
+            (chi - clo + 1).max(0) as u64
         } else {
             self.get_queue_size(&cname)
         };
-        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
+        let w = caller_fixed
+            .map(|(_, _, cw, _)| cw)
+            .or_else(|| self.module.arrays.get(&*cname).map(|t| t.2))
+            .unwrap_or(32);
         let w = self
             .declared_collection_elem_width(queue_data_type)
             .unwrap_or(w);
@@ -3510,12 +3520,25 @@ impl Simulator {
         let elem_struct = (cname != key)
             .then(|| self.queue_elem_struct(&cname))
             .flatten();
+        let caller_elem_idx = |j: u64| -> i64 {
+            match caller_fixed {
+                Some((clo, chi, _, desc)) => {
+                    if desc {
+                        chi - j as i64
+                    } else {
+                        clo + j as i64
+                    }
+                }
+                None => j as i64,
+            }
+        };
         let vals: Vec<Value> = if elem_struct.is_some() {
             Vec::new()
         } else {
             (0..size)
                 .map(|j| {
-                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+                    let cidx = caller_elem_idx(j);
+                    self.get_signal_value_by_name(&format!("{}[{}]", cname, cidx))
                         .unwrap_or_else(|| Value::zero(w))
                 })
                 .collect()
@@ -3524,7 +3547,8 @@ impl Simulator {
         self.module.dynamic_arrays.insert(key.clone());
         if let Some(su) = &elem_struct {
             for j in 0..size {
-                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", key, j));
+                let cidx = caller_elem_idx(j);
+                let (src, dst) = (format!("{}[{}]", cname, cidx), format!("{}[{}]", key, j));
                 self.copy_unpacked_struct(&dst, &src, su);
             }
         }
@@ -3969,6 +3993,41 @@ impl Simulator {
         }
         let size = self.get_queue_size(param);
         let w = self.module.arrays.get(param).map(|t| t.2).unwrap_or(32);
+        // §7.7: when the actual is a fixed-size array (`output int d[]`
+        // passed `f_off[5:2]`), validate runtime size compatibility and write
+        // back elements in left-to-right order WITHOUT overwriting the caller's
+        // fixed-array metadata or bounds.
+        if !self.module.dynamic_arrays.contains(caller)
+            && !self.module.associative_arrays.contains_key(caller)
+            && let Some(&(clo, chi, _)) = self.module.arrays.get(caller)
+        {
+            let cap = (chi - clo + 1).max(0) as u64;
+            if size != cap {
+                self.emit_severity_text(
+                    "Error",
+                    &format!(
+                        "Dynamic array formal '{}' size ({}) does not match fixed array actual '{}' size ({})",
+                        param, size, caller, cap
+                    ),
+                );
+                return;
+            }
+            let c_desc = self.module.descending_arrays.contains(caller);
+            let elem_su = self
+                .p_elem_type(param)
+                .or_else(|| self.p_elem_type(caller))
+                .and_then(|dt| self.unpacked_struct_of(&dt));
+            for j in 0..size {
+                let cidx = if c_desc { chi - j as i64 } else { clo + j as i64 };
+                if let Some(su) = &elem_su {
+                    let (d, s) = (format!("{caller}[{cidx}]"), format!("{param}[{j}]"));
+                    self.copy_unpacked_struct(&d, &s, su);
+                } else if let Some(v) = self.get_signal_value_by_name(&format!("{param}[{j}]")) {
+                    self.set_signal_value_by_name(&format!("{caller}[{cidx}]"), v);
+                }
+            }
+            return;
+        }
         let vals: Vec<Value> = (0..size)
             .map(|j| {
                 self.get_signal_value_by_name(&format!("{}[{}]", param, j))

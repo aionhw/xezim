@@ -897,7 +897,8 @@ impl Simulator {
                     CombItem::TimingCheck { .. } => "timing check",
                     CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
-                    | CombItem::FastDirectFanout { .. } => "continuous assign (copy)",
+                    | CombItem::FastDirectFanout { .. }
+                    | CombItem::BulkArrayCopy { .. } => "continuous assign (copy)",
                     CombItem::Noop => continue,
                 };
                 let src_file = e
@@ -2098,20 +2099,40 @@ impl Simulator {
     /// that re-evaluate on every settle (`comb_unresolved_idx`) — the way a
     /// memory read through a dynamic index is tracked.
     #[inline]
+    pub(super) fn note_packed_seg_dirty(&mut self, id: usize) {
+        let seg = packed_seg_idx(id);
+        if seg < self.packed_seg_deps.len() && !self.packed_seg_deps[seg].is_empty() {
+            if seg < self.packed_seg_dirty.len() && !self.packed_seg_dirty[seg] {
+                self.packed_seg_dirty[seg] = true;
+                self.dirty_packed_segs.push(seg);
+            }
+            self.dirty_any = true;
+        } else if !self.comb_unresolved_idx.is_empty() {
+            self.dirty_any = true;
+        }
+    }
+
+    #[inline]
     pub(super) fn packed_store(&mut self, id: usize, v: u64, x: u64) -> bool {
         let changed = self.packed.set_raw(id, v, x);
         if changed {
             self.table_modified = true;
-            if !self.comb_unresolved_idx.is_empty() {
-                self.dirty_any = true;
-            }
+            self.note_packed_seg_dirty(id);
         }
         changed
     }
 
-    /// `packed_store` of a whole `Value` (resized to the element width).
+    /// `packed_store` of a whole `Value` (resized to the element width; supports wide cells).
     #[inline]
     pub(super) fn packed_store_value(&mut self, id: usize, val: &Value) -> bool {
+        if self.packed.is_wide(id) {
+            let changed = self.packed.write(id, val);
+            if changed {
+                self.table_modified = true;
+                self.note_packed_seg_dirty(id);
+            }
+            return changed;
+        }
         let w = self.packed.width(id);
         let (v, x) = if val.width == w && !val.is_real && !val.is_fill {
             val.raw_bits()
@@ -2126,8 +2147,9 @@ impl Simulator {
     /// holds no resized copy of it.
     pub(super) fn force_cell(&mut self, id: usize, v: Value) {
         if is_packed_id(id) {
-            let (cv, cx, _) = self.packed.raw(id);
-            self.packed.force_raw(id, cv, cx);
+            let cur = self.packed.read(id);
+            self.packed.force_value(id, &cur);
+            self.note_packed_seg_dirty(id);
             return;
         }
         // Record the value as stored (post-resize), so the map mirrors the

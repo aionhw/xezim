@@ -3253,8 +3253,7 @@ impl Simulator {
                     // Past a `force` too: a forced cell's value can change
                     // within the slot like any other.
                     saved.push((id, self.packed.read(id)));
-                    let (v, x) = pre.raw_bits();
-                    self.packed.put_raw(id, v, x);
+                    self.packed.put_value(id, &pre);
                 }
             }
         }
@@ -3268,8 +3267,7 @@ impl Simulator {
                 self.signal_table[id] = v;
                 self.sync_mirror(id);
             } else {
-                let (v, x) = v.raw_bits();
-                self.packed.put_raw(id, v, x);
+                self.packed.put_value(id, &v);
             }
         }
     }

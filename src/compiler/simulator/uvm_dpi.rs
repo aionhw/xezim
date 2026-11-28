@@ -1154,10 +1154,7 @@ impl Simulator {
 
     fn uvm_hdl_value(&self, obj: &HdlObj) -> Value {
         match obj {
-            HdlObj::Slot(id) if is_packed_id(*id) => {
-                let (v, x, w) = self.packed.raw(*id);
-                Value::from_inline(v, x, w)
-            }
+            HdlObj::Slot(id) if is_packed_id(*id) => self.packed.read(*id),
             HdlObj::Slot(id) => self.signal_table[*id].clone(),
             HdlObj::Named(n) => self
                 .signals

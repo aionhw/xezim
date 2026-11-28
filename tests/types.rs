@@ -954,3 +954,12 @@ mod ch07_struct_perf_sra;
 
 #[path = "types/ch07_union_semantics.rs"]
 mod ch07_union_semantics;
+
+#[path = "types/ch07_array_semantics.rs"]
+mod ch07_array_semantics;
+
+#[path = "types/ch07_array_legality.rs"]
+mod ch07_array_legality;
+
+#[path = "types/ch07_array_packed_mem.rs"]
+mod ch07_array_packed_mem;

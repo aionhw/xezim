@@ -403,38 +403,220 @@ impl Simulator {
         n_expr: &Expression,
         src_expr: Option<&Expression>,
     ) {
-        let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
-        // The source may be any array or queue. A self-copy
-        // (`d = new[n](d)`) is index-preserving, so no
-        // snapshot is needed.
-        let src = src_expr.and_then(|e| match &e.kind {
-            ExprKind::Ident(h) => {
-                // Resolve flattened object members before the
-                // hierarchy resolver adds a module/local prefix.
-                if h.path.len() > 1
-                    && let Some(storage) = self.expr_assoc_name(e)
+        const MAX_DYN_ARRAY_SIZE: u64 = 1 << 28;
+        let nv = self.eval_expr(n_expr);
+        if nv.has_xz() {
+            self.emit_severity_text(
+                "Error",
+                &format!("Invalid X/Z size in new[] for '{}'", name),
+            );
+            return;
+        }
+        if nv.is_signed && nv.to_i64().is_some_and(|i| i < 0) {
+            self.emit_severity_text(
+                "Error",
+                &format!("Negative size in new[] for '{}'", name),
+            );
+            return;
+        }
+        let Some(n) = nv.to_u64() else {
+            self.emit_severity_text(
+                "Error",
+                &format!("Invalid negative or out-of-range size in new[] for '{}'", name),
+            );
+            return;
+        };
+        if n > MAX_DYN_ARRAY_SIZE {
+            self.emit_severity_text(
+                "Error",
+                &format!("Dynamic array size {} in new[] for '{}' exceeds limit", n, name),
+            );
+            return;
+        }
+        // Snapshot fixed/row/slice/call/concat/pattern sources BEFORE modifying `name`
+        // (and evaluate any impure index in `mat[f_idx()]` ONCE).
+        let mut pre_vals: Option<Vec<Value>> = None;
+        let mut pre_default_broadcast: Option<Value> = None;
+        let mut resolved_dyn_src: Option<String> = None;
+        let mut evaluated_src = false;
+        if let Some(se) = src_expr {
+            let pat_se = self.unpacked_pattern(se);
+            match &pat_se.kind {
+                ExprKind::Concatenation(parts)
+                    if !self.module.arrays_2d.contains_key(name)
+                        && !self.module.arrays_nd.contains_key(name) =>
                 {
-                    return Some(storage);
+                    // §10.10.3: preserve nested braces as self-determined expressions.
+                    let items: Vec<&Expression> = parts.iter().collect();
+                    pre_vals = Some(self.unpacked_concat_operand_values(items, true, None));
+                    evaluated_src = true;
                 }
-                let n = self.resolve_hier_name(h);
-                // A class-member source (`new[t+1](slices)`
-                // in a method) lives at `<h>#slices` — the
-                // bare name read size 0, so the copy-init
-                // silently dropped every existing element.
-                Some(self.resolve_locator_storage(&n))
+                ExprKind::AssignmentPattern(items) => {
+                    evaluated_src = true;
+                    if items.len() == 1
+                        && let crate::ast::expr::AssignmentPatternItem::Default(de) = &items[0]
+                    {
+                        pre_default_broadcast = Some(self.eval_expr(de));
+                    } else if let Some(dt) = self.module.var_decl_types.get(name).cloned()
+                        && n <= (1 << 20)
+                    {
+                        let indices: Vec<i64> = (0..n as i64).collect();
+                        let elems: Vec<Option<Expression>> = self
+                            .pattern_elems_for_type(items, &indices, &dt)
+                            .into_iter()
+                            .map(|o| o.cloned())
+                            .collect();
+                        let mut vals = Vec::with_capacity(elems.len());
+                        for eopt in elems {
+                            if let Some(e) = eopt {
+                                vals.push(self.eval_expr(&e));
+                            } else {
+                                vals.push(Value::zero(32));
+                            }
+                        }
+                        pre_vals = Some(vals);
+                    } else {
+                        let mut vals = Vec::with_capacity(items.len().min(n as usize));
+                        for item in items.iter().take(n as usize) {
+                            vals.push(self.eval_expr(item.expr()));
+                        }
+                        pre_vals = Some(vals);
+                    }
+                }
+                ExprKind::RangeSelect { .. } => {
+                    evaluated_src = true;
+                    let mut vals = Vec::new();
+                    if self.append_fixed_slice_concat_values(pat_se, &mut vals) {
+                        pre_vals = Some(vals);
+                    } else if let Some((svals, _)) = self.collection_slice_values(pat_se) {
+                        pre_vals = Some(svals);
+                    }
+                }
+                ExprKind::Call { .. } => {
+                    evaluated_src = true;
+                    if let Some(Some(ret_src)) = self.ret_collection_operand(pat_se) {
+                        if !self.is_associative_array(&ret_src) {
+                            let sz = self.get_queue_size(&ret_src);
+                            let mut vals = Vec::with_capacity(sz.min(n) as usize);
+                            for i in 0..sz.min(n) {
+                                let v = self
+                                    .get_signal_value_by_name(&format!("{ret_src}[{i}]"))
+                                    .unwrap_or_else(|| Value::zero(32));
+                                vals.push(v);
+                            }
+                            pre_vals = Some(vals);
+                        }
+                    } else {
+                        pre_default_broadcast = Some(self.eval_expr(pat_se));
+                    }
+                }
+                ExprKind::Index { expr: base, index } => {
+                    // Check fixed/dyn row (`mat2[1]`, `mat[f_idx()]`, `d[1]`) evaluating `index` ONCE.
+                    let base_ident = match &Self::unparen(base).kind {
+                        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                            if h.path.len() > 1 {
+                                self.expr_assoc_name(base)
+                                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned())
+                            } else {
+                                self.resolve_locator_storage(&self.resolve_hier_name(h))
+                            }
+                        }
+                        _ => String::new(),
+                    };
+                    if !base_ident.is_empty() && self.module.arrays_2d.contains_key(&base_ident) {
+                        evaluated_src = true;
+                        let iv = self.eval_expr(index).to_index();
+                        let &((lo1, hi1), (lo2, hi2), w) = &self.module.arrays_2d[&base_ident];
+                        let dyn_rows = self.module.dynamic_arrays.contains(&base_ident);
+                        let valid_row = iv.filter(|&r| {
+                            if dyn_rows {
+                                r >= 0 && (r as u64) < self.get_queue_size(&base_ident)
+                            } else {
+                                (lo1.min(hi1)..=lo1.max(hi1)).contains(&r)
+                            }
+                        });
+                        if let Some(ridx) = valid_row {
+                            let col_desc = self
+                                .module
+                                .unpacked_decl_dims
+                                .get(&base_ident)
+                                .and_then(|dd| dd.get(1))
+                                .is_some_and(|&(l, r)| l > r);
+                            let cmin = lo2.min(hi2);
+                            let cmax = lo2.max(hi2);
+                            let ccount = (cmax - cmin + 1).max(0) as u64;
+                            let take = ccount.min(n);
+                            let mut vals = Vec::with_capacity(take as usize);
+                            for k in 0..take {
+                                let cidx = if col_desc { cmax - k as i64 } else { cmin + k as i64 };
+                                let v = self
+                                    .get_signal_value_by_name(&format!("{}[{}][{}]", base_ident, ridx, cidx))
+                                    .unwrap_or_else(|| Value::zero(w.max(1)));
+                                vals.push(v);
+                            }
+                            pre_vals = Some(vals);
+                        } else {
+                            pre_vals = Some(Vec::new());
+                        }
+                    } else if let Some(cand) = self
+                        .class_array_of_coll_key(pat_se)
+                        .or_else(|| {
+                            Self::cond_expr_is_effect_free(pat_se, false)
+                                .then(|| self.flat_member_name(pat_se))
+                                .flatten()
+                        })
+                        .filter(|sn| self.module.dynamic_arrays.contains(sn.as_str()))
+                    {
+                        resolved_dyn_src = Some(cand);
+                    } else if !base_ident.is_empty()
+                        && let Some(ridx) = self.eval_expr(index).to_index()
+                    {
+                        let cand = format!("{base_ident}[{ridx}]");
+                        if self.module.dynamic_arrays.contains(&cand) {
+                            resolved_dyn_src = Some(cand);
+                        } else {
+                            // Snapshot scalar element? Let normal fallback handle unless it's a scalar broadcast.
+                            evaluated_src = true;
+                            pre_default_broadcast = self
+                                .get_signal_value_by_name(&cand)
+                                .or_else(|| Some(Value::new(32)));
+                        }
+                    }
+                }
+                ExprKind::Ident(h) => {
+                    let raw = if h.path.len() > 1 {
+                        self.expr_assoc_name(pat_se)
+                            .unwrap_or_else(|| self.resolve_hier_name(h).into_owned())
+                    } else {
+                        self.resolve_locator_storage(&self.resolve_hier_name(h))
+                    };
+                    if self.module.dynamic_arrays.contains(&raw) {
+                        resolved_dyn_src = Some(raw);
+                    } else if let Some(&(lo, hi, w)) = self.module.arrays.get(&raw) {
+                        evaluated_src = true;
+                        let desc = self.module.descending_arrays.contains(&raw);
+                        let count = (hi - lo + 1).max(0) as u64;
+                        let take = count.min(n);
+                        let mut vals = Vec::with_capacity(take as usize);
+                        for k in 0..take {
+                            let idx = if desc { hi - k as i64 } else { lo + k as i64 };
+                            let v = self
+                                .get_signal_value_by_name(&format!("{}[{}]", raw, idx))
+                                .unwrap_or_else(|| Value::zero(w.max(1)));
+                            vals.push(v);
+                        }
+                        pre_vals = Some(vals);
+                    } else if self.expr_assoc_name(pat_se).is_some() {
+                        resolved_dyn_src = self.expr_assoc_name(pat_se);
+                    }
+                }
+                ExprKind::MemberAccess { .. } => {
+                    resolved_dyn_src = self.expr_assoc_name(pat_se);
+                }
+                _ => {}
             }
-            // `obj.member` and indexed/call-bearing owners are
-            // collection operands, not scalar broadcast values.
-            ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
-            // A ROW of an array of dynamic arrays (`d[i]`, `h.rows[i]`) is a
-            // collection operand too; taken for a scalar, the copy kept
-            // nothing (`d[1] = new[2](d[1])` zeroed the row).
-            ExprKind::Index { .. } if Self::cond_expr_is_effect_free(e, false) => self
-                .class_array_of_coll_key(e)
-                .or_else(|| self.flat_member_name(e))
-                .filter(|n| self.module.dynamic_arrays.contains(n.as_str())),
-            _ => None,
-        });
+        }
+        let src = resolved_dyn_src;
         if let Some((dt, tail)) = self.dynamic_assoc_decl(name) {
             self.module
                 .var_decl_types
@@ -489,29 +671,17 @@ impl Simulator {
             self.set_queue_size(name, n);
             return;
         }
-        // §7.5.1, §10.10: `new[n]({src[1], 5})` initializes from the elements
-        // of an unpacked concatenation, read before the target is resized
-        // (`d = new[3]({d, 8})`). Read as one packed value, it was broadcast.
-        let concat_vals = match src_expr.map(|e| &e.kind) {
-            Some(ExprKind::Concatenation(parts))
-                if !self.module.arrays_2d.contains_key(name)
-                    && !self.module.arrays_nd.contains_key(name) =>
-            {
-                let mut items = Vec::with_capacity(parts.len());
-                let mut stack: Vec<&Expression> = parts.iter().rev().collect();
-                while let Some(e) = stack.pop() {
-                    match &e.kind {
-                        ExprKind::Concatenation(inner) => stack.extend(inner.iter().rev()),
-                        _ => items.push(e),
-                    }
+        let concat_vals = pre_vals;
+        let keep = match (&src, &concat_vals) {
+            (Some(sn), _) => self.get_queue_size(sn).min(n),
+            (None, Some(vals)) => (vals.len() as u64).min(n),
+            (None, None) => {
+                if pre_default_broadcast.is_some() {
+                    n
+                } else {
+                    0
                 }
-                Some(self.unpacked_concat_operand_values(items, true, None))
             }
-            _ => None,
-        };
-        let keep = match &src {
-            Some(sn) => self.get_queue_size(sn).min(n),
-            None => 0,
         };
         if let Some(sn) = &src {
             for i in 0..keep {
@@ -524,7 +694,7 @@ impl Simulator {
                     self.register_dyn_row_like(&drow, &srow);
                     self.copy_dyn_tree(&drow, &srow);
                 } else {
-                    self.queue_copy_elem(sn, i, &name, i);
+                    self.queue_copy_elem(sn, i, name, i);
                 }
             }
         }
@@ -628,7 +798,13 @@ impl Simulator {
                 let v = self.fit_queue_push_elem(name, v);
                 self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
             }
-        } else if let Some(se) = src_expr
+        } else if let Some(v) = pre_default_broadcast {
+            let v = self.fit_queue_push_elem(name, v);
+            for i in 0..n {
+                self.set_signal_value_by_name(&format!("{}[{}]", name, i), v.clone());
+            }
+        } else if !evaluated_src
+            && let Some(se) = src_expr
             && src.is_none()
         {
             match &self.unpacked_pattern(se).kind {
@@ -641,19 +817,16 @@ impl Simulator {
                         self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
                     }
                 }
-                // A non-array scalar argument (`new[n](3.0)`,
-                // `new[n]("A")`) broadcasts to every element
-                // (matches a reference simulator). Ident sources were already
-                // element-copied above.
                 ExprKind::Ident(_) => {}
                 _ => {
                     let v = self.eval_expr(se);
+                    let v = self.fit_queue_push_elem(name, v);
                     for i in 0..n {
                         self.set_signal_value_by_name(&format!("{}[{}]", name, i), v.clone());
                     }
                 }
             }
         }
-        self.set_queue_size(&name, n);
+        self.set_queue_size(name, n);
     }
 }

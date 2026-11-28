@@ -1079,6 +1079,7 @@ impl Simulator {
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
         self.initialize_continuously_driven_nets();
+        self.rebuild_packed_seg_deps();
         self.gate_fall_delay_by_id
             .extend(cache.gate_fall_delay_by_id);
         self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
@@ -1292,7 +1293,23 @@ impl Simulator {
                 // §10.6.2 / §10.10: expand whole-array / row / slice / pattern /
                 // concat unpacked-array assigns using borrowed module tables.
                 raw_ca.make_full_mut();
-                let expanded = {
+                let is_bulk_candidate = if let Some(f) = raw_ca.as_full()
+                    && !f.rhs_parent_scoped
+                    && f.delay == 0
+                    && f.delay_fall().is_none()
+                    && f.delay_off().is_none()
+                    && f.delay_exprs().is_none()
+                    && self.module.is_bulk_array_copy_candidate(&raw_ca)
+                {
+                    let bulk_scope = self.infer_contassign_scope_hint(&f.lhs, &f.rhs);
+                    self.try_build_bulk_array_copy(&f.lhs, &f.rhs, bulk_scope.as_deref())
+                        .is_some()
+                } else {
+                    false
+                };
+                let expanded = if is_bulk_candidate {
+                    None
+                } else {
                     let f = raw_ca.as_full().expect("promoted to Full above");
                     let m = &self.module;
                     let is_other_array = |n: &str| {
@@ -1614,12 +1631,20 @@ impl Simulator {
                     {
                         let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
                         let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
-                        match (
-                            self.signal_name_to_id.get(dst_name.as_str()),
-                            self.signal_name_to_id.get(src_name.as_str()),
-                        ) {
-                            (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
-                            _ => None,
+                        let is_arr = |n: &str| {
+                            self.array_first_id.contains_key(n)
+                                || self.array_nd_first_id.contains_key(n)
+                        };
+                        if is_arr(dst_name.as_str()) || is_arr(src_name.as_str()) {
+                            None
+                        } else {
+                            match (
+                                self.signal_name_to_id.get(dst_name.as_str()),
+                                self.signal_name_to_id.get(src_name.as_str()),
+                            ) {
+                                (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
+                                _ => None,
+                            }
                         }
                     } else {
                         None
@@ -1629,6 +1654,46 @@ impl Simulator {
                 };
             if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
                 continue;
+            }
+            if !ca.rhs_parent_scoped
+                && explicit_delay == 0
+                && ca.delay_fall().is_none()
+                && ca.delay_off().is_none()
+                && ca.delay_exprs().is_none()
+                && cov_counter.is_none()
+                && !ca_time0_effects
+            {
+                let bulk_scope = self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs);
+                if let Some((runs, mut rids, mut wids)) =
+                    self.try_build_bulk_array_copy(&ca.lhs, &ca.rhs, bulk_scope.as_deref())
+                {
+                    if runs.is_empty() {
+                        continue;
+                    }
+                    for &d in &wids {
+                        self.cont_driven.insert(d);
+                    }
+                    rids.shrink_to_fit();
+                    wids.shrink_to_fit();
+                    entries.push(CombEntry {
+                        item: CombItem::BulkArrayCopy {
+                            runs: runs.into_boxed_slice(),
+                        },
+                        cold: Box::new(CombEntryCold {
+                            rhs_time_scope: None,
+                            scope_hint: bulk_scope,
+                            read_signal_ids: rids,
+                            write_signal_ids: wids,
+                            span: ca_span,
+                            cov: None,
+                            time0_effects: false,
+                            alias_t0_reads: None,
+                        }),
+                        has_unresolved_reads: false,
+                        defer_at_time0: false,
+                    });
+                    continue;
+                }
             }
             // So is an element connect of an unpacked-array port collapsed
             // onto its actual (see `collapse_array_port_nets`).
@@ -6285,6 +6350,7 @@ impl Simulator {
         }
         self.comb_writer_index = None;
         self.comb_entries = entries;
+        self.rebuild_packed_seg_deps();
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
         // continuous_assigns live on in CombItem::ContAssign (fallback) or
@@ -6373,5 +6439,463 @@ impl Simulator {
                 })
                 .collect(),
         )
+    }
+
+    /// Lower a continuous whole/slice/row unpacked-array assignment into
+    /// [`CombItem::BulkArrayCopy`] runs, preserving declared ascending /
+    /// descending element correspondence without expanding per-element AST nodes.
+    fn try_build_bulk_array_copy(
+        &self,
+        lhs: &Expression,
+        rhs: &Expression,
+        scope_hint: Option<&str>,
+    ) -> Option<(Vec<super::comb_network::BulkCopyRun>, Vec<usize>, Vec<usize>)> {
+        use super::comb_network::BulkCopyRun;
+        use crate::ast::expr::RangeKind;
+        use crate::compiler::elaborate::{const_eval_i64_with_params, eval_const_expr_val_env};
+
+        enum ArraySpec {
+            OneD {
+                first: usize,
+                lo: i64,
+                hi: i64,
+                desc: bool,
+            },
+            Nd {
+                first: usize,
+                shape: Vec<(i64, i64)>,
+                descs: Vec<bool>,
+            },
+        }
+
+        let dotted_ok = |h: &crate::ast::expr::HierarchicalIdentifier| -> bool {
+            h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) && !h.path.is_empty()
+        };
+        let top_prefix = format!("{}.", self.module.name);
+        let resolve_array_spec = |h: &crate::ast::expr::HierarchicalIdentifier| -> Option<ArraySpec> {
+            if !dotted_ok(h) {
+                return None;
+            }
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            let mut cands: Vec<String> = Vec::with_capacity(3);
+            if h.path.len() == 1
+                && let Some(sc) = scope_hint
+            {
+                cands.push(format!("{sc}.{raw}"));
+            }
+            cands.push(raw.clone());
+            if let Some(stripped) = raw.strip_prefix(&top_prefix) {
+                cands.push(stripped.to_string());
+            }
+            let cand = cands.into_iter().find(|n| {
+                self.array_first_id.contains_key(n.as_str())
+                    || self.array_nd_first_id.contains_key(n.as_str())
+            })?;
+            let n = cand.as_str();
+            if self.module.dynamic_arrays.contains(n)
+                || self.module.queue_vars.contains(n)
+                || self.module.associative_arrays.contains_key(n)
+                || self.module.resolved_net_kinds.contains_key(n)
+            {
+                return None;
+            }
+            if let Some(dt) = self.module.var_decl_types.get(n) {
+                let r = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                if matches!(r, DataType::Struct(su) if !su.packed)
+                    || super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+                {
+                    return None;
+                }
+            }
+            if let Some(&(first, lo, hi)) = self.array_first_id.get(n) {
+                if hi < lo {
+                    return None;
+                }
+                if !is_packed_id(first)
+                    && (self.signal_real.get(first).copied().unwrap_or(false)
+                        || self.sdf_delays.get(first).copied().unwrap_or(0) != 0
+                        || self
+                            .module_paths
+                            .as_ref()
+                            .is_some_and(|p| (first..first + (hi - lo + 1) as usize).any(|id| p.is_path_net(id))))
+                {
+                    return None;
+                }
+                let desc = self.module.descending_arrays.contains(n);
+                return Some(ArraySpec::OneD {
+                    first,
+                    lo,
+                    hi,
+                    desc,
+                });
+            }
+            if let Some((first, shape)) = self.array_nd_first_id.get(n) {
+                if shape.iter().any(|&(lo, hi)| hi < lo) {
+                    return None;
+                }
+                let total = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                    acc.saturating_mul((hi - lo + 1) as usize)
+                });
+                if !is_packed_id(*first)
+                    && (self.signal_real.get(*first).copied().unwrap_or(false)
+                        || self.sdf_delays.get(*first).copied().unwrap_or(0) != 0
+                        || self
+                            .module_paths
+                            .as_ref()
+                            .is_some_and(|p| (*first..*first + total).any(|id| p.is_path_net(id))))
+                {
+                    return None;
+                }
+                let descs = match self.module.unpacked_decl_dims.get(n) {
+                    Some(dd) if dd.len() == shape.len() => {
+                        dd.iter().map(|&(l, r)| l > r).collect()
+                    }
+                    _ => vec![false; shape.len()],
+                };
+                return Some(ArraySpec::Nd {
+                    first: *first,
+                    shape: shape.clone(),
+                    descs,
+                });
+            }
+            None
+        };
+
+        let mut runs: Vec<BulkCopyRun> = Vec::new();
+        let params = &self.module.parameters;
+
+        match (&lhs.kind, &rhs.kind) {
+            // Case 1: whole-array `assign dst = src;` (1-D, 2-D, or N-D).
+            (ExprKind::Ident(lh), ExprKind::Ident(rh)) => {
+                match (resolve_array_spec(lh)?, resolve_array_spec(rh)?) {
+                    (
+                        ArraySpec::OneD {
+                            first: df,
+                            lo: dlo,
+                            hi: dhi,
+                            desc: ddesc,
+                        },
+                        ArraySpec::OneD {
+                            first: sf,
+                            lo: slo,
+                            hi: shi,
+                            desc: sdesc,
+                        },
+                    ) => {
+                        let dlen = (dhi - dlo + 1) as usize;
+                        let slen = (shi - slo + 1) as usize;
+                        if dlen != slen || dlen == 0 {
+                            return None;
+                        }
+                        runs.push(BulkCopyRun {
+                            dst_first: if ddesc { df + dlen - 1 } else { df },
+                            src_first: if sdesc { sf + slen - 1 } else { sf },
+                            len: dlen,
+                            dst_step: if ddesc { -1 } else { 1 },
+                            src_step: if sdesc { -1 } else { 1 },
+                        });
+                    }
+                    (
+                        ArraySpec::Nd {
+                            first: df,
+                            shape: dshape,
+                            descs: ddescs,
+                        },
+                        ArraySpec::Nd {
+                            first: sf,
+                            shape: sshape,
+                            descs: sdescs,
+                        },
+                    ) => {
+                        if dshape.len() != sshape.len() || dshape.is_empty() {
+                            return None;
+                        }
+                        let dlens: Vec<usize> =
+                            dshape.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).collect();
+                        let slens: Vec<usize> =
+                            sshape.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).collect();
+                        if dlens != slens {
+                            return None;
+                        }
+                        let total: usize = dlens.iter().product();
+                        if total == 0 {
+                            return None;
+                        }
+                        if ddescs == sdescs && !ddescs.iter().any(|&d| d) {
+                            runs.push(BulkCopyRun {
+                                dst_first: df,
+                                src_first: sf,
+                                len: total,
+                                dst_step: 1,
+                                src_step: 1,
+                            });
+                        } else {
+                            let ndim = dlens.len();
+                            let inner_len = dlens[ndim - 1];
+                            let d_step = if ddescs[ndim - 1] { -1isize } else { 1isize };
+                            let s_step = if sdescs[ndim - 1] { -1isize } else { 1isize };
+                            let d_inner_start = if ddescs[ndim - 1] { inner_len - 1 } else { 0 };
+                            let s_inner_start = if sdescs[ndim - 1] { inner_len - 1 } else { 0 };
+                            let mut dst_strides = vec![1usize; ndim];
+                            let mut src_strides = vec![1usize; ndim];
+                            for k in (0..ndim - 1).rev() {
+                                dst_strides[k] = dst_strides[k + 1] * dlens[k + 1];
+                                src_strides[k] = src_strides[k + 1] * slens[k + 1];
+                            }
+                            fn emit_rows(
+                                dim: usize,
+                                d_off: usize,
+                                s_off: usize,
+                                dlens: &[usize],
+                                ddescs: &[bool],
+                                sdescs: &[bool],
+                                d_strides: &[usize],
+                                s_strides: &[usize],
+                                df: usize,
+                                sf: usize,
+                                d_inner_start: usize,
+                                s_inner_start: usize,
+                                d_step: isize,
+                                s_step: isize,
+                                out: &mut Vec<BulkCopyRun>,
+                            ) {
+                                if dim + 1 == dlens.len() {
+                                    out.push(BulkCopyRun {
+                                        dst_first: df + d_off + d_inner_start,
+                                        src_first: sf + s_off + s_inner_start,
+                                        len: dlens[dim],
+                                        dst_step: d_step,
+                                        src_step: s_step,
+                                    });
+                                    return;
+                                }
+                                let n = dlens[dim];
+                                for pos in 0..n {
+                                    let dp = if ddescs[dim] { n - 1 - pos } else { pos };
+                                    let sp = if sdescs[dim] { n - 1 - pos } else { pos };
+                                    emit_rows(
+                                        dim + 1,
+                                        d_off + dp * d_strides[dim],
+                                        s_off + sp * s_strides[dim],
+                                        dlens,
+                                        ddescs,
+                                        sdescs,
+                                        d_strides,
+                                        s_strides,
+                                        df,
+                                        sf,
+                                        d_inner_start,
+                                        s_inner_start,
+                                        d_step,
+                                        s_step,
+                                        out,
+                                    );
+                                }
+                            }
+                            emit_rows(
+                                0,
+                                0,
+                                0,
+                                &dlens,
+                                &ddescs,
+                                &sdescs,
+                                &dst_strides,
+                                &src_strides,
+                                df,
+                                sf,
+                                d_inner_start,
+                                s_inner_start,
+                                d_step,
+                                s_step,
+                                &mut runs,
+                            );
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            // Case 2: constant 1-D slice `assign dst[a:b] = src[c:d];` (or whole 1-D side).
+            _ if matches!(lhs.kind, ExprKind::RangeSelect { .. })
+                || matches!(rhs.kind, ExprKind::RangeSelect { .. }) =>
+            {
+                let resolve_1d_slice = |e: &Expression| -> Option<(usize, usize, isize)> {
+                    match &e.kind {
+                        ExprKind::Ident(h) => {
+                            let ArraySpec::OneD { first, lo, hi, desc } = resolve_array_spec(h)?
+                            else {
+                                return None;
+                            };
+                            let len = (hi - lo + 1) as usize;
+                            let start = if desc { first + len - 1 } else { first };
+                            Some((start, len, if desc { -1 } else { 1 }))
+                        }
+                        ExprKind::RangeSelect {
+                            expr: base,
+                            kind,
+                            left,
+                            right,
+                        } => {
+                            let ExprKind::Ident(h) = &base.kind else {
+                                return None;
+                            };
+                            let ArraySpec::OneD { first, lo, hi, desc } = resolve_array_spec(h)?
+                            else {
+                                return None;
+                            };
+                            if eval_const_expr_val_env(left, params).has_xz()
+                                || eval_const_expr_val_env(right, params).has_xz()
+                            {
+                                return None;
+                            }
+                            let lv = const_eval_i64_with_params(left, Some(params))?;
+                            let rv = const_eval_i64_with_params(right, Some(params))?;
+                            match kind {
+                                RangeKind::Constant => {
+                                    if lv.min(rv) < lo || lv.max(rv) > hi {
+                                        return None;
+                                    }
+                                    let len = (lv.abs_diff(rv) + 1) as usize;
+                                    let start = first + (lv - lo) as usize;
+                                    let step = if lv <= rv { 1 } else { -1 };
+                                    Some((start, len, step))
+                                }
+                                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                    if rv <= 0 {
+                                        return None;
+                                    }
+                                    let (slo, shi) = if matches!(kind, RangeKind::IndexedUp) {
+                                        (lv, lv + rv - 1)
+                                    } else {
+                                        (lv - rv + 1, lv)
+                                    };
+                                    if slo < lo || shi > hi {
+                                        return None;
+                                    }
+                                    let (start_idx, step) = if desc { (shi, -1) } else { (slo, 1) };
+                                    let start = first + (start_idx - lo) as usize;
+                                    Some((start, rv as usize, step))
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                let (d_start, d_len, d_step) = resolve_1d_slice(lhs)?;
+                let (s_start, s_len, s_step) = resolve_1d_slice(rhs)?;
+                if d_len != s_len || d_len == 0 {
+                    return None;
+                }
+                runs.push(BulkCopyRun {
+                    dst_first: d_start,
+                    src_first: s_start,
+                    len: d_len,
+                    dst_step: d_step,
+                    src_step: s_step,
+                });
+            }
+            // Case 3: constant row `assign dst = src[row];`.
+            (ExprKind::Ident(lh), ExprKind::Index { expr, index }) => {
+                let ExprKind::Ident(rh) = &expr.kind else {
+                    return None;
+                };
+                let ArraySpec::OneD {
+                    first: df,
+                    lo: dlo,
+                    hi: dhi,
+                    desc: ddesc,
+                } = resolve_array_spec(lh)?
+                else {
+                    return None;
+                };
+                let ArraySpec::Nd {
+                    first: sf,
+                    shape: sshape,
+                    descs: sdescs,
+                } = resolve_array_spec(rh)?
+                else {
+                    return None;
+                };
+                if sshape.len() != 2 {
+                    return None;
+                }
+                if eval_const_expr_val_env(index, params).has_xz() {
+                    return None;
+                }
+                let row = const_eval_i64_with_params(index, Some(params))?;
+                let (rlo, rhi) = sshape[0];
+                if row < rlo || row > rhi {
+                    return None;
+                }
+                let (ilo, ihi) = sshape[1];
+                let dlen = (dhi - dlo + 1) as usize;
+                let ilen = (ihi - ilo + 1) as usize;
+                if dlen != ilen || dlen == 0 {
+                    return None;
+                }
+                let s_row_first = sf + ((row - rlo) as usize) * ilen;
+                let sdesc = sdescs[1];
+                runs.push(BulkCopyRun {
+                    dst_first: if ddesc { df + dlen - 1 } else { df },
+                    src_first: if sdesc { s_row_first + ilen - 1 } else { s_row_first },
+                    len: dlen,
+                    dst_step: if ddesc { -1 } else { 1 },
+                    src_step: if sdesc { -1 } else { 1 },
+                });
+            }
+            _ => return None,
+        }
+
+        // Drop trivial self-copies.
+        runs.retain(|r| !(r.dst_first == r.src_first && r.dst_step == r.src_step));
+        let mut rids = Vec::new();
+        let mut wids = Vec::new();
+        for r in &runs {
+            if !is_packed_id(r.src_first) {
+                rids.reserve(r.len);
+                let mut s = r.src_first as isize;
+                for _ in 0..r.len {
+                    rids.push(s as usize);
+                    s += r.src_step;
+                }
+            }
+            if !is_packed_id(r.dst_first) {
+                wids.reserve(r.len);
+                let mut d = r.dst_first as isize;
+                for _ in 0..r.len {
+                    wids.push(d as usize);
+                    d += r.dst_step;
+                }
+            }
+        }
+        Some((runs, rids, wids))
+    }
+
+    /// Build `packed_seg_deps`: for every [`CombItem::BulkArrayCopy`] entry
+    /// reading a [`PackedMem`] source segment, record that entry in
+    /// `packed_seg_deps[seg]` so writes to that packed segment wake it.
+    pub(super) fn rebuild_packed_seg_deps(&mut self) {
+        let n_segs = self.packed.num_segs();
+        self.packed_seg_deps = vec![Vec::new(); n_segs];
+        self.packed_seg_dirty = vec![false; n_segs];
+        self.dirty_packed_segs.clear();
+        if n_segs == 0 {
+            return;
+        }
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            if let CombItem::BulkArrayCopy { runs } = &entry.item {
+                for run in runs.iter() {
+                    if is_packed_id(run.src_first) {
+                        let seg = packed_mem::packed_seg_idx(run.src_first);
+                        if seg < self.packed_seg_deps.len() {
+                            let deps = &mut self.packed_seg_deps[seg];
+                            if deps.last() != Some(&(eidx as u32)) && !deps.contains(&(eidx as u32))
+                            {
+                                deps.push(eidx as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

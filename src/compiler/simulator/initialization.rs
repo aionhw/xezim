@@ -1923,15 +1923,15 @@ impl Simulator {
         }
     }
 
-    /// Whether a 1-D array's cells may live in the packed arena
-    /// (`PackedMem`): a plain integral VARIABLE element of 1..=64 bits.
-    /// Everything whose storage semantics the arena does not model stays an
-    /// ordinary array — strings (dynamic length), reals, class handles,
-    /// chandles, events, unpacked structs, interfaces, the queue / dynamic /
-    /// associative collections `module.arrays` also lists, and nets (driver
-    /// resolution, z initialization).
+    /// Whether an array's cells may live in the packed arena
+    /// (`PackedMem`): a plain integral VARIABLE element of
+    /// `1..=PACKED_MAX_WIDTH` bits. Everything whose storage semantics the
+    /// arena does not model stays an ordinary array — strings (dynamic length),
+    /// reals, class handles, chandles, events, unpacked structs, interfaces,
+    /// the queue / dynamic / associative collections `module.arrays` also
+    /// lists, and nets (driver resolution, z initialization).
     pub(super) fn packed_admissible(module: &ElaboratedModule, base: &str, w: u32) -> bool {
-        if w == 0 || w > 64 {
+        if w == 0 || w > packed_mem::PACKED_MAX_WIDTH {
             return false;
         }
         let leaf = base.rsplit('.').next().unwrap_or(base);
@@ -1942,6 +1942,7 @@ impl Simulator {
             || module.string_signals.contains(leaf)
             || module.nets.contains(base)
             || module.z_init_signals.contains(base)
+            || module.events.contains(base)
         {
             return false;
         }
@@ -3205,6 +3206,13 @@ impl Simulator {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(257);
+        // Arrays with at least this many cells (and eligible plain integral
+        // storage) live in `PackedMem` rather than per-cell `Value` + side
+        // tables. `XEZIM_PACKED_MEM_MIN_CELLS` overrides.
+        let packed_min_cells: usize = std::env::var("XEZIM_PACKED_MEM_MIN_CELLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
         // For unnamed (skipped-large-array) elements, we don't push to
         // id_to_name at all. id_to_name ends up shorter than signal_table.
         // Helpers like `name_for_id(id)` synthesize the name on demand
@@ -3252,27 +3260,6 @@ impl Simulator {
             signed_vec.push(false);
             real_vec.push(false);
         };
-        let push_elem = |name: &str,
-                         w: u32,
-                         sig_table: &mut Vec<Value>,
-                         widths_vec: &mut Vec<u32>,
-                         signed_vec: &mut Vec<bool>,
-                         real_vec: &mut Vec<bool>,
-                         name_to_id: &mut NameMap,
-                         names: &mut IdNames| {
-            push_elem_named(
-                name,
-                w,
-                sig_table,
-                widths_vec,
-                signed_vec,
-                real_vec,
-                name_to_id,
-                names,
-                true,
-                &_unnamed_arc,
-            );
-        };
         // Static signals/parameters reserved only `n` slots above; unpacked
         // arrays can add millions more signal IDs. Reserve once so large
         // memory construction does not repeatedly grow/copy the SoA vectors.
@@ -3296,74 +3283,123 @@ impl Simulator {
                 std::process::exit(1);
             }
         };
-        let mut array_elem_count: usize = 0;
-        // How many of those elements will actually be REGISTERED by name
-        // below (1-D arrays at or under `large_array_threshold` keep their
-        // per-element names; 2-D / N-D always do). Used only to size
-        // `signal_name_to_id` / `id_to_name` up front — without it those two
-        // grow from `n` to ~1.5 M entries on c906 by repeated doubling, and
-        // every rehash re-hashes every `Arc<str>` key.
-        let mut named_elem_count: usize = 0;
-        for (name, &(lo, hi, _)) in module.arrays.iter() {
-            let count = (hi - lo + 1).max(0) as usize;
-            check_array_size(name, count);
-            array_elem_count = array_elem_count.saturating_add(count);
-            // Only collection elements are stored names; a plain array's
-            // element names are virtual (see the 1-D loop below).
-            if count <= large_array_threshold
-                && (count < virtual_name_min_cells
-                    || name.ends_with(']')
-                    || module.queue_vars.contains(name.as_str())
-                    || module.dynamic_arrays.contains(name.as_str())
-                    || module.associative_arrays.contains_key(name.as_str()))
-            {
-                named_elem_count = named_elem_count.saturating_add(count);
-            }
-        }
-        for (name, &((lo1, hi1), (lo2, hi2), _)) in module.arrays_2d.iter() {
-            let d1 = (hi1 - lo1 + 1).max(0) as usize;
-            let d2 = (hi2 - lo2 + 1).max(0) as usize;
-            let count = d1.saturating_mul(d2);
-            check_array_size(name, count);
-            array_elem_count = array_elem_count.saturating_add(count);
-            named_elem_count = named_elem_count.saturating_add(count);
-        }
-        for (name, (shape, _)) in module.arrays_nd.iter() {
-            let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
-                acc.saturating_mul((hi - lo + 1).max(0) as usize)
-            });
-            check_array_size(name, count);
-            array_elem_count = array_elem_count.saturating_add(count);
-            named_elem_count = named_elem_count.saturating_add(count);
-        }
-        // Free the elaboration-time `signals` map BEFORE allocating the
-        // (potentially multi-GB) array-element storage below — its data
-        // (per-signal width, signed/real, type_name) is already projected into
-        // the parallel signal_widths/signal_signed/signal_real/
-        // signal_type_names vectors + signal_name_to_id, which the sim uses
-        // instead. Clearing it here (rather than at end of construction) keeps
-        // its ~one-long-name-string-plus-Signal-per-entry footprint out of the
-        // peak-RSS window during the big array reserve.
         // Toggle coverage needs the declarations too (see
         // `cov_toggle_candidates`); empty unless the run asked for it.
         let code_cov_toggle_names = Self::cov_toggle_candidates(&module);
+        // Strip trailing `[idx]` suffixes from an elaboration signal name to
+        // locate the owning 1-D, 2-D, or N-D unpacked array key. Multi-D
+        // parameter arrays only register their top-level key in `arrays_2d` /
+        // `arrays_nd` (no duplicate sub-rows in `arrays`), so stripping all
+        // element indices finds both 1-D and N-D parameter initializers.
+        fn elab_array_base<'a>(module: &ElaboratedModule, mut key: &'a str) -> Option<&'a str> {
+            while let Some(prefix) = key
+                .strip_suffix(']')
+                .and_then(|s| s.rsplit_once('[').map(|(b, _)| b))
+            {
+                key = prefix;
+                if module.arrays.contains_key(key)
+                    || module.arrays_2d.contains_key(key)
+                    || module.arrays_nd.contains_key(key)
+                {
+                    return Some(key);
+                }
+            }
+            None
+        }
         // Snapshot array-element values before the map is dropped: the array
         // builder below re-registers these names onto freshly zeroed slots.
-        let array_elem_inits: Vec<(String, Value)> = module
-            .signals
+        let elab_signals = std::mem::take(&mut module.signals);
+        let array_elem_inits: Vec<(String, Value)> = elab_signals
             .iter()
-            .filter(|(k, _)| k.ends_with(']'))
-            .filter(|(k, _)| {
-                k.rsplit_once('[')
-                    .is_some_and(|(b, _)| module.arrays.contains_key(b))
-            })
+            .filter(|(k, _)| k.ends_with(']') && elab_array_base(&module, k.as_str()).is_some())
             .map(|(k, s)| (k.clone(), s.value.to_value()))
             .collect();
         let arrays_with_elab_values: HashSet<String> = array_elem_inits
             .iter()
-            .filter_map(|(name, _)| name.rsplit_once('[').map(|(base, _)| base.to_string()))
+            .filter_map(|(name, _)| elab_array_base(&module, name.as_str()).map(str::to_string))
             .collect();
-        module.signals = Default::default();
+        drop(elab_signals);
+        let packed_mem = packed_mem_enabled();
+        let can_pack_array = |base: &str, count: usize, w: u32| -> bool {
+            if !packed_mem || count == 0 || (count < packed_min_cells && count <= large_array_threshold) {
+                return false;
+            }
+            let ts_base = module.two_state_signals.contains(base);
+            let ts_any = ts_base
+                || module
+                    .two_state_signals
+                    .contains(base.rsplit('.').next().unwrap_or(base));
+            ts_base == ts_any
+                && !arrays_with_elab_values.contains(base)
+                && Self::packed_admissible(&module, base, w)
+        };
+        let packed_array_bytes = |base: &str, count: usize, w: u32| -> usize {
+            let ts_base = module.two_state_signals.contains(base);
+            let plane = if w <= 64 {
+                (w as usize).div_ceil(8).next_power_of_two()
+            } else {
+                8usize * (w as usize).div_ceil(64)
+            };
+            let per_cell = if ts_base { plane } else { 2 * plane };
+            count
+                .saturating_mul(per_cell)
+                .saturating_add(PACKED_PAD + 8)
+        };
+        let is_virtual_array_base = |base: &str, count: usize| -> bool {
+            count >= virtual_name_min_cells
+                && module.var_decl_types.contains_key(base)
+                && !arrays_with_elab_values.contains(base)
+                && !base.ends_with(']')
+                && !module.queue_vars.contains(base)
+                && !module.dynamic_arrays.contains(base)
+                && !module.associative_arrays.contains_key(base)
+        };
+        let mut array_elem_count: usize = 0;
+        let mut named_elem_count: usize = 0;
+        let mut packed_reserve_bytes: usize = 0;
+        for (name, &(lo, hi, w)) in module.arrays.iter() {
+            let count = (hi - lo + 1).max(0) as usize;
+            check_array_size(name, count);
+            if can_pack_array(name.as_str(), count, w) {
+                packed_reserve_bytes = packed_reserve_bytes
+                    .saturating_add(packed_array_bytes(name.as_str(), count, w));
+                continue;
+            }
+            array_elem_count = array_elem_count.saturating_add(count);
+            if count <= large_array_threshold && !is_virtual_array_base(name.as_str(), count) {
+                named_elem_count = named_elem_count.saturating_add(count);
+            }
+        }
+        for (name, &((lo1, hi1), (lo2, hi2), w)) in module.arrays_2d.iter() {
+            let d1 = (hi1 - lo1 + 1).max(0) as usize;
+            let d2 = (hi2 - lo2 + 1).max(0) as usize;
+            let count = d1.saturating_mul(d2);
+            check_array_size(name, count);
+            if can_pack_array(name.as_str(), count, w) {
+                packed_reserve_bytes = packed_reserve_bytes
+                    .saturating_add(packed_array_bytes(name.as_str(), count, w));
+                continue;
+            }
+            array_elem_count = array_elem_count.saturating_add(count);
+            if count <= large_array_threshold && !is_virtual_array_base(name.as_str(), count) {
+                named_elem_count = named_elem_count.saturating_add(count);
+            }
+        }
+        for (name, (shape, w)) in module.arrays_nd.iter() {
+            let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                acc.saturating_mul((hi - lo + 1).max(0) as usize)
+            });
+            check_array_size(name, count);
+            if can_pack_array(name.as_str(), count, *w) {
+                packed_reserve_bytes = packed_reserve_bytes
+                    .saturating_add(packed_array_bytes(name.as_str(), count, *w));
+                continue;
+            }
+            array_elem_count = array_elem_count.saturating_add(count);
+            if count <= large_array_threshold && !is_virtual_array_base(name.as_str(), count) {
+                named_elem_count = named_elem_count.saturating_add(count);
+            }
+        }
         // Return those pages to the OS before the array storage below claims
         // fresh memory (see `release_free_memory`).
         xezim_core::release_free_memory();
@@ -3393,6 +3429,11 @@ impl Simulator {
         // replacement for the per-element entries.
         let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
             HashMap::with_capacity_and_hasher(module.arrays.len(), Default::default());
+        let mut array_nd_first_id: HashMap<Arc<str>, (usize, Vec<(i64, i64)>)> =
+            HashMap::with_capacity_and_hasher(
+                module.arrays_2d.len() + module.arrays_nd.len(),
+                Default::default(),
+            );
         let phase_arrays_1d = crate::WallTimer::now();
         let _ = (
             "[ARR] arrays={} arrays_2d={} arrays_nd={} signals_pre={} names_pre={}",
@@ -3420,41 +3461,18 @@ impl Simulator {
         // an argument -- same census-first shape the AOT template dedup used.
         let mem_census = std::env::var_os("XEZIM_MEM_CENSUS").is_some();
         let mut census: Vec<(String, usize, u32)> = Vec::new();
-        let packed_mem = packed_mem_enabled();
         let mut packed_mem_arena = PackedMem::default();
-        // Reserve the arena once for every array that can be admitted (an
-        // upper bound: rejected arrays leave their share untouched, so it
-        // never becomes resident). Growing by doubling instead copied the
-        // whole arena at each step and briefly held two copies of it.
-        if packed_mem {
-            let bound: usize = module
-                .arrays
-                .values()
-                .map(|&(lo, hi, w)| ((hi - lo + 1).max(0) as usize, w))
-                .filter(|&(count, w)| count > large_array_threshold && (1..=64).contains(&w))
-                .map(|(count, w)| {
-                    count.saturating_mul(2 * (w as usize).div_ceil(8).next_power_of_two())
-                        + PACKED_PAD
-                })
-                .fold(0usize, usize::saturating_add);
+        // Reserve the arena once for every 1-D, 2-D, and N-D array that can be
+        // admitted (an upper bound: rejected arrays leave their share
+        // untouched).
+        if packed_mem && packed_reserve_bytes > 0 {
             xezim_core::oom_trace::checkpoint(
                 "reserve packed arrays",
-                &[("packed_capacity_bytes", bound)],
+                &[("packed_capacity_bytes", packed_reserve_bytes)],
             );
-            packed_mem_arena.reserve(bound);
+            packed_mem_arena.reserve(packed_reserve_bytes);
         }
-        let mut packed_arrays: std::collections::HashSet<String> =
-            std::collections::HashSet::default();
-        let mut packed_cells: usize = 0;
-        for (base, &(lo, hi, w)) in arrays_sorted {
-            let count = (hi - lo + 1).max(0) as usize;
-            let _oom_array = trace_array_storage(base, count, w);
-            if mem_census && count > 0 {
-                census.push((base.clone(), count, w));
-            }
-            let register_names = count <= large_array_threshold;
-            // Resolve element traits before packed admission: arena ids have
-            // no entries in the ordinary signed/two-state side tables.
+        let elem_decl_traits = |base: &str| -> (Option<&DataType>, bool, bool) {
             let elem_dt = module.var_decl_types.get(base).or_else(|| {
                 let mut b: &str = base;
                 loop {
@@ -3472,39 +3490,28 @@ impl Simulator {
             let elem_signed = elem_dt.is_some_and(|dt| {
                 super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
             });
-            // Packed admission (see `PackedMem`): an array big enough to
-            // forgo per-element names whose element is a plain integral
-            // variable of at most 64 bits. Cells get ids above PACKED_BASE
-            // and no `signal_table` / side-table entries at all — that
-            // omission IS the saving. Everything with storage semantics the
-            // arena does not model stays an ordinary array: strings (dynamic
-            // length), reals, class handles and other non-integral elements,
-            // queue / dynamic / associative collections (which `module.arrays`
-            // also lists), nets, and arrays already holding elaboration
-            // values (parameters).
-            // Two-state-ness mirrors the ordinary array exactly: elements
-            // zero-initialize when the BASE is a 2-state signal and drop x/z
-            // on stores when the base OR its leaf is (see the fixups below).
-            // An array where the two tests disagree stays ordinary.
-            let ts_base = module.two_state_signals.contains(base.as_str());
-            let ts_any = ts_base
-                || module
-                    .two_state_signals
-                    .contains(base.rsplit('.').next().unwrap_or(base));
-            if packed_mem
-                && !register_names
-                && count > 0
-                && ts_base == ts_any
-                && !arrays_with_elab_values.contains(base)
-                && Self::packed_admissible(&module, base, w)
-            {
+            let ts_base = module.two_state_signals.contains(base);
+            (elem_dt, elem_signed, ts_base)
+        };
+        let mut packed_arrays: std::collections::HashSet<String> =
+            std::collections::HashSet::default();
+        let mut packed_cells: usize = 0;
+        for (base, &(lo, hi, w)) in arrays_sorted {
+            let count = (hi - lo + 1).max(0) as usize;
+            let _oom_array = trace_array_storage(base, count, w);
+            if mem_census && count > 0 {
+                census.push((base.clone(), count, w));
+            }
+            let register_names = count <= large_array_threshold;
+            let (elem_dt, elem_signed, ts_base) = elem_decl_traits(base.as_str());
+            if can_pack_array(base.as_str(), count, w) {
                 let init = if ts_base {
                     Value::zero(w)
                 } else {
                     array_init(w)
                 };
                 if let Some(first_id) =
-                    packed_mem_arena.admit(count, w, elem_signed, ts_base, init.raw_bits())
+                    packed_mem_arena.admit_value(count, w, elem_signed, ts_base, &init)
                 {
                     array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
                     packed_arrays.insert(base.clone());
@@ -3514,29 +3521,7 @@ impl Simulator {
             }
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
-            // A named array's element names are VIRTUAL (see `NameMap`):
-            // `base[idx]` resolves arithmetically and is never stored.
-            // Collections keep real per-element entries — their element
-            // names are enumerated by prefix and their fake 0..63 backing
-            // range is not the collection's extent — and so does an
-            // array-of-collection element registered under a compound base
-            // (`aq[0]`; a generate-scope bracket inside the path is fine).
-            // Small arrays keep stored names too: their few entries cost
-            // little, and a testbench's (a UVM BFM's 256-entry scoreboards)
-            // are read by name at run time, where a stored name is one hash
-            // probe and a virtual one two.
-            // Only an array with a declaration of its own is virtual: a
-            // struct member's array (`s.arr`) and a parameter array holding
-            // elaboration values are reached through their element names by
-            // prefix walks and the restore below, which keep stored names.
-            let virtual_names = register_names
-                && count >= virtual_name_min_cells
-                && module.var_decl_types.contains_key(base.as_str())
-                && !arrays_with_elab_values.contains(base.as_str())
-                && !base.ends_with(']')
-                && !module.queue_vars.contains(base.as_str())
-                && !module.dynamic_arrays.contains(base.as_str())
-                && !module.associative_arrays.contains_key(base.as_str());
+            let virtual_names = register_names && is_virtual_array_base(base.as_str(), count);
             if register_names && !virtual_names {
                 for idx in lo..=hi {
                     // Same bytes `format!("{}[{}]", base, idx)` produced, into
@@ -3667,15 +3652,6 @@ impl Simulator {
                 }
             }
         }
-        if packed_mem && packed_cells > 0 && (mem_census || crate::verbose()) {
-            eprintln!(
-                "[PACKED-MEM] arrays={} cells={} arena={:.2} MB (vs {:.2} MB unpacked)",
-                packed_arrays.len(),
-                packed_cells,
-                packed_mem_arena.bytes() as f64 / 1e6,
-                (packed_cells * (std::mem::size_of::<Value>() + 24)) as f64 / 1e6,
-            );
-        }
         if mem_census {
             // Per-cell cost today: the Value itself plus the fixed-size
             // per-signal side tables that are indexed by signal_id.
@@ -3764,45 +3740,80 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
-            let _oom_array = trace_array_storage(
-                base,
-                ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize),
-                w,
-            );
+            let count = ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize);
+            let _oom_array = trace_array_storage(base, count, w);
+            let shape = vec![(lo1, hi1), (lo2, hi2)];
+            let (elem_dt, elem_signed, ts_base) = elem_decl_traits(base.as_str());
+            if can_pack_array(base.as_str(), count, w) {
+                let init = if ts_base {
+                    Value::zero(w)
+                } else {
+                    array_init(w)
+                };
+                if let Some(first_id) =
+                    packed_mem_arena.admit_value(count, w, elem_signed, ts_base, &init)
+                {
+                    array_nd_first_id.insert(Arc::from(base.as_str()), (first_id, shape));
+                    packed_arrays.insert(base.clone());
+                    packed_cells += count;
+                    continue;
+                }
+            }
             let first_id = signal_table.len();
-            for i in lo1..=hi1 {
-                for j in lo2..=hi2 {
-                    push_elem(
-                        format!("{}[{}][{}]", base, i, j).as_str(),
-                        w,
-                        &mut signal_table,
-                        &mut signal_widths_vec,
-                        &mut signal_signed_vec,
-                        &mut signal_real_vec,
-                        &mut signal_name_to_id,
-                        &mut id_to_name,
+            array_nd_first_id.insert(Arc::from(base.as_str()), (first_id, shape.clone()));
+            let register_names = count <= large_array_threshold;
+            let virtual_names = register_names && is_virtual_array_base(base.as_str(), count);
+            if register_names && !virtual_names {
+                for i in lo1..=hi1 {
+                    for j in lo2..=hi2 {
+                        elem_name_buf.clear();
+                        elem_name_buf.push_str(base);
+                        elem_name_buf.push('[');
+                        Self::push_i64(&mut elem_name_buf, i);
+                        elem_name_buf.push_str("][");
+                        Self::push_i64(&mut elem_name_buf, j);
+                        elem_name_buf.push(']');
+                        push_elem_named(
+                            elem_name_buf.as_str(),
+                            w,
+                            &mut signal_table,
+                            &mut signal_widths_vec,
+                            &mut signal_signed_vec,
+                            &mut signal_real_vec,
+                            &mut signal_name_to_id,
+                            &mut id_to_name,
+                            true,
+                            &_unnamed_arc,
+                        );
+                    }
+                }
+            } else {
+                signal_table.extend(std::iter::repeat_n(array_init(w), count));
+                signal_widths_vec.extend(std::iter::repeat_n(w, count));
+                signal_signed_vec.extend(std::iter::repeat_n(false, count));
+                signal_real_vec.extend(std::iter::repeat_n(false, count));
+                id_to_name.push_gap(count, virtual_names);
+                if virtual_names {
+                    signal_name_to_id.add_virtual_nd_array(
+                        Arc::from(base.as_str()),
+                        first_id,
+                        shape,
                     );
                 }
             }
-            // §25.9: a virtual-interface element starts null (see the 1-D
-            // loop).
             if vif_vars.contains(base.as_str()) {
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
-            // §6.11.1: same element-signedness inheritance the 1-D loop
-            // applies — without it `int a2[2][2]; a2[0][0] = -1` read back
-            // unsigned (4294967295, and `a2[0][0] < 0` was FALSE).
-            if module.var_decl_types.get(base).is_some_and(|dt| {
+            if elem_dt.is_some_and(|dt| {
                 super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
                     signal_signed_vec[id] = true;
                 }
             }
-            // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
+            if elem_dt.is_some_and(|dt| {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
@@ -3815,58 +3826,98 @@ impl Simulator {
             module.arrays_nd.iter().collect();
         arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, (shape, w)) in arrays_nd_sorted {
+            let count = shape.iter().fold(1usize, |count, &(lo, hi)| {
+                count.saturating_mul((hi - lo + 1).max(0) as usize)
+            });
             let _oom_array = if xezim_core::oom_trace::enabled() {
-                Some(trace_array_storage(
-                    base,
-                    shape.iter().fold(1usize, |count, &(lo, hi)| {
-                        count.saturating_mul((hi - lo + 1).max(0) as usize)
-                    }),
-                    *w,
-                ))
+                Some(trace_array_storage(base, count, *w))
             } else {
                 None
             };
-            fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
-                if dims.is_empty() {
-                    out.push(prefix);
-                    return;
-                }
-                let (lo, hi) = dims[0];
-                for i in lo..=hi {
-                    enumerate(&dims[1..], format!("{}[{}]", prefix, i), out);
+            let (elem_dt, elem_signed, ts_base) = elem_decl_traits(base.as_str());
+            if can_pack_array(base.as_str(), count, *w) {
+                let init = if ts_base {
+                    Value::zero(*w)
+                } else {
+                    array_init(*w)
+                };
+                if let Some(first_id) =
+                    packed_mem_arena.admit_value(count, *w, elem_signed, ts_base, &init)
+                {
+                    array_nd_first_id.insert(Arc::from(base.as_str()), (first_id, shape.clone()));
+                    packed_arrays.insert(base.clone());
+                    packed_cells += count;
+                    continue;
                 }
             }
-            let mut names = Vec::new();
-            enumerate(shape, base.clone(), &mut names);
             let first_id = signal_table.len();
-            for name in names {
-                push_elem(
-                    name.as_str(),
-                    *w,
-                    &mut signal_table,
-                    &mut signal_widths_vec,
-                    &mut signal_signed_vec,
-                    &mut signal_real_vec,
-                    &mut signal_name_to_id,
-                    &mut id_to_name,
-                );
+            array_nd_first_id.insert(Arc::from(base.as_str()), (first_id, shape.clone()));
+            let register_names = count <= large_array_threshold;
+            let virtual_names = register_names && is_virtual_array_base(base.as_str(), count);
+            if register_names && !virtual_names {
+                #[allow(clippy::too_many_arguments)]
+                fn emit_nd<F: FnMut(&str)>(
+                    dims: &[(i64, i64)],
+                    buf: &mut String,
+                    push: &mut F,
+                ) {
+                    if dims.is_empty() {
+                        push(buf.as_str());
+                        return;
+                    }
+                    let (lo, hi) = dims[0];
+                    let saved = buf.len();
+                    for i in lo..=hi {
+                        buf.push('[');
+                        Simulator::push_i64(buf, i);
+                        buf.push(']');
+                        emit_nd(&dims[1..], buf, push);
+                        buf.truncate(saved);
+                    }
+                }
+                elem_name_buf.clear();
+                elem_name_buf.push_str(base);
+                emit_nd(shape, &mut elem_name_buf, &mut |name| {
+                    push_elem_named(
+                        name,
+                        *w,
+                        &mut signal_table,
+                        &mut signal_widths_vec,
+                        &mut signal_signed_vec,
+                        &mut signal_real_vec,
+                        &mut signal_name_to_id,
+                        &mut id_to_name,
+                        true,
+                        &_unnamed_arc,
+                    );
+                });
+            } else {
+                signal_table.extend(std::iter::repeat_n(array_init(*w), count));
+                signal_widths_vec.extend(std::iter::repeat_n(*w, count));
+                signal_signed_vec.extend(std::iter::repeat_n(false, count));
+                signal_real_vec.extend(std::iter::repeat_n(false, count));
+                id_to_name.push_gap(count, virtual_names);
+                if virtual_names {
+                    signal_name_to_id.add_virtual_nd_array(
+                        Arc::from(base.as_str()),
+                        first_id,
+                        shape.clone(),
+                    );
+                }
             }
             if vif_vars.contains(base.as_str()) {
                 for id in first_id..signal_table.len() {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
-            // §6.11.1: element-signedness inheritance (see the 1-D / 2-D
-            // loops above).
-            if module.var_decl_types.get(base).is_some_and(|dt| {
+            if elem_dt.is_some_and(|dt| {
                 super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
                     signal_signed_vec[id] = true;
                 }
             }
-            // Element REALNESS inheritance — see the 1-D loop.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
+            if elem_dt.is_some_and(|dt| {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
@@ -3879,31 +3930,54 @@ impl Simulator {
         // parameter, §6.20.2). Deliberately after the 2-D / N-D creation
         // loops: those rebuild storage for their names, so restoring earlier
         // left a multi-dimensional parameter array zero-filled.
+        if packed_mem && packed_cells > 0 && (mem_census || crate::verbose()) {
+            eprintln!(
+                "[PACKED-MEM] arrays={} cells={} arena={:.2} MB (vs {:.2} MB unpacked)",
+                packed_arrays.len(),
+                packed_cells,
+                packed_mem_arena.bytes() as f64 / 1e6,
+                (packed_cells * (std::mem::size_of::<Value>() + 24)) as f64 / 1e6,
+            );
+        }
         for (nm, v) in array_elem_inits {
-            if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
-                signal_table[id] = v;
+            if let Some(id) = signal_name_to_id
+                .get(nm.as_str())
+                .copied()
+                .or_else(|| resolve_array_elem_id(nm.as_str(), &array_first_id))
+                .or_else(|| resolve_nd_array_elem_id(nm.as_str(), &array_nd_first_id))
+            {
+                if !is_packed_id(id) {
+                    signal_table[id] = v;
+                }
             }
         }
-        // §6.8 again for the 2-D / N-D element storage (named slots).
+        // §6.8 again for the 2-D / N-D element storage (both named and virtual/unnamed).
         for base in module.two_state_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
-            }
-            let prefix = format!("{}[", base);
-            for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+            if let Some((first_id, shape)) = array_nd_first_id.get(base.as_str()) {
+                if is_packed_id(*first_id) {
+                    continue;
+                }
+                let n = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                    acc.saturating_mul((hi - lo + 1).max(0) as usize)
+                });
+                for id in *first_id..*first_id + n {
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
         for base in module.z_init_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
-            }
-            let prefix = format!("{}[", base);
-            for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+            if let Some((first_id, shape)) = array_nd_first_id.get(base.as_str()) {
+                if is_packed_id(*first_id) {
+                    continue;
+                }
+                let n = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                    acc.saturating_mul((hi - lo + 1).max(0) as usize)
+                });
+                let net_kind = module.resolved_net_kinds.get(base.as_str());
+                for id in *first_id..*first_id + n {
+                    signal_table[id] = match net_kind {
                         Some(
                             super::elaborate::ResolvedNetKind::Tri0
                             | super::elaborate::ResolvedNetKind::Supply0,
@@ -3996,6 +4070,23 @@ impl Simulator {
                 {
                     let n = (hi - lo + 1).max(0) as usize;
                     for id in first_id..(first_id + n).min(num_signals) {
+                        signal_two_state[id] = true;
+                    }
+                }
+            }
+            for (base_name, (first_id, shape)) in array_nd_first_id.iter() {
+                if is_packed_id(*first_id) {
+                    continue;
+                }
+                let base_ref: &str = base_name.as_ref();
+                let leaf = base_ref.rsplit('.').next().unwrap_or(base_ref);
+                if module.two_state_signals.contains(base_ref)
+                    || module.two_state_signals.contains(leaf)
+                {
+                    let n = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                        acc.saturating_mul((hi - lo + 1).max(0) as usize)
+                    });
+                    for id in *first_id..(*first_id + n).min(num_signals) {
                         signal_two_state[id] = true;
                     }
                 }
@@ -4431,6 +4522,8 @@ impl Simulator {
             scope_parents_by_leaf,
             array_elem_ids: HashMap::default(),
             array_first_id,
+            large_array_threshold,
+            array_nd_first_id,
             leaf_name_to_ids,
             id_to_name,
             elem_name_cache: RefCell::new(HashMap::default()),
@@ -4591,6 +4684,10 @@ impl Simulator {
             delayed_nba: Vec::new(),
             delayed_nba_queue: Vec::new(),
             packed_nba: Vec::new(),
+            packed_wide_nba: Vec::new(),
+            packed_seg_deps: Vec::new(),
+            packed_seg_dirty: Vec::new(),
+            dirty_packed_segs: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
             timing_checks: Vec::new(),
@@ -5145,6 +5242,7 @@ impl Simulator {
             dump_dirty_epoch: 1,
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
+            vcd_packed_indices: Vec::new(),
             dump_dirty_active: false,
             dump_full: false,
             vcd_enabled: false,
@@ -5167,6 +5265,7 @@ impl Simulator {
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
             xtrace_id_to_trace: Vec::new(),
+            xtrace_packed_indices: Vec::new(),
             xtrace_prev_signals: Vec::new(),
             xtrace_real: Vec::new(),
             xtrace_string: Vec::new(),
@@ -5204,6 +5303,7 @@ impl Simulator {
             elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
+            fst_packed_indices: Vec::new(),
             fst_prev_signals: Vec::new(),
             fst_events: Vec::new(),
             fst_event_last: Vec::new(),

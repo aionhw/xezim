@@ -711,6 +711,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Memory: packed arena storage for large integral arrays (on; 0 turns it off)",
     ),
     (
+        "XEZIM_PACKED_MEM_MIN_CELLS",
+        "Memory: minimum cell count for packed arena storage (default 256)",
+    ),
+    (
         "XEZIM_PARALLEL_SERIALIZE",
         "Parallel: run edge-dispatch plans serially (default 1; 0 enables worker threads)",
     ),

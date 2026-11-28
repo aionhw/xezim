@@ -40,6 +40,28 @@ impl Simulator {
         self.signals.get(name)
     }
 
+    /// Read a signal or unpacked array cell by name, returning an owned `Value`
+    /// so `PackedMem` cells and unmaterialized array elements work uniformly.
+    pub fn get_signal_value(&self, name: &str) -> Option<Value> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(if packed_mem::is_packed_id(id) {
+                self.packed.read(id)
+            } else {
+                self.signal_table[id].clone()
+            });
+        }
+        if let Some(id) = signal_map::resolve_array_elem_id(name, &self.array_first_id)
+            .or_else(|| signal_map::resolve_nd_array_elem_id(name, &self.array_nd_first_id))
+        {
+            return Some(if packed_mem::is_packed_id(id) {
+                self.packed.read(id)
+            } else {
+                self.signal_table[id].clone()
+            });
+        }
+        self.signals.get(name).cloned()
+    }
+
     // ---- assertion + coverage accessors (for regression tests + tools) ----
 
     /// Number of distinct source positions that fired an immediate

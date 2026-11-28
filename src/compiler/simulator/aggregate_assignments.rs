@@ -562,6 +562,15 @@ impl Simulator {
                         return;
                     }
                 }
+                if (self.module.dynamic_arrays.contains(target)
+                    || self.module.arrays.contains_key(target)
+                    || self.module.arrays_2d.contains_key(target)
+                    || self.module.arrays_nd.contains_key(target))
+                    && self.assign_pattern_aggregate(target, sub)
+                {
+                    self.pattern_nba_leaves = capture;
+                    return;
+                }
                 // §10.9.2: a pattern for a packed element takes the
                 // element's type.
                 if let Some(v) = self.eval_in_packed_type(e, dt) {
@@ -6021,11 +6030,23 @@ impl Simulator {
             return false;
         }
         // For an array this is the ELEMENT type; for a scalar, its own type.
-        let Some(dt) = self.module.var_decl_types.get(base).cloned().or_else(|| {
-            // Struct-field sub-path (e.g. `info.addr`): resolve through the
-            // type system via `flat_path_type`.
-            self.flat_path_type(base).map(|(d, _)| d)
-        }) else {
+        let Some(dt) = self
+            .module
+            .var_decl_types
+            .get(base)
+            .cloned()
+            .or_else(|| {
+                self.module.dynamic_arrays.contains(base).then(|| {
+                    base.rsplit_once('[')
+                        .and_then(|(b, _)| self.module.var_decl_types.get(b).cloned())
+                })?
+            })
+            .or_else(|| {
+                // Struct-field sub-path (e.g. `info.addr`): resolve through the
+                // type system via `flat_path_type`.
+                self.flat_path_type(base).map(|(d, _)| d)
+            })
+        else {
             return false;
         };
 

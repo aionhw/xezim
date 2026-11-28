@@ -4725,6 +4725,15 @@ impl Simulator {
             reuse.clear();
             self.packed_nba = reuse;
         }
+        if !self.packed_wide_nba.is_empty() {
+            let entries = std::mem::take(&mut self.packed_wide_nba);
+            for (eid, val) in &entries {
+                self.packed_store_value(*eid, val);
+            }
+            let mut reuse = entries;
+            reuse.clear();
+            self.packed_wide_nba = reuse;
+        }
 
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
@@ -4928,6 +4937,17 @@ impl Simulator {
         }
     }
 
+    /// Queue a wide (`> 64`-bit) NBA into a packed-arena cell.
+    pub(super) fn queue_packed_wide_nba(&mut self, eid: usize, val: Value) {
+        if let Some(e) = self.packed_wide_nba.iter_mut().find(|(i, _)| *i == eid) {
+            e.1 = val;
+        } else if self.packed.read(eid) != val {
+            self.packed_wide_nba.push((eid, val));
+        } else {
+            self.prof_nba_elided += 1;
+        }
+    }
+
     /// A whole-signal update queued behind a partial one
     /// (`nba_behind_queued_partial`). Out of line, so the `nba_fast` commit
     /// loop keeps `apply_nba_entry` inlined.
@@ -4946,8 +4966,7 @@ impl Simulator {
         // Defensive landing for a packed-arena id: the per-signal table
         // indexing below cannot take one (it would index far out of bounds).
         if is_packed_id(entry.signal_id) {
-            let (v, x) = entry.value.raw_bits();
-            self.packed_store(entry.signal_id, v, x);
+            self.packed_store_value(entry.signal_id, &entry.value);
             return;
         }
         let id = entry.signal_id;

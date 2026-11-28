@@ -35,6 +35,45 @@ pub(super) fn resolve_array_elem_id(
     Some(first_id + (idx - lo) as usize)
 }
 
+/// Resolve a multi-dimensional element name `base[i0][i1]...` using `array_nd_first_id`.
+#[inline]
+pub(super) fn resolve_nd_array_elem_id(
+    name: &str,
+    array_nd_first_id: &HashMap<Arc<str>, (usize, Vec<(i64, i64)>)>,
+) -> Option<usize> {
+    if array_nd_first_id.is_empty() || name.as_bytes().last() != Some(&b']') {
+        return None;
+    }
+    let mut idxs: [i64; 8] = [0; 8];
+    let mut n = 0usize;
+    let mut end = name.len();
+    while end > 0 && name.as_bytes()[end - 1] == b']' && n < 8 {
+        let open = name[..end - 1].rfind('[')?;
+        let idx: i64 = name[open + 1..end - 1].parse().ok()?;
+        idxs[n] = idx;
+        n += 1;
+        end = open;
+        if n >= 2
+            && let Some((first_id, shape)) = array_nd_first_id.get(&name[..end])
+        {
+            if shape.len() != n {
+                return None;
+            }
+            let mut off = 0usize;
+            for (k, &(lo, hi)) in shape.iter().enumerate() {
+                let idx = idxs[n - 1 - k];
+                if idx < lo || idx > hi {
+                    return None;
+                }
+                let span = (hi - lo + 1) as usize;
+                off = off * span + (idx - lo) as usize;
+            }
+            return Some(*first_id + off);
+        }
+    }
+    None
+}
+
 #[inline(always)]
 /// Element width of a bytecode array operand, so an out-of-range or x/z-index
 /// READ can yield x at the ELEMENT width. A 1-bit x zero-extends into a wider

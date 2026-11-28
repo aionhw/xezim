@@ -975,6 +975,10 @@ pub struct Simulator {
     /// per-element Arc<str> strings) and on c910 / large-memory designs
     /// scales linearly with memory depth.
     array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
+    large_array_threshold: usize,
+    /// Compact resolver for multi-D unpacked-array elements: `base_name` →
+    /// (`first_id`, `shape`), covering both ordinary and `PackedMem` 2-D/N-D arrays.
+    array_nd_first_id: HashMap<Arc<str>, (usize, Vec<(i64, i64)>)>,
     /// Reverse index: leaf-name (last `.`-segment of a signal's full path) →
     /// signal_ids that share that leaf. Built once for the "real" signal set
     /// (excludes per-element array IDs which all end with `]`). Keeps the
@@ -1591,6 +1595,13 @@ pub struct Simulator {
     /// entries exist only between an edge exec and the same tick's NBA
     /// region. Last-write-wins by linear scan.
     packed_nba: Vec<(usize, u64, u64)>,
+    /// Wide (`> 64`-bit) NBA writes into `PackedMem` cells.
+    packed_wide_nba: Vec<(usize, Value)>,
+    /// Combinational entries reading each `PackedMem` segment (indexed by `packed_seg_idx`).
+    packed_seg_deps: Vec<Vec<u32>>,
+    /// Per-segment dirty flags & queue for waking `packed_seg_deps` readers.
+    packed_seg_dirty: Vec<bool>,
+    dirty_packed_segs: Vec<usize>,
     /// §29 per-instance UDP runtime state, indexed by `CombItem::Udp{idx}`.
     udp_runtime: Vec<UdpRuntime>,
     /// True when the design contains any UDP instance — forces the serial
@@ -3608,6 +3619,7 @@ pub struct Simulator {
     dump_dirty_epoch: u64,
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
+    vcd_packed_indices: Vec<usize>,
     dump_dirty_active: bool,
     /// A dump writer or toggle coverage is open under a forced full scan
     /// (`XEZIM_VCD_FULL=1` / `XEZIM_DUMP_FULL=1`), so `dump_dirty_active` is
@@ -3642,6 +3654,7 @@ pub struct Simulator {
     /// Signal id → `xtrace_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
     xtrace_id_to_trace: Vec<Vec<u32>>,
+    xtrace_packed_indices: Vec<usize>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
     /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
@@ -3792,6 +3805,7 @@ pub struct Simulator {
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
     fst_id_to_trace: Vec<Vec<u32>>,
+    fst_packed_indices: Vec<usize>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
     fst_prev_signals: Vec<Value>,
     /// SV event objects are pulses rather than levels, so they are kept out of

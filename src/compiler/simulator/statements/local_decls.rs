@@ -1183,6 +1183,12 @@ impl Simulator {
                     self.module
                         .var_decl_types
                         .insert(name.clone(), data_type.clone());
+                    if super::elaborate::is_type_two_state_resolved(
+                        &data_type,
+                        &self.module.typedef_types,
+                    ) {
+                        self.module.two_state_signals.insert(name.clone());
+                    }
                     if let Some(init) = &d.init {
                         self.route_decl_init_via_assign(&name, init, d.name.span);
                     }

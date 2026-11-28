@@ -1298,7 +1298,9 @@ impl Simulator {
             let mut base: &str = c;
             while let Some(p) = base.rfind('[') {
                 base = &base[..p];
-                if self.array_first_id.contains_key(base) {
+                if self.array_first_id.contains_key(base)
+                    || self.array_nd_first_id.contains_key(base)
+                {
                     return self.array_has_unnamed_cells(base);
                 }
                 if !base.ends_with(']') {
@@ -1369,18 +1371,30 @@ impl Simulator {
         let bare =
             std::iter::once(r.to_string()).chain(r.strip_prefix(top_prefix).map(str::to_string));
         for cand in qualified.chain(bare) {
-            let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str()) else {
-                continue;
-            };
-            if is_packed_id(first_id) {
-                return Some(None);
+            if let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str()) {
+                if is_packed_id(first_id) {
+                    return Some(None);
+                }
+                let count = (hi - lo + 1).max(0) as usize;
+                return Some(Some(
+                    (first_id..first_id + count)
+                        .filter(|&id| id < self.signal_table.len())
+                        .collect(),
+                ));
             }
-            let count = (hi - lo + 1).max(0) as usize;
-            return Some(Some(
-                (first_id..first_id + count)
-                    .filter(|&id| id < self.signal_table.len())
-                    .collect(),
-            ));
+            if let Some((first_id, shape)) = self.array_nd_first_id.get(cand.as_str()) {
+                if is_packed_id(*first_id) {
+                    return Some(None);
+                }
+                let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                    acc.saturating_mul((hi - lo + 1).max(0) as usize)
+                });
+                return Some(Some(
+                    (*first_id..*first_id + count)
+                        .filter(|&id| id < self.signal_table.len())
+                        .collect(),
+                ));
+            }
         }
         None
     }
@@ -3508,22 +3522,36 @@ impl Simulator {
         if self.signal_name_to_id.contains_key(name) {
             return false;
         }
-        if resolve_array_elem_id(name, &self.array_first_id).is_some() {
+        if resolve_array_elem_id(name, &self.array_first_id).is_some()
+            || resolve_nd_array_elem_id(name, &self.array_nd_first_id).is_some()
+        {
             return true;
         }
         s.value_of.is_some() && self.array_has_unnamed_cells(name)
     }
 
-    /// Are the cells of the 1-D array `base` stored without names (in the
-    /// packed arena, or as an unnamed bulk array)?
+    /// Are the cells of the 1-D / 2-D / N-D array `base` stored without names
+    /// (in the packed arena, or as an unnamed bulk array)?
     pub(super) fn array_has_unnamed_cells(&self, base: &str) -> bool {
-        let Some(&(first, lo, _)) = self.array_first_id.get(base) else {
-            return false;
-        };
-        is_packed_id(first)
-            || !self
-                .signal_name_to_id
-                .contains_key(format!("{}[{}]", base, lo).as_str())
+        if let Some(&(first, lo, _)) = self.array_first_id.get(base) {
+            return is_packed_id(first)
+                || !self
+                    .signal_name_to_id
+                    .contains_key(format!("{}[{}]", base, lo).as_str());
+        }
+        if let Some((first, shape)) = self.array_nd_first_id.get(base) {
+            if is_packed_id(*first) {
+                return true;
+            }
+            let mut probe = String::from(base);
+            for &(lo, _) in shape {
+                probe.push('[');
+                Self::push_i64(&mut probe, lo);
+                probe.push(']');
+            }
+            return !self.signal_name_to_id.contains_key(probe.as_str());
+        }
+        false
     }
 
     fn event_struct_collection(&self, name: &str) -> bool {
@@ -4901,18 +4929,23 @@ impl Simulator {
     #[inline]
     pub(super) fn term_raw_bits(&self, id: usize) -> (u64, u64) {
         if is_packed_id(id) {
-            let (v, x, _) = self.packed.raw(id);
-            (v, x)
+            if self.packed.is_wide(id) {
+                self.packed.read(id).raw_bits()
+            } else {
+                let (v, x, _) = self.packed.raw(id);
+                (v, x)
+            }
         } else {
             self.signal_table[id].raw_bits()
         }
     }
 
-    /// The full value of a waiter term wider than 64 bits (arena cells are
-    /// at most 64 bits wide).
+    /// The full value of a waiter term wider than 64 bits.
     #[inline]
     pub(super) fn term_wide_value(&self, id: usize) -> Option<Value> {
-        if !is_packed_id(id) && self.signal_widths[id] > 64 {
+        if is_packed_id(id) {
+            self.packed.is_wide(id).then(|| self.packed.read(id))
+        } else if self.signal_widths[id] > 64 {
             Some(self.signal_table[id].clone())
         } else {
             None
@@ -4936,6 +4969,16 @@ impl Simulator {
             sid.edge
         };
         if is_packed_id(sid.signal_id) {
+            if self.packed.is_wide(sid.signal_id) {
+                let cur = self.packed.read(sid.signal_id);
+                if matches!(edge, EdgeKind::AnyEdge)
+                    && let Some(prev) = pw
+                {
+                    return cur != *prev;
+                }
+                let (cv, cx) = cur.raw_bits();
+                return lsb_edge_fires(edge, pv, px, cv, cx);
+            }
             let (cv, cx) = self.term_raw_bits(sid.signal_id);
             return lsb_edge_fires(edge, pv, px, cv, cx);
         }
