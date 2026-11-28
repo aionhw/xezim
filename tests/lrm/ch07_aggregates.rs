@@ -98,10 +98,6 @@ fn c7_2_struct_2state_member_default() {
 #[test]
 fn c7_aggregates() {
     // Not compared: element order of unique()/unique_index() (left unspecified by §7.12.1).
-    // Known gap (§7.4.6): `7.4.6a` reference `0`, xezim `x`
-    // Known gap (§7.8): `7.8o` reference `-1 -5`, xezim `1 -5`
-    // Known gap (§7.12.3): `7.12.3f` reference `x`, xezim `3`
-    // Known gap (§7.12.3): `7.12.3i` reference `10`, xezim `0`
     check(
         "c07_agg",
         include_str!("sv/c07_agg.sv"),
@@ -132,6 +128,7 @@ fn c7_aggregates() {
             "T|7.4.2c|'{'h1, 'h2, 'h3, 'h4}",
             "T|7.4.5a|6 1 '{'{1, 2, 3}, '{4, 5, 6}}",
             "T|7.4.5b|dc 1",
+            "T|7.4.6a|0",
             "T|7.4.6b|'{'hee, 'hee, 'hee, 'hee}",
             "T|7.4.6c|xx",
             "T|7.4.3|2 3",
@@ -159,6 +156,7 @@ fn c7_aggregates() {
             "T|7.8l|'{-5:1, 3:3, 10:2}",
             "T|7.8m|-5",
             "T|7.8n|'{1:2, 15:1}",
+            "T|7.8o|-1 -5",
             "T|7.8p|2",
             "T|7.8q|1 -1",
             "T|7.8r|0",
@@ -200,20 +198,74 @@ fn c7_aggregates() {
             "T|7.12.3c|0",
             "T|7.12.3d|2",
             "T|7.12.3e|44 300",
+            "T|7.12.3f|x",
             "T|7.12.3g|7",
             "T|7.12.3h|0 '{}",
             "T|7.12.2f|2 3 1",
+            "T|7.12.3i|10",
             "T|7.12.4|'{}",
             "T|7.12.1m|32",
         ],
+        &["T|7.12.1i|", "T|7.12.1j|"],
+    );
+}
+
+/// IEEE 1800-2023 §7.4.6, §7.9.8 and §7.12.3.
+#[test]
+fn c7_array_reads_traversal_and_nested_reductions() {
+    check(
+        "c07_array_reads_traversal_and_nested_reductions",
+        r#"
+module top;
+  int a[2][3], b[2][2][2], dict[int];
+  integer four[2][3];
+  logic [7:0] rows[2][2];
+  logic [3:0] xz[3];
+  logic [255:0] wide[2];
+  logic unknown;
+  int negative, result;
+  byte key;
+  initial begin
+    negative = -1;
+    unknown = 1'bx;
+    a[0][0] = 77;
+    b[0][0][0] = 88;
+    $display("T|reads|%0d %0d %0d %0d %0d",
+             a[negative][0], a[0][negative], b[unknown][0][0], b[0][0][0],
+             $isunknown(four[negative][0]));
+    dict[-5] = 1;
+    dict[260] = 2;
+    result = dict.first(key); $display("T|first|%0d %0d", result, key);
+    result = dict.next(key);  $display("T|next|%0d %0d", result, key);
+    result = dict.prev(key);  $display("T|prev|%0d %0d", result, key);
+    result = dict.prev(key);  $display("T|miss|%0d %0d", result, key);
+    result = dict.last(key);  $display("T|last|%0d %0d", result, key);
+    xz = '{4'h1, 4'hx, 4'h2};
+    $display("T|xz|%0d %0d %0d %b", $isunknown(xz.sum()),
+             $isunknown(xz.product()), $isunknown(xz.sum with (item)),
+             xz.or with (item));
+    wide = '{256'h1 << 160, 256'h1};
+    $display("T|wide|%0d", wide.sum() == ((256'h1 << 160) | 256'h1));
+    rows = '{'{5, 10}, '{15, 20}};
+    $display("T|rows|%0d %0d %0d", rows.sum with (item.sum),
+             rows.sum(r) with (r.sum()), rows.sum with (item.sum with (item)));
+  end
+endmodule
+"#,
+        "top",
+        Order::Exact,
         &[
-            "T|7.12.1i|",
-            "T|7.12.1j|",
-            "T|7.4.6a|",
-            "T|7.8o|",
-            "T|7.12.3f|",
-            "T|7.12.3i|",
+            "T|reads|0 0 0 88 1",
+            "T|first|-1 -5",
+            "T|next|-1 4",
+            "T|prev|-1 -5",
+            "T|miss|0 -5",
+            "T|last|-1 4",
+            "T|xz|1 1 1 xx11",
+            "T|wide|1",
+            "T|rows|50 50 50",
         ],
+        &[],
     );
 }
 
