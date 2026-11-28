@@ -1761,6 +1761,39 @@ impl Simulator {
         self.set_queue_size(dst, picks.len() as u64);
     }
 
+    /// §7.12.1: a locator used inside an expression owns its result only
+    /// until that expression consumes it. A unique key allows nested calls.
+    pub(super) fn materialize_locator_temp(
+        &mut self,
+        arr: &str,
+        method: &str,
+        picks: &LocatorPicks,
+    ) -> String {
+        let tmp = format!("@locator#{}", self.next_dyn_id);
+        self.next_dyn_id += 1;
+        self.materialize_locator(&tmp, arr, method, picks);
+        if !method.ends_with("_index") {
+            let mut rows = Vec::new();
+            if let Some(su) = self.queue_elem_struct(arr) {
+                let members = self.struct_coll_suffixes(&su);
+                for i in 0..picks.len() {
+                    rows.extend(members.iter().map(|member| format!("{tmp}[{i}].{member}")));
+                }
+            } else {
+                for i in 0..picks.len() {
+                    let row = format!("{tmp}[{i}]");
+                    if self.module.associative_arrays.contains_key(&row) {
+                        rows.push(row);
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                self.local_coll_elems.insert(tmp.clone(), rows);
+            }
+        }
+        tmp
+    }
+
     /// Will `sort_with` order by the STRING text of each element's key?
     /// `expr_is_string_valued`/`call_returns_string` resolve loop-locals only
     /// when their declared type is on record, but a `q.sort with (item.f)` /

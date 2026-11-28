@@ -4684,13 +4684,16 @@ impl Simulator {
                         ExprKind::Call { func, .. } => &**func,
                         _ => &**expr,
                     };
-                    if let Some((tmp, method)) = self.locator_result_temp(call)
-                        && matches!(
+                    if let Some((tmp, method)) = self.locator_result_temp(call) {
+                        let result = matches!(
                             method,
                             "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
                         )
-                    {
-                        return self.reduce_with(&tmp, method, filter, iter_name.as_deref());
+                        .then(|| self.reduce_with(&tmp, method, filter, iter_name.as_deref()));
+                        self.cleanup_dyn_storage(&tmp);
+                        if let Some(result) = result {
+                            return result;
+                        }
                     }
                 }
                 {

@@ -122,9 +122,8 @@ impl Simulator {
             _ => return None,
         };
         let (arr, lm, filter, iter) = self.locator_call(recv)?;
-        let tmp = format!("__xz_locator_{:p}", func);
         let picks = self.locator_indices_named(&arr, &lm, filter.as_ref(), iter.as_deref());
-        self.materialize_locator(&tmp, &arr, &lm, &picks);
+        let tmp = self.materialize_locator_temp(&arr, &lm, &picks);
         Some((tmp, mname))
     }
 
@@ -208,10 +207,12 @@ impl Simulator {
             }
         }
         // §7.12.1, §7.10.2: a method on a locator call's result queue.
-        if let Some((tmp, mname)) = self.locator_result_temp(func)
-            && let Some(v) = self.eval_builtin_method(&tmp, mname, args)
-        {
-            return v;
+        if let Some((tmp, mname)) = self.locator_result_temp(func) {
+            let value = self.eval_builtin_method(&tmp, mname, args);
+            self.cleanup_dyn_storage(&tmp);
+            if let Some(value) = value {
+                return value;
+            }
         }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`

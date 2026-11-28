@@ -3632,6 +3632,7 @@ impl Simulator {
     }
 
     pub(super) fn set_queue_size(&mut self, obj_name: &str, size: u64) {
+        let requested = size;
         // §7.10.5: an assignment or method drops elements above the bound.
         let size = if let Some(&max) = self.module.queue_max_sizes.get(obj_name)
             && size > u64::from(max)
@@ -3651,10 +3652,33 @@ impl Simulator {
         note_store_write(name_bit(leaf));
         note_store_write(name_bit(obj_name));
         let key = Self::name_with_suffix(obj_name, ".size");
+        let size_id = self.signal_name_to_id.get(key.as_str()).copied();
+        let old_size = self
+            .signals
+            .get(&key)
+            .or_else(|| size_id.map(|id| &self.signal_table[id]))
+            .and_then(Value::to_u64)
+            .unwrap_or(0);
+        // §7.5.1, §7.10.2: deleted elements cease to own their values. Some
+        // design-scope sequences also have preallocated table cells.
+        let end = old_size.max(requested);
+        if size < end {
+            self.signals.truncate_sequence(obj_name, size);
+            if let Some(&(first, 0, hi)) = self.array_first_id.get(obj_name)
+                && !is_packed_id(first)
+                && hi >= 0
+            {
+                for index in size..end.min(hi as u64 + 1) {
+                    let id = first + index as usize;
+                    let value = Value::zero(self.signal_widths[id].max(1));
+                    self.store_named_cell(id, value);
+                }
+            }
+        }
         // The `.size` signal is the queue's comb-dependency proxy (see
         // Simulator::new): route through the table write so a size change
         // marks it dirty and re-fires comb readers of `q.size()` / `q[i]`.
-        if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
+        if let Some(id) = size_id {
             // Compare at the slot's declared (signed) type, as `write_sig!`
             // stores it, so an unchanged size is not seen as a change.
             let mut v = Value::from_u64(size, 32);
@@ -4976,6 +5000,9 @@ impl Simulator {
             self.signals.remove(&k);
             self.widths.remove(&k);
             self.signed_signals.remove(&k);
+            self.real_signals.remove(&k);
+            self.module.two_state_signals.remove(&k);
+            self.active_union_tag.remove(&k);
         }
         if has_size {
             self.signals.remove(&size_key);
@@ -4983,17 +5010,33 @@ impl Simulator {
         }
         if self.dynamic_assoc_dims.contains_key(key) {
             self.clear_dynamic_assoc_rows(key, 0);
-            self.dynamic_assoc_dims.remove(key);
         }
+        if let Some(elems) = self.local_coll_elems.remove(key) {
+            for en in elems {
+                self.signals.truncate_sequence(&en, 0);
+                let row_size = Self::name_with_suffix(&en, ".size");
+                self.signals.remove(&row_size);
+                self.widths.remove(&row_size);
+                self.remove_local_collection_metadata(&en);
+            }
+        }
+        self.remove_local_collection_metadata(key);
+        self.dyn_key_scratch = size_key;
+    }
+
+    /// Drop the metadata anchored at a private local collection or row.
+    fn remove_local_collection_metadata(&mut self, key: &str) {
         self.module.dynamic_arrays.remove(key);
         self.module.arrays.remove(key);
         self.module.arrays_2d.remove(key);
         self.module.arrays_nd.remove(key);
         self.module.associative_arrays.remove(key);
-        if !self.local_coll_shapes.is_empty() {
-            self.local_coll_shapes.remove(key);
-        }
+        self.local_coll_shapes.remove(key);
         self.module.assoc_index_widths.remove(key);
+        self.module.assoc_elem_widths.remove(key);
+        self.module.assoc_key_type_names.remove(key);
+        self.module.assoc_defaults.remove(key);
+        self.class_assoc_defaults.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.queue_vars.remove(key);
         self.module.unpacked_decl_dims.remove(key);
@@ -5003,27 +5046,16 @@ impl Simulator {
         self.module.packed_signal_elem_widths.remove(key);
         self.module.packed_struct_fields.remove(key);
         self.module.array_elem_class.remove(key);
-        if !self.local_coll_elems.is_empty()
-            && let Some(elems) = self.local_coll_elems.remove(key)
-        {
-            for en in elems {
-                for k in self.signals.keys_with_elem_prefix(&format!("{}[", en)) {
-                    self.signals.remove(&k);
-                }
-                self.signals.remove(&format!("{}.size", en));
-                self.module.associative_arrays.remove(&en);
-                self.module.assoc_index_widths.remove(&en);
-                self.module.assoc_key_type_names.remove(&en);
-                self.module.assoc_elem_widths.remove(&en);
-                self.module.dynamic_arrays.remove(&en);
-                self.module.arrays.remove(&en);
-            }
-        }
-        self.signals.remove(&size_key);
+        self.module.struct_members.remove(key);
+        self.dynamic_assoc_dims.remove(key);
+        self.assoc_elem_colls.remove(key);
+        self.active_union_tag.remove(key);
         self.widths.remove(key);
         self.string_signals.remove(key);
         self.signed_signals.remove(key);
-        self.dyn_key_scratch = size_key;
+        self.real_signals.remove(key);
+        self.module.string_signals.remove(key);
+        self.module.two_state_signals.remove(key);
     }
 
     /// Caller-frame state for a queue/dynamic-array LOCAL that a nested call

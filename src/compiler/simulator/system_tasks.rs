@@ -2899,8 +2899,8 @@ impl Simulator {
                                         filter.as_ref(),
                                         iter_name.as_deref(),
                                     );
-                                    const TMP: &str = "__xz_locator_fmt";
-                                    self.materialize_locator(TMP, &arr_name, &mname, &idxs);
+                                    let tmp =
+                                        self.materialize_locator_temp(&arr_name, &mname, &idxs);
                                     // An `_index` form yields indices: strings
                                     // only for a string-keyed array.
                                     let is_str = if mname.ends_with("_index") {
@@ -2931,7 +2931,7 @@ impl Simulator {
                                     let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
                                     for i in 0..idxs.len() {
                                         if let Some(v) = self
-                                            .get_signal_value_by_name(&format!("{}[{}]", TMP, i))
+                                            .get_signal_value_by_name(&format!("{}[{}]", tmp, i))
                                         {
                                             let label =
                                                 members.and_then(|m| Self::enum_label(m, &v));
@@ -2940,6 +2940,7 @@ impl Simulator {
                                             }));
                                         }
                                     }
+                                    self.cleanup_dyn_storage(&tmp);
                                     result.push_str(&format!("'{{{}}}", parts.join(", ")));
                                     continue;
                                 }

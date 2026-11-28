@@ -357,6 +357,59 @@ impl SignalMap {
             .map(|(name, run)| (name.as_str(), run.start, &run.items))
     }
 
+    /// Discard the dense suffix starting at `keep` without spelling its keys.
+    pub(super) fn truncate_elem_run(&mut self, name: &str, keep: u64) {
+        let Some(run) = self.runs.get_mut(name) else {
+            return;
+        };
+        let len = run.items.len();
+        let retained = keep.saturating_sub(run.start).min(len as u64) as usize;
+        if retained == len {
+            return;
+        }
+        note_store_write(signal_key_bits(name));
+        run.items.truncate(retained);
+        self.run_keys -= len - retained;
+        self.drop_idle_run(name);
+        self.stamp_base(Self::outer_of(name));
+    }
+
+    /// Drop the elements and any member or row storage beyond a sequence's
+    /// retained prefix (§7.5.1, §7.10.2).
+    pub(super) fn truncate_sequence(&mut self, name: &str, keep: u64) {
+        self.truncate_elem_run(name, keep);
+        let outside = |key: &str| {
+            key.strip_prefix(name)
+                .and_then(|tail| tail.strip_prefix('['))
+                .and_then(|tail| tail.split_once(']'))
+                .and_then(|(index, _)| index.parse::<u64>().ok())
+                .is_some_and(|index| index >= keep)
+        };
+        let outer = Self::outer_of(name);
+        let keys: Vec<_> = self
+            .elems
+            .get(outer)
+            .into_iter()
+            .flatten()
+            .filter(|key| outside(key))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+        let rows: Vec<_> = self
+            .nested_runs
+            .get(outer)
+            .into_iter()
+            .flatten()
+            .filter(|row| outside(row))
+            .cloned()
+            .collect();
+        for row in rows {
+            self.truncate_elem_run(&row, 0);
+        }
+    }
+
     /// Every stored key, in no particular order.
     pub fn keys(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
         self.iter().map(|(k, _)| k)

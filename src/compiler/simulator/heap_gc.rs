@@ -233,9 +233,9 @@ impl Simulator {
                 trace.trace(&(name, value))?;
             }
         }
-        for (name, first, values) in self.signals.elem_runs() {
+        for (name, _, values) in self.signals.elem_runs() {
             if Self::class_storage_owner(name).is_none() {
-                trace.elem_keys(name, first, values.len());
+                trace.elem_run_base(name);
                 for value in values {
                     trace.trace(value)?;
                 }
@@ -379,9 +379,9 @@ impl Simulator {
         }
         // The elements `name[first]`, `name[first + 1]`, ... of a queue or
         // dynamic array, traced as the keyed entries above are.
-        for (name, first, values) in self.signals.elem_runs() {
+        for (name, _, values) in self.signals.elem_runs() {
             if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
-                edge_trace.elem_keys(name, first, values.len());
+                edge_trace.elem_run_base(name);
                 // `name[i]` names the same property as `name` does.
                 let (_, property) = name.split_once('#').unwrap();
                 if !self.class_property_has_no_handles(owner, property) {
@@ -394,7 +394,7 @@ impl Simulator {
                     edges.entry(owner).or_default().extend(found);
                 }
             } else {
-                roots.elem_keys(name, first, values.len());
+                roots.elem_run_base(name);
                 for value in values {
                     roots.trace(value)?;
                 }
@@ -477,12 +477,23 @@ impl Simulator {
         // through DerefMut would leave dangling names in that index.
         let names: Vec<String> = self
             .signals
-            .keys()
-            .filter(|n| dead_name(n))
-            .map(|n| n.into_owned())
+            .map_entries()
+            .map(|(name, _)| name)
+            .filter(|name| dead_name(name))
+            .cloned()
             .collect();
         for name in names {
             self.signals.remove(&name);
+        }
+        let runs: Vec<_> = self
+            .signals
+            .elem_runs()
+            .map(|(name, _, _)| name)
+            .filter(|name| dead_name(name))
+            .map(str::to_owned)
+            .collect();
+        for name in runs {
+            self.signals.truncate_elem_run(&name, 0);
         }
         macro_rules! module_maps {
             ($($field:ident),* $(,)?) => { $(self.module.$field.retain(|name, _| !dead_name(name));)* };
@@ -531,7 +542,9 @@ impl Simulator {
             var_type_args,
             class_assoc_defaults,
             dynamic_assoc_dims,
+            local_coll_shapes,
             local_coll_elems,
+            active_union_tag,
             static_struct_holders,
             rand_ranges,
             rand_elem_ranges

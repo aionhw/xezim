@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Release discarded queue and dynamic-array elements, expression-local array
+  locator results, and private collection metadata when their lifetime ends
+  (§6.21, §7.5.1, §7.10.2, §7.12.1, §8.7, #1667).
+
 - Keep named process-block locals distinct across eagerly elaborated generate
   scopes, and preserve `foreach` indices across timing controls
   (§6.21, §12.7.3, §27.4, #1651).
@@ -251,6 +255,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the extends clause (§6.18, §8.13, §8.25, §13.5.1).
 
 **Performance**
+
+- Trace dense collections without treating positional indices as class handles,
+  and release dead objects' dense storage without formatting element keys
+  (§8.7, #1667).
 
 - Compile dotted collection method calls using the owning object's handle,
   including through another object's property or a method argument

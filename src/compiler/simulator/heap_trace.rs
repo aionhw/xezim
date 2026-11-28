@@ -86,24 +86,19 @@ impl HandleTrace {
     pub fn trace<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), TraceError> {
         value.serialize(&mut *self)
     }
-    /// Trace the keys `name[first]` .. `name[first + count - 1]`, as tracing
-    /// each key's text does, without spelling the keys out.
-    pub fn elem_keys(&mut self, name: &str, first: u64, count: usize) {
-        if count == 0 {
-            return;
-        }
+    /// Trace the base of a positional run. Its implicit indices are offsets
+    /// in a fixed array, queue or dynamic array (§7.4, §7.5, §7.10).
+    /// Explicit keys, including class-handle associative keys, are traced
+    /// separately through the ordinary keyed store.
+    pub fn elem_run_base(&mut self, name: &str) {
         if let Some(rest) = name.strip_prefix("\u{2}inst")
             && let Some((owner, _)) = rest.split_once('#')
             && let Ok(handle) = owner.parse::<u64>()
         {
             self.candidate(handle);
         }
-        // A key with a bracket is no number in any radix; its pieces are
-        // the name's and the index.
+        // A nested run's base can itself contain an associative key.
         self.text_pieces(name);
-        for i in first..first + count as u64 {
-            self.candidate(i);
-        }
     }
     fn text_pieces(&mut self, text: &str) {
         for piece in text.split(['.', '[', ']', ':']) {
