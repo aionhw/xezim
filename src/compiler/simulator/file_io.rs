@@ -339,6 +339,31 @@ impl Simulator {
         self.scan_format(&mut ScanInput::Text(src.chars().peekable()), fmt, outs)
     }
 
+    fn scale_scanned_time(&self, raw: f64) -> f64 {
+        use super::elaborate::{round_time_units, scale_pow10};
+
+        if !raw.is_finite() {
+            return raw;
+        }
+        let (tf_units, tf_prec) = self.time_format.as_ref().map_or_else(
+            || (Self::secs_to_exp(self.tick_s), 0),
+            |&(units, prec, _, _)| (units, prec),
+        );
+        let (scope_unit_exp, _) = self.current_timescale_exp();
+        let shift = tf_units.saturating_sub(scope_unit_exp);
+        // Round in $timeformat units before converting to the scope's time
+        // unit (Tables 20-3 and 21-7). Skip overflowing intermediate counts.
+        if let Ok(prec) = i32::try_from(tf_prec)
+            && prec <= 308
+        {
+            let scaled = scale_pow10(raw, prec);
+            if scaled.is_finite() {
+                return scale_pow10(round_time_units(scaled), shift.saturating_sub(prec));
+            }
+        }
+        scale_pow10(raw, shift)
+    }
+
     fn scan_format(&mut self, input: &mut ScanInput<'_>, fmt: &str, outs: &[Expression]) -> i64 {
         let mut assigned = 0usize;
         let mut completed_conversion = false;
@@ -383,7 +408,7 @@ impl Simulator {
                         }
                         Value::from_string(&text)
                     }
-                    'f' | 'e' | 'g' => {
+                    'f' | 'e' | 'g' | 't' | 'T' => {
                         // Table 21-7 (§21.3.4.3): a sign may start the field or
                         // follow the exponent marker. A point belongs to the
                         // mantissa, and each part must contain digits.
@@ -430,6 +455,11 @@ impl Simulator {
                         }
                         let Ok(value) = text.parse::<f64>() else {
                             break;
+                        };
+                        let value = if matches!(spec, 't' | 'T') {
+                            self.scale_scanned_time(value)
+                        } else {
+                            value
                         };
                         Value::from_f64(value)
                     }
