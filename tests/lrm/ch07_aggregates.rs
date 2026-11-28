@@ -9,32 +9,36 @@ use crate::harness::{Order, check};
 // §7.10: Bounded queues (int q[$:3])
 #[test]
 fn c7_10_bounded_queue() {
-    // Known gap (§7.10): `r2` reference `'{1, 2, 3, 4} 4`, xezim `'{1, 2, 3, 4, 5, 6} 6`
-    // Known gap (§7.10): `r3` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
-    // Known gap (§7.10): `r4` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
     check(
         "7.10_bounded_queue",
         include_str!("sv/7.10_bounded_queue.sv"),
         "rq",
         Order::Exact,
-        &["T|r1|'{}"],
-        &["T|r2|", "T|r3|", "T|r4|"],
+        &[
+            "T|r1|'{}",
+            "T|r2|'{1, 2, 3, 4} 4",
+            "T|r3|'{1, 2, 3, 4}",
+            "T|r4|'{0, 1, 2, 3}",
+        ],
+        &[],
     );
 }
 
 // §7.10: Queue slice with reversed bounds q[3:1]
 #[test]
 fn c7_10_queue_slice_bounds() {
-    // Known gap (§7.10): `r2` reference `'{1, 2, 3, 4} 4`, xezim `'{1, 2, 3, 4, 5, 6} 6`
-    // Known gap (§7.10): `r3` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
-    // Known gap (§7.10): `r4` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
     check(
         "7.10_queue_slice_bounds",
         include_str!("sv/7.10_queue_slice_bounds.sv"),
         "rq",
         Order::Exact,
-        &["T|r1|'{}"],
-        &["T|r2|", "T|r3|", "T|r4|"],
+        &[
+            "T|r1|'{}",
+            "T|r2|'{1, 2, 3, 4} 4",
+            "T|r3|'{1, 2, 3, 4}",
+            "T|r4|'{0, 1, 2, 3}",
+        ],
+        &[],
     );
 }
 
@@ -95,12 +99,7 @@ fn c7_2_struct_2state_member_default() {
 fn c7_aggregates() {
     // Not compared: element order of unique()/unique_index() (left unspecified by §7.12.1).
     // Known gap (§7.4.6): `7.4.6a` reference `0`, xezim `x`
-    // Known gap (§7.5): `7.5f` reference `'{'{0, 0, 0}, '{9}}`, xezim `'{0, 9}`
-    // Known gap (§7.8): `7.8h` reference `next-of-nonexist=c`, xezim `next-of-nonexist=bb`
     // Known gap (§7.8): `7.8o` reference `-1 -5`, xezim `1 -5`
-    // Known gap (§7.10): `7.10l` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
-    // Known gap (§7.10): `7.10m` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
-    // Known gap (§7.10): `7.10n` reference `'{1, 2, 3, 4}`, xezim `'{1, 2, 3, 4, 5, 6}`
     // Known gap (§7.12.3): `7.12.3f` reference `x`, xezim `3`
     // Known gap (§7.12.3): `7.12.3i` reference `10`, xezim `0`
     check(
@@ -142,6 +141,7 @@ fn c7_aggregates() {
             "T|7.5.3|0",
             "T|7.5d|'{4, 5}",
             "T|7.5e|0",
+            "T|7.5f|'{'{0, 0, 0}, '{9}}",
             "T|7.6a|'{1, 2, 3} '{99, 2, 3} 99",
             "T|7.6b|'{7, 8, 9}",
             "T|7.6c|'{7, 8, 9}",
@@ -152,6 +152,7 @@ fn c7_aggregates() {
             "T|7.8e|last=c",
             "T|7.8f|prev=b",
             "T|7.8g|next-of-last=0",
+            "T|7.8h|next-of-nonexist=c",
             r#"T|7.8i|'{"a":1, "c":3}"#,
             "T|7.8j|nonexist=0",
             "T|7.8k|num=2",
@@ -174,6 +175,9 @@ fn c7_aggregates() {
             "T|7.10i|'{1, 2, 10, 3, 4, 5, 77}",
             "T|7.10j|'{1, 2, 10, 3, 4, 5, 77}",
             "T|7.10k|0 0",
+            "T|7.10l|'{1, 2, 3, 4}",
+            "T|7.10m|'{1, 2, 3, 4}",
+            "T|7.10n|'{0, 1, 2, 3}",
             "T|7.10o|'{3, 1, 2, 4}",
             r#"T|7.10p|'{"a", "b"}"#,
             "T|7.12.1a|'{5, 8}",
@@ -206,12 +210,7 @@ fn c7_aggregates() {
             "T|7.12.1i|",
             "T|7.12.1j|",
             "T|7.4.6a|",
-            "T|7.5f|",
-            "T|7.8h|",
             "T|7.8o|",
-            "T|7.10l|",
-            "T|7.10m|",
-            "T|7.10n|",
             "T|7.12.3f|",
             "T|7.12.3i|",
         ],
@@ -221,15 +220,6 @@ fn c7_aggregates() {
 // §7.3.1, §7.4.6: packed unions, out-of-range array reads, nested containers
 #[test]
 fn c7_aggregates_more() {
-    // Known gap (§7.10): `7.10r` reference `'{'{1, 2}, '{3, 4}} 2`, xezim `'{2, 3} 1`
-    // Known gap (§7.5): `7.5g` reference `'{'{0}, '{0, 9}}`, xezim `'{0, 0}`
-    // Known gap (§7.8): `7.8v` reference `'{5:'{1, 2}, 7:'{3} } 2`, xezim `'{5:x, 7:3 } 2`
-    // Known gap (§7.4.5): `7.4.5d` reference `ab`, xezim `xx`
-    // Known gap (§7.12.1): `7.12.1o` reference `'{"x", "z"}`, xezim `'{}`
-    // Known gap (§7.12.1): `7.12.1p` reference `'{1}`, xezim `'{}`
-    // Known gap (§7.12.1): `7.12.1q` reference `2`, xezim `0`
-    // Known gap (§7.12.1): `7.12.1r` reference `'{1}`, xezim `'{}`
-    // Known gap (§7.10): `7.10v` reference `'{1, 2}`, xezim `'{1, 2, 3}`
     check(
         "c07_more",
         include_str!("sv/c07_more.sv"),
@@ -245,12 +235,21 @@ fn c7_aggregates_more() {
             "T|7.10q|10 two 2",
             "T|7.8u|6 five",
             "T|7.12.1n|1 10",
+            "T|7.10r|'{'{1, 2}, '{3, 4}} 2",
+            "T|7.5g|'{'{0}, '{0, 9}}",
+            "T|7.8v|'{5:'{1, 2}, 7:'{3}} 2",
             "T|7.4.5c|ab 4 192",
+            "T|7.4.5d|ab",
             "T|7.4.6d|'{2, 3}",
+            r#"T|7.12.1o|'{"x", "z"}"#,
+            "T|7.12.1p|'{1}",
+            "T|7.12.1q|2",
+            "T|7.12.1r|'{1}",
             r#"T|7.8w|'{"a":2, "b":1}"#,
             "T|7.10s|'{1, 3, 4}",
             "T|7.10t|'{3}",
             "T|7.10u|'{1, 2}",
+            "T|7.10v|'{1, 2}",
             r#"T|7.12.2g|'{"apple", "fig", "pear"}"#,
             r#"T|7.12.2h|'{"pear", "fig", "apple"}"#,
             "T|7.12.2i|'{3, 2, 1}",
@@ -263,17 +262,7 @@ fn c7_aggregates_more() {
             "T|7.2.3|1",
             "T|7.2.1k|-1 0",
         ],
-        &[
-            "T|7.10r|",
-            "T|7.5g|",
-            "T|7.8v|",
-            "T|7.4.5d|",
-            "T|7.12.1o|",
-            "T|7.12.1p|",
-            "T|7.12.1q|",
-            "T|7.12.1r|",
-            "T|7.10v|",
-        ],
+        &[],
     );
 }
 

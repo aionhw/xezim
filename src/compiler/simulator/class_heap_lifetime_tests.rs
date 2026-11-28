@@ -413,3 +413,118 @@ fn incremental_collection_tracks_survivors_across_runs() {
         .collect();
     assert_eq!(ids, vec![1, 8], "node 7 must be reclaimed, 1 and 8 kept");
 }
+
+/// §7.5.1, §7.10.2, §7.12.1, §8.7 (#1667): removed elements and
+/// locator temporaries no longer keep their class handles reachable.
+#[test]
+fn sequence_shrinks_and_locator_temps_release_handles() {
+    let source = r#"
+class Item;
+  int id = 9917;
+endclass
+module top;
+  Item h, keep;
+  Item pop_q[$], del_q[$], locator_q[$], da[];
+  initial begin
+    da = new[256];
+    for (int i = 0; i < 256; i++) begin
+      h = new;
+      pop_q.push_back(h);
+      del_q.push_back(h);
+      locator_q.push_back(h);
+      da[i] = h;
+    end
+    keep = h; h = null;
+    if (locator_q.unique().size() != 256) $fatal(1, "locator size");
+    $display("locator: %p", locator_q.find_first with (item != null));
+    repeat (256) begin
+      h = pop_q.pop_back(); h = null;
+      h = locator_q.pop_front(); h = null;
+    end
+    del_q.delete();
+    da = new[0](da);
+    if (keep.id != 9917 || pop_q.size() != 0 || del_q.size() != 0 ||
+        locator_q.size() != 0 || da.size() != 0) $fatal(1, "live handle or size");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("collection fixture");
+    assert_eq!(sim.error_count, 0);
+    for name in ["pop_q", "del_q", "locator_q", "da"] {
+        assert!(
+            sim.signals.elem_keys(name).is_empty(),
+            "stale {name} values"
+        );
+    }
+    assert!(
+        !sim.signals
+            .keys()
+            .any(|key| key.starts_with("@locator") || key.starts_with("__xz_locator"))
+    );
+    let marked = sim.class_heap_reachability_probe().expect("trace roots");
+    let keep = sim.get_signal("keep").unwrap().to_u64().unwrap() as usize;
+    assert!(marked[keep], "live handle was not traced");
+    let reachable = marked.iter().filter(|&&mark| mark).count();
+    assert!(reachable < 32, "{reachable} surviving handles");
+}
+
+/// §7.10, §8.7 (#1667): integer queue positions are not object references.
+#[test]
+fn dense_integer_queue_positions_do_not_keep_class_objects() {
+    let source = r#"
+class Item;
+endclass
+module top;
+  int q[$];
+  Item h;
+  initial begin
+    repeat (256) begin
+      h = new;
+      q.push_back(0);
+    end
+    h = null;
+    if (q.size() != 256) $fatal(1, "queue size");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("index fixture");
+    assert_eq!(sim.error_count, 0);
+    let marked = sim.class_heap_reachability_probe().expect("trace roots");
+    let reachable = marked.iter().filter(|&&mark| mark).count();
+    assert!(
+        reachable < 32,
+        "{reachable} handles retained by queue positions"
+    );
+}
+
+/// §6.21, §7.8 (#1667): associative metadata has the local array's lifetime.
+#[test]
+fn local_collection_metadata_is_reclaimed_with_the_frame() {
+    let source = r#"
+module top;
+  task automatic churn();
+    int a[int] = '{default: 17};
+    int rows[][int];
+    a[3] = 4;
+    rows = new[2];
+    rows[1][3] = 4;
+    if (a[0] != 17 || rows[1][3] != 4) $fatal(1, "local collection");
+  endtask
+  initial begin
+    repeat (32) churn();
+    $finish;
+  end
+endmodule
+"#;
+    let sim = crate::simulate(source, 100).expect("metadata fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(
+        !sim.module
+            .assoc_elem_widths
+            .keys()
+            .any(|k| k.starts_with('@'))
+    );
+    assert!(!sim.module.assoc_defaults.keys().any(|k| k.starts_with('@')));
+}
