@@ -614,6 +614,7 @@ mod construction;
 mod coverage;
 mod coverage_implicit;
 mod coverage_option_access;
+mod coverage_with_warning;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;

@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Warn when the `with` expression of a cross bin names something other than
+  the crossed coverpoints and constants, which leaves the bin empty
+  (§19.6.1, #1690).
 - Return typed defaults for invalid multidimensional array reads, report
   truncation from associative traversal, and preserve X/Z, full width, and
   nested row iterators in array reductions (§7.4.6, §7.9.8, §7.12.3).

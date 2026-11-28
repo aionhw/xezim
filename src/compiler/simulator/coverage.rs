@@ -1879,18 +1879,23 @@ impl Simulator {
         }
         let mut params: HashMap<String, Value> = ctor.iter().cloned().collect();
         let mut idx = vec![0usize; sets.len()];
+        let mut evaluated = false;
         for _ in 0..MAX_TUPLES {
             for (k, it) in cr.items.iter().enumerate() {
                 params.insert(it.name.clone(), Value::from_u64(sets[k][idx[k]] as u64, 64));
             }
-            if super::elaborate::const_eval_i64_with_params(e, Some(&params))
-                .is_some_and(|v| v != 0)
-            {
-                return true;
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&params)) {
+                evaluated = true;
+                if v != 0 {
+                    return true;
+                }
             }
             let mut k = idx.len();
             loop {
                 if k == 0 {
+                    if !evaluated {
+                        Self::cg_warn_unevaluable_with(e, cr);
+                    }
                     return false;
                 }
                 k -= 1;
