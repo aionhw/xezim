@@ -120,8 +120,9 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let pv = self.lookup_param_value(h)?;
-        let (_, fields) = self.packed_struct_layout_for_hier(h)?;
-        let &(_, off, w) = fields.iter().find(|(n, _, _)| n == member)?;
+        let (_, layout) = self.packed_struct_layout_for_hier(h)?;
+        let f = layout.get(member)?;
+        let (off, w) = (f.offset, f.width);
         if w == 0 || off.checked_add(w)? > pv.width {
             return None;
         }

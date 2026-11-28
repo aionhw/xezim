@@ -10,8 +10,11 @@ impl<'a> BytecodeCompiler<'a> {
     /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
     /// made this the largest single fallback after the named-cast fix.
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
-    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<(String, Vec<(String, u32, u32)>)> {
-        let fields_tbl = self.packed_struct_fields?;
+    fn lvalue_struct_layout(
+        &self,
+        lv: &Expression,
+    ) -> Option<(String, Arc<super::super::struct_layout::StructLayout>)> {
+        let fields_tbl = self.packed_struct_layouts?;
         // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
         // the element layout, which is keyed by the array name — same keying
         // the `arr[i].m` member store uses. Without this the pattern had no
@@ -34,17 +37,17 @@ impl<'a> BytecodeCompiler<'a> {
             .map(|scope| cat_dot(scope, &raw))
             .filter(|q| fields_tbl.contains_key(q))
             .unwrap_or(raw);
-        let layout = fields_tbl.get(&named)?;
+        let layout = fields_tbl.get(&named).filter(|l| !l.is_mixed)?;
         // A whole packed ARRAY of structs is keyed the same way; its pattern
         // spans the elements, not one struct.
-        let struct_w = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+        let struct_w = layout.total_width;
         if matches!(lv.kind, ExprKind::Ident(_))
             && let Some(&id) = self.signal_name_to_id.get(named.as_str())
             && self.signal_widths.get(id).is_some_and(|&sw| sw > struct_w)
         {
             return None;
         }
-        Some((named, layout.to_vec()))
+        Some((named, Arc::clone(layout)))
     }
 
     /// The declared type of the variable `lv` names, or of an element
@@ -123,7 +126,7 @@ impl<'a> BytecodeCompiler<'a> {
             full_dims.and_then(|t| t.get(&format!("{root}.{path}")).map(|d| d.to_vec()))
         };
         if let Some((root, layout)) = self.lvalue_struct_layout(lv) {
-            return pp::layout_struct_type(&layout, "", &|p| member_dims(&root, p));
+            return pp::layout_struct_type(&layout.ordered, "", &|p| member_dims(&root, p));
         }
         let ExprKind::Ident(h) = &lv.kind else {
             return None;
@@ -154,14 +157,14 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
         }
-        if let Some(fields) = self.packed_struct_fields {
+        if let Some(fields) = self.packed_struct_layouts {
             for name in &names {
                 let mut split = name.len();
                 while let Some(dot) = name[..split].rfind('.') {
                     split = dot;
-                    if let Some(layout) = fields.get(&name[..split]) {
+                    if let Some(layout) = fields.get(&name[..split]).filter(|l| !l.is_mixed) {
                         let root = &name[..split];
-                        return pp::layout_struct_type(layout, &name[split + 1..], &|p| {
+                        return pp::layout_struct_type(&layout.ordered, &name[split + 1..], &|p| {
                             member_dims(root, p)
                         });
                     }

@@ -29,8 +29,9 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::Ident(hier) = &arr_expr.kind else {
             return None;
         };
-        let (_, fields) = self.packed_struct_layout_for_hier(hier)?;
-        let &(_, off, mw) = fields.iter().find(|(m, _, _)| m == member)?;
+        let (_, layout) = self.packed_struct_layout_for_hier(hier)?;
+        let f = layout.get(member)?;
+        let (off, mw) = (f.offset, f.width);
         if mw == 0 {
             return None;
         }
@@ -232,8 +233,9 @@ impl<'a> BytecodeCompiler<'a> {
         let width = if let Some(m) = tail_member {
             // The layout map holds the ELEMENT struct's fields for an
             // array-of-struct signal (as `packed_array_member_store` uses it).
-            let (_, fields) = self.packed_struct_layout_for_hier(hier)?;
-            let &(_, off, mw) = fields.iter().find(|(n, _, _)| n == m)?;
+            let (_, layout) = self.packed_struct_layout_for_hier(hier)?;
+            let f = layout.get(m)?;
+            let (off, mw) = (f.offset, f.width);
             if mw == 0 {
                 return None;
             }
@@ -1751,13 +1753,14 @@ impl<'a> BytecodeCompiler<'a> {
             // and nothing else records one for it.
             if let ExprKind::Ident(bh) = &expr.kind
                 && let Some((slot, rw)) = self.local_var_reg_of(bh)
-                && let Some(fields) = self
-                    .packed_struct_fields
+                && let Some(layout) = self
+                    .packed_struct_layouts
                     .and_then(|m| m.get(format!("fn ret:{}", Self::hier_raw_name(bh)).as_str()))
-                && let Some(&(_, off, mw)) = fields.iter().find(|(n, _, _)| *n == member.name)
-                && mw > 0
+                && let Some(f) = layout.get(&member.name)
+                && f.width > 0
                 && rw > 0
             {
+                let (off, mw) = (f.offset, f.width);
                 let fields_w = rw;
                 // value & mask, widened, shifted into place
                 let vex = self.alloc_reg();

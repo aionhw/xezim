@@ -451,10 +451,8 @@ impl<'a> BytecodeCompiler<'a> {
                 let ExprKind::Ident(hier) = &root.kind else {
                     return None;
                 };
-                let (key, fields) = self.packed_struct_layout_for_hier(hier)?;
-                if !fields.iter().any(|(name, _, _)| name == &member.name) {
-                    return None;
-                }
+                let (key, layout) = self.packed_struct_layout_for_hier(hier)?;
+                layout.get(&member.name)?;
                 self.packed_member_signed(&key, &member.name)
                     .or_else(|| self.packed_member_signed(&Self::hier_raw_name(hier), &member.name))
             }

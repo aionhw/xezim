@@ -87,12 +87,115 @@ impl Simulator {
     }
 
     /// Active tag of a tagged-union subject (§7.3.2), if it is one.
-    pub(super) fn subject_union_tag(&self, subject: &Expression) -> Option<String> {
-        if let ExprKind::Ident(h) = &subject.kind {
+    pub(super) fn subject_union_tag(&mut self, subject: &Expression) -> Option<String> {
+        if let Some((hint, _, su)) = self.tagged_union_dt_of_expr(subject) {
+            let v = if let Some(ref n) = hint {
+                self.get_local_or_signal(n)
+                    .unwrap_or_else(|| self.eval_expr(subject))
+            } else {
+                self.eval_expr(subject)
+            };
+            if let Some((_, tag, _, _)) = self.decode_tagged_union_val(&su, &v, hint.as_deref()) {
+                return Some(tag);
+            }
+        }
+        if let ExprKind::Ident(h) = &Self::unparen(subject).kind {
             let n = self.resolve_hier_name(h);
             return self.active_union_tag.get(&*n).cloned();
         }
         None
+    }
+
+    fn match_pattern_val(
+        &mut self,
+        val: &Value,
+        dt: Option<&DataType>,
+        pat: &Pattern,
+        binds: &mut Vec<(String, Value)>,
+        storage_hint: Option<&str>,
+    ) -> bool {
+        match pat {
+            Pattern::Wildcard => true,
+            Pattern::Binding(id) => {
+                binds.push((id.name.clone(), val.clone()));
+                true
+            }
+            Pattern::Expr(e) => {
+                let rhs = self.eval_expr(e);
+                let tw = val.width.max(rhs.width).max(1);
+                let a = val.resize(tw);
+                let b = rhs.resize(tw);
+                a.case_eq(&b).is_true()
+            }
+            Pattern::Tagged { tag, inner } => {
+                let Some(su) = dt.and_then(|d| self.resolve_tagged_su(d)) else {
+                    return false;
+                };
+                let Some((_, active_tag, mw, mdt)) =
+                    self.decode_tagged_union_val(&su, val, storage_hint)
+                else {
+                    return false;
+                };
+                if active_tag != tag.name {
+                    return false;
+                }
+                match inner {
+                    None => true,
+                    Some(ip) => {
+                        let mv = self.extract_tagged_member_value(val, mw, &mdt, storage_hint);
+                        self.match_pattern_val(&mv, Some(&mdt), ip, binds, None)
+                    }
+                }
+            }
+            Pattern::Struct(members) => {
+                let Some(dt) = dt else {
+                    return false;
+                };
+                let DataType::Struct(su) = self.resolve_dt(dt) else {
+                    return false;
+                };
+                // Collect member (name, offset, width, dt) MSB-first matching how the
+                // struct payload was packed into `val`.
+                let mut raw: Vec<(String, u32, DataType)> = Vec::new();
+                for m in &su.members {
+                    let mw = super::elaborate::resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    for d in &m.declarators {
+                        raw.push((d.name.name.clone(), mw, m.data_type.clone()));
+                    }
+                }
+                let mut fields: Vec<(String, u32, u32, DataType)> = Vec::with_capacity(raw.len());
+                let mut off = 0u32;
+                for (mn, mw, mdt) in raw.into_iter().rev() {
+                    fields.push((mn, off, mw, mdt));
+                    off += mw;
+                }
+                fields.reverse();
+                for (i, (name, sub)) in members.iter().enumerate() {
+                    let target = match name {
+                        Some(id) => fields.iter().find(|(n, _, _, _)| *n == id.name),
+                        None => fields.get(i),
+                    };
+                    let Some((_, foff, fw, fdt)) = target else {
+                        return false;
+                    };
+                    let mut fv = if *fw > 0 {
+                        val.range_select((*foff + *fw - 1) as usize, *foff as usize)
+                    } else {
+                        Value::zero(1)
+                    };
+                    fv.is_signed =
+                        super::elaborate::is_type_signed_resolved(fdt, &self.module.typedef_types);
+                    if !self.match_pattern_val(&fv, Some(fdt), sub, binds, None) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Test a §12.6 pattern against `subject`, collecting `.v` bindings.
@@ -110,10 +213,32 @@ impl Simulator {
                 true
             }
             Pattern::Tagged { tag, inner } => {
-                // Subject must be a tagged union currently holding this member.
+                if let Some((hint, _, su)) = self.tagged_union_dt_of_expr(subject) {
+                    let v = if let Some(ref n) = hint {
+                        self.get_local_or_signal(n)
+                            .unwrap_or_else(|| self.eval_expr(subject))
+                    } else {
+                        self.eval_expr(subject)
+                    };
+                    let Some((_, active_tag, mw, mdt)) =
+                        self.decode_tagged_union_val(&su, &v, hint.as_deref())
+                    else {
+                        return false;
+                    };
+                    if active_tag != tag.name {
+                        return false;
+                    }
+                    return match inner {
+                        None => true,
+                        Some(ip) => {
+                            let mv =
+                                self.extract_tagged_member_value(&v, mw, &mdt, hint.as_deref());
+                            self.match_pattern_val(&mv, Some(&mdt), ip, binds, None)
+                        }
+                    };
+                }
                 match self.subject_union_tag(subject) {
                     Some(cur) if cur == tag.name => match inner {
-                        // The union's stored value IS the member payload.
                         Some(ip) => self.match_pattern(subject, ip, binds),
                         None => true,
                     },
@@ -123,7 +248,8 @@ impl Simulator {
             Pattern::Expr(e) => {
                 let a = self.eval_expr(subject);
                 let b = self.eval_expr(e);
-                a.case_eq(&b).is_true()
+                let tw = a.width.max(b.width).max(1);
+                a.resize(tw).case_eq(&b.resize(tw)).is_true()
             }
             // §12.6 structure pattern `'{a: .x, b: 3}`: members bind by name
             // when named, positionally otherwise.
@@ -592,6 +718,55 @@ impl Simulator {
         }
         self.set_queue_size(RET_SNAP, (hi - lo + 1) as u64);
         self.pending_ret_collection = Some(RET_SNAP.to_string());
+        true
+    }
+
+    /// §7.4.6 Table 7-1: assign declared member defaults when reading an
+    /// out-of-bounds / missing element of a flat/module unpacked-struct array.
+    /// Class-property collections return `false` so they fall through to
+    /// [`Self::assign_struct_memberwise`].
+    fn try_assign_oob_struct_defaults(
+        &mut self,
+        dst: &str,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) -> bool {
+        let ExprKind::Index { expr: base_e, .. } = &rvalue.kind else {
+            return false;
+        };
+        if !Self::cond_expr_is_effect_free(base_e, false)
+            || self.class_prop_struct_of(base_e).is_some()
+        {
+            return false;
+        }
+        let Some(bn) = self.flat_member_name(base_e) else {
+            return false;
+        };
+        if bn.contains('#')
+            || self.instance_assoc_member(&bn).is_some()
+            || self.resolve_locator_storage(&bn) != bn
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .is_some_and(|h| self.class_prop_struct(h, &bn).is_some())
+        {
+            return false;
+        }
+        if !(self.module.arrays.contains_key(&bn)
+            || self.module.arrays_2d.contains_key(&bn)
+            || self.module.arrays_nd.contains_key(&bn)
+            || self.module.dynamic_arrays.contains(&bn)
+            || self.is_associative_array(&bn))
+        {
+            return false;
+        }
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaf_defaults(dst, su, 0, &mut leaves);
+        for (k, dv, _) in leaves {
+            self.set_signal_value_by_name(&k, dv);
+        }
         true
     }
 
@@ -1941,8 +2116,36 @@ impl Simulator {
         // stale `Invalid` and raised a spurious run-time error. Ahead of the
         // simple-assign fast path, which is where `b = a` stores and returns;
         // a design without tagged unions pays the one `is_empty` test.
-        if !self.active_union_tag.is_empty() && !matches!(rvalue.kind, ExprKind::Tagged { .. }) {
-            if let ExprKind::Ident(lh) = &lvalue.kind {
+        if (!self.active_union_tag.is_empty() || !self.tagged_union_strings.is_empty())
+            && !matches!(rvalue.kind, ExprKind::Tagged { .. })
+        {
+            if let Some((Some(lname), _, _)) = self.tagged_union_dt_of_expr(lvalue) {
+                let rname = self
+                    .tagged_union_dt_of_expr(rvalue)
+                    .and_then(|(n, _, _)| n);
+                let src_tag = rname
+                    .as_deref()
+                    .and_then(|rn| self.active_union_tag.get(rn).cloned());
+                match src_tag {
+                    Some(tag) => {
+                        self.active_union_tag.insert(lname.clone(), tag);
+                    }
+                    None => {
+                        self.active_union_tag.remove(&lname);
+                    }
+                }
+                let src_str = rname
+                    .as_deref()
+                    .and_then(|rn| self.tagged_union_strings.get(rn).cloned());
+                match src_str {
+                    Some(s) => {
+                        self.tagged_union_strings.insert(lname, s);
+                    }
+                    None => {
+                        self.tagged_union_strings.remove(&lname);
+                    }
+                }
+            } else if let ExprKind::Ident(lh) = &lvalue.kind {
                 if lh.path.len() == 1 && lh.path[0].selects.is_empty() {
                     let lname = self.resolve_hier_name(lh);
                     let src_tag = match &rvalue.kind {
@@ -2523,12 +2726,16 @@ impl Simulator {
                             }
                             let dst_s = format!("{}{}", cont_s, &dst[cut..]);
                             let src = eval_rflat(self, &mut rflat_cache);
-                            if let Some(src) = src {
-                                if self.struct_storage_exists(&src, &su) {
-                                    self.copy_unpacked_struct(&dst_s, &src, &su);
+                            if let Some(src) = &src {
+                                if self.struct_storage_exists(src, &su) {
+                                    self.copy_unpacked_struct(&dst_s, src, &su);
                                     self.settle_after_proc_write();
                                     return;
                                 }
+                            }
+                            if self.try_assign_oob_struct_defaults(&dst_s, rvalue, &su) {
+                                self.settle_after_proc_write();
+                                return;
                             }
                             if Self::is_struct_elem_ref(rvalue) {
                                 self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
@@ -2583,12 +2790,19 @@ impl Simulator {
                     return;
                 }
                 let src = eval_rflat(self, &mut rflat_cache);
-                if let Some(src) = src {
-                    if src != dst && self.struct_storage_exists(&src, &su) {
-                        self.copy_unpacked_struct(&dst, &src, &su.clone());
-                        self.settle_after_proc_write();
-                        return;
-                    }
+                if let Some(src) = &src
+                    && *src != dst
+                    && self.struct_storage_exists(src, &su)
+                {
+                    self.copy_unpacked_struct(&dst, src, &su.clone());
+                    self.settle_after_proc_write();
+                    return;
+                }
+                if !dst_is_collection
+                    && self.try_assign_oob_struct_defaults(&dst, rvalue, &su)
+                {
+                    self.settle_after_proc_write();
+                    return;
                 }
                 // §7.2: an element of a CLASS-PROPERTY collection
                 // (`r = q[i]` in a method, `r = c.q[i]`) has its
@@ -3298,39 +3512,36 @@ impl Simulator {
                 }
             }
         }
-        // Tagged union assignment: un = tagged Name (inner);
+        // Tagged union assignment: `un = tagged Name (inner);` or `un = cond ? tagged ... : tagged ...;`
+        if let Some((lname_opt, _, su)) = self.tagged_union_dt_of_expr(lvalue)
+            && let Some((tag_name, v, str_payload)) = self.eval_tagged_rhs(&su, rvalue)
+        {
+            if let Some(lname) = lname_opt {
+                self.active_union_tag.insert(lname.clone(), tag_name);
+                match str_payload {
+                    Some(s) => {
+                        self.tagged_union_strings.insert(lname, s);
+                    }
+                    None => {
+                        self.tagged_union_strings.remove(&lname);
+                    }
+                }
+            }
+            self.assign_value(lvalue, &v);
+            self.settle_after_proc_write();
+            return;
+        }
         if let ExprKind::Tagged { tag, inner } = &rvalue.kind {
             if let ExprKind::Ident(lh) = &lvalue.kind {
                 let lname = self.resolve_hier_name(lh);
-                // §7.3.2: the pattern literal `tagged '{ member: value }`
-                // carries no member name between `tagged` and `'{` — the
-                // tag IS the first named item of the pattern. Without it
-                // `active_union_tag` stays empty and every later
-                // `u.member` read (tagged_union_member) returns x.
-                let tag_name = if tag.name.is_empty() {
-                    inner.as_ref().map_or(String::new(), |ie| {
-                        if let ExprKind::AssignmentPattern(items) = &ie.kind {
-                            items
-                                .iter()
-                                .find_map(|it| match it {
-                                    AssignmentPatternItem::Named(id, _) => Some(id.name.clone()),
-                                    _ => None,
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    })
-                } else {
-                    tag.name.clone()
-                };
+                let (tag_name, inner_expr) = Self::extract_tag_and_inner(tag, inner);
                 self.active_union_tag.insert(lname.to_string(), tag_name);
-                if let Some(inner_expr) = inner {
+                if let Some(inner_expr) = inner_expr {
                     let v = self.eval_expr(inner_expr);
-                    self.set_signal_value_by_name(&lname, v);
+                    self.set_local_or_signal(&lname, v);
                 } else {
                     let w = self.lookup_signal_width(&lname).unwrap_or(1);
-                    self.set_signal_value_by_name(&lname, Value::zero(w));
+                    self.set_local_or_signal(&lname, Value::zero(w));
                 }
                 self.settle_after_proc_write();
                 return;
@@ -4894,8 +5105,19 @@ impl Simulator {
         }
         if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
             let desc = self.module.descending_arrays.contains(&dst);
-            let cap = (hi - lo + 1) as u64;
-            let n = self.get_queue_size(&src).min(cap);
+            let cap = (hi - lo + 1).max(0) as u64;
+            let rsize = self.get_queue_size(&src);
+            if rsize != cap {
+                self.emit_severity_text(
+                    "Error",
+                    &format!(
+                        "Dynamic array size mismatch assigning '{}' (size {}) to fixed array '{}' (size {})",
+                        src, rsize, dst, cap
+                    ),
+                );
+                return;
+            }
+            let n = rsize;
             let su = self
                 .queue_elem_struct(&src)
                 .or_else(|| self.queue_elem_struct(&dst));
@@ -4967,8 +5189,23 @@ impl Simulator {
             {
                 let (llo, lhi, _) = self.module.arrays[&*lname];
                 let (rlo, rhi, _) = self.module.arrays[&*rname];
-                let lsize = (lhi - llo + 1) as usize;
-                let rsize = (rhi - rlo + 1) as usize;
+                let lsize = (lhi - llo + 1).max(0) as usize;
+                let rsize = (rhi - rlo + 1).max(0) as usize;
+                if !self.module.dynamic_arrays.contains(&*lname)
+                    && self.module.dynamic_arrays.contains(&*rname)
+                {
+                    let dsz = self.get_queue_size(&rname);
+                    if dsz != lsize as u64 {
+                        self.emit_severity_text(
+                            "Error",
+                            &format!(
+                                "Dynamic array size mismatch assigning '{}' (size {}) to fixed array '{}' (size {})",
+                                rname, dsz, lname, lsize
+                            ),
+                        );
+                        return;
+                    }
+                }
                 // §7.2 / §7.6: an unpacked struct element consists of
                 // member leaves; its container scalar carries no value.
                 if let Some(su) = self.queue_elem_struct(&rname) {

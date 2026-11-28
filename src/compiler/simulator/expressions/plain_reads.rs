@@ -446,6 +446,7 @@ impl Simulator {
             || self.module.packed_struct_fields.contains_key(n)
             || self.module.associative_arrays.contains_key(n)
             || self.active_union_tag.contains_key(n)
+            || self.tagged_union_dt_of_name(n).is_some()
             || self.dyn_name_lookup(n).is_some()
             || (self.clocking_read_possible(base)
                 && self.try_clocking_signal_read(&[n, m]).is_some())

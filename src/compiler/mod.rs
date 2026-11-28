@@ -17,7 +17,7 @@ pub(crate) mod packed_assignment_pattern_plan;
 pub mod prof_sampler;
 pub(crate) mod scoped_arrays;
 pub mod simulator;
-pub mod soa;
+pub(crate) mod struct_layout;
 pub(crate) mod struct_sra;
 pub mod ts_jit;
 
@@ -25,7 +25,6 @@ pub use arena::{Arena, ArenaGuard, ArenaVec};
 pub use dispatch::{DispatchTable, NUM_OPCODES, Opcode, get_dispatch_table};
 pub use interrupt::interrupted_exit_status;
 pub use simulator::Simulator;
-pub use soa::{InlineSignalArray, PackedWideSignalArray, SoaSignalStore, SoaSignalTable};
 pub use xezim_core::Value;
 pub use xezim_core::elaborate;
 pub use xezim_core::elaborate::{ElaboratedModule, elaborate_module};

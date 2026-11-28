@@ -415,7 +415,19 @@ impl Simulator {
         if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
             return v;
         }
-        // §7.3.2 tagged-union member read (`t.Valid`).
+        // §7.3.2 tagged-union member read (`t.Valid`, `arr[i].Val`, `ip.Jmp.JmpC.addr`).
+        {
+            let full = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: expr.clone(),
+                    member: member.clone(),
+                },
+                member.span,
+            );
+            if let Some(v) = self.read_tagged_union_member_chain(&full) {
+                return v;
+            }
+        }
         if let ExprKind::Ident(h) = &expr.kind {
             if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name) {
                 let (base, m) = (h.path[0].name.name.clone(), member.name.clone());
@@ -633,6 +645,63 @@ impl Simulator {
         if let Some(v) = self.missing_struct_elem_member(expr, &member.name) {
             return v;
         }
+        // Unpacked-struct element member read (`arr[i].field` for assoc,
+        // dynamic/queue, or fixed unpacked-struct arrays): must run BEFORE
+        // `self.eval_expr(expr)` + packed layout guessing below, because an
+        // OOB element read of a single-field 32-bit unpacked struct returns
+        // a 32-bit `x` whose width happens to match the struct width.
+        if let ExprKind::Index {
+            expr: idx_base,
+            index,
+        } = &expr.kind
+        {
+            if let ExprKind::Ident(hier) = &idx_base.kind {
+                let mut an = self.resolve_hier_name(hier);
+                if let Some(scoped) = self.instance_assoc_member(&an) {
+                    an = std::borrow::Cow::Owned(scoped);
+                } else if !self.is_associative_array(&an)
+                    && !self.module.dynamic_arrays.contains(&*an)
+                    && !self.module.arrays.contains_key(&*an)
+                {
+                    // Through an object handle (`c.slices[0].path`).
+                    an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
+                }
+                if self.is_associative_array(&an) {
+                    let idx_val = self.eval_expr(index);
+                    let key_str = self.assoc_key_str(&an, &idx_val);
+                    let target = format!("{}[{}].{}", an, key_str, member.name);
+                    if let Some(v) = self.get_signal_value_by_name(&target) {
+                        return v;
+                    }
+                } else if (self.module.dynamic_arrays.contains(&*an)
+                    || self.module.arrays.contains_key(&*an))
+                    && self.queue_elem_struct(&an).is_some()
+                {
+                    let an_owned = an.into_owned();
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        return self
+                            .unpacked_struct_member_oob_default(&an_owned, &member.name)
+                            .unwrap_or_else(|| Value::new(1));
+                    };
+                    let target = format!("{}[{}].{}", an_owned, i, member.name);
+                    if let Some(v) = self.get_signal_value_by_name(&target) {
+                        return v;
+                    }
+                    let is_oob = if self.module.dynamic_arrays.contains(&an_owned) {
+                        i < 0 || (i as u64) >= self.get_queue_size(&an_owned)
+                    } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&an_owned) {
+                        i < lo || i > hi
+                    } else {
+                        false
+                    };
+                    if is_oob {
+                        return self
+                            .unpacked_struct_member_oob_default(&an_owned, &member.name)
+                            .unwrap_or_else(|| Value::new(1));
+                    }
+                }
+            }
+        }
         {
             let base_val = self.eval_expr(expr);
             // §7.2.1/§8.4: an ELEMENT of a fixed rand/class array whose
@@ -694,6 +763,18 @@ impl Simulator {
                             });
                             if mreal {
                                 v.is_real = true;
+                            }
+                            if v.has_xz()
+                                && !self.mixed_packed_vars.is_empty()
+                                && let Some(flat) = self.flat_member_name(expr)
+                                && let Some((root, prefix)) = flat.split_once('.')
+                            {
+                                let field = format!("{prefix}.{}", member.name);
+                                if self.packed_member_two_state(root, &field) {
+                                    let signed = v.is_signed;
+                                    v = v.to_two_state();
+                                    v.is_signed = signed;
+                                }
                             }
                             return v;
                         }
@@ -985,84 +1066,22 @@ impl Simulator {
                                         .map(|&(_, o, w)| (o, w))
                                 })
                             {
-                                return struct_val
+                                let mut out = struct_val
                                     .range_select((off + w - 1) as usize, off as usize);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Associative-array element struct-member read:
-        // `assoc[key].field` (element = unpacked struct). Mirror of the
-        // assign-side handler — reads the dotted signal
-        // `assoc[keystr].field`. Guarded by signal presence, so a
-        // class-handle element (`rtab[nm].method`/`.prop`) where no such
-        // signal exists correctly falls through to the handle path.
-        if let ExprKind::Index {
-            expr: idx_base,
-            index,
-        } = &expr.kind
-        {
-            if let ExprKind::Ident(hier) = &idx_base.kind {
-                let mut an = self.resolve_hier_name(hier);
-                if let Some(scoped) = self.instance_assoc_member(&an) {
-                    an = std::borrow::Cow::Owned(scoped);
-                } else if !self.is_associative_array(&an)
-                    && !self.module.dynamic_arrays.contains(&*an)
-                    && !self.module.arrays.contains_key(&*an)
-                {
-                    // Through an object handle (`c.slices[0].path`).
-                    an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
-                }
-                if self.is_associative_array(&an) {
-                    let idx_val = self.eval_expr(index);
-                    let key_str = self.assoc_key_str(&an, &idx_val);
-                    let target = format!("{}[{}].{}", an, key_str, member.name);
-                    if let Some(v) = self.get_signal_value_by_name(&target) {
-                        return v;
-                    }
-                } else if (self.module.dynamic_arrays.contains(&*an)
-                    || self.module.arrays.contains_key(&*an))
-                    && self.queue_elem_struct(&an).is_some()
-                {
-                    // Same leaf read for a DYNAMIC/fixed collection of
-                    // unpacked structs reached through an instance
-                    // scope (`<h>#slices[0].path`) — the bare
-                    // flattened name misses the storage, so a
-                    // class-member `slices[t].path` read x while the
-                    // write (fixed above) landed correctly.
-                    let Some(i) = self.eval_expr(index).to_index() else {
-                        if let Some(su) = self.queue_elem_struct(&an) {
-                            for m in &su.members {
-                                if m.declarators.iter().any(|d| d.name.name == member.name) {
-                                    let w = resolve_type_width(
-                                        &m.data_type,
-                                        Some(&self.module.parameters),
-                                        Some(&self.module.typedefs),
-                                    )
-                                    .max(1);
-                                    let mut v = if super::elaborate::is_type_two_state_resolved(
-                                        &m.data_type,
-                                        &self.module.typedef_types,
-                                    ) {
-                                        Value::zero(w)
-                                    } else {
-                                        Value::new(w)
-                                    };
-                                    v.is_signed = super::elaborate::is_type_signed_resolved(
-                                        &m.data_type,
-                                        &self.module.typedef_types,
-                                    );
-                                    return v;
+                                if self.struct_member_signed(base_name, &member.name) {
+                                    out.is_signed = true;
                                 }
+                                if out.has_xz()
+                                    && !self.mixed_packed_vars.is_empty()
+                                    && self.packed_member_two_state(base_name, &member.name)
+                                {
+                                    let signed = out.is_signed;
+                                    out = out.to_two_state();
+                                    out.is_signed = signed;
+                                }
+                                return out;
                             }
                         }
-                        return Value::new(1);
-                    };
-                    let target = format!("{}[{}].{}", an, i, member.name);
-                    if let Some(v) = self.get_signal_value_by_name(&target) {
-                        return v;
                     }
                 }
             }

@@ -1662,6 +1662,15 @@ impl Simulator {
         }
         // Fallback
         let mut v = self.signals.get(&*name).cloned().unwrap_or_else(|| {
+            if let Some(close) = name.rfind(']')
+                && name.as_bytes().get(close + 1) == Some(&b'.')
+                && let Some(arr_base) = Self::strip_trailing_index_groups(&name[..=close])
+                && !self.module.z_init_signals.contains(arr_base)
+                && let Some(oob) =
+                    self.unpacked_struct_member_oob_default(arr_base, &name[close + 2..])
+            {
+                return oob;
+            }
             // §7.4.6: an out-of-range element read (`mem[9]` of `mem[0:3]`
             // names no signal) yields x at the ELEMENT width, not a 1-bit
             // x that a store then zero-extends.
@@ -1682,6 +1691,67 @@ impl Simulator {
             v.is_signed = true;
         }
         v
+    }
+
+    fn strip_trailing_index_groups(mut s: &str) -> Option<&str> {
+        let mut stripped = false;
+        while let Some(rest) = s.strip_suffix(']') {
+            let open = rest.rfind('[')?;
+            s = &rest[..open];
+            stripped = true;
+        }
+        (stripped && !s.is_empty()).then_some(s)
+    }
+
+    /// §7.4.6 Table 7-1: OOB / invalid-index member read on an array of
+    /// unpacked structs yields the member type's default value (NOT any
+    /// declared struct member initializer).
+    pub(super) fn unpacked_struct_member_oob_default(
+        &self,
+        arr_name: &str,
+        member_path: &str,
+    ) -> Option<Value> {
+        let mut cur_su = self.queue_elem_struct(arr_name)?;
+        let mut parts = member_path.split('.').peekable();
+        while let Some(seg) = parts.next() {
+            let member = cur_su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == seg))?;
+            if parts.peek().is_some() {
+                cur_su = match self.resolve_dt_ref(&member.data_type) {
+                    crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(su) => {
+                        su.clone()
+                    }
+                    _ => return None,
+                };
+                continue;
+            }
+            let resolved_dt = self.resolve_dt_ref(&member.data_type);
+            if matches!(resolved_dt, crate::ast::types::DataType::Real { .. }) {
+                return Some(Value::from_f64(0.0));
+            }
+            let w = resolve_type_width(
+                &member.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let mut v = if super::elaborate::is_type_two_state_resolved(
+                &member.data_type,
+                &self.module.typedef_types,
+            ) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            };
+            v.is_signed = super::elaborate::is_type_signed_resolved(
+                &member.data_type,
+                &self.module.typedef_types,
+            );
+            return Some(v);
+        }
+        None
     }
 
     #[inline(always)]

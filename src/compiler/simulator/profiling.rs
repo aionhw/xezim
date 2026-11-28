@@ -1031,7 +1031,8 @@ impl Simulator {
                 | CombItem::GateRegion { .. }
                 | CombItem::VectorGate { .. }
                 | CombItem::ScatterGate { .. }
-                | CombItem::CtlGate { .. } => {}
+                | CombItem::CtlGate { .. }
+                | CombItem::BulkArrayCopy { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -4966,9 +4967,9 @@ impl Simulator {
                         CombItem::CompiledAlwaysBlock { .. } => "CompiledAlwaysBlock",
                         CombItem::ContAssign { .. } => "ContAssign",
                         CombItem::AlwaysBlock { .. } => "AlwaysBlock",
-                        CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. } => {
-                            "DirectCopy"
-                        }
+                        CombItem::DirectCopy { .. }
+                        | CombItem::FastDirectCopy { .. }
+                        | CombItem::BulkArrayCopy { .. } => "DirectCopy",
                         CombItem::FastDirectFanout { .. }
                         | CombItem::FusedBufFanout { .. }
                         | CombItem::FusedAndFanout { .. } => "Fanout",
@@ -5034,6 +5035,12 @@ impl Simulator {
                     CombItem::TimingCheck { .. } => "",
                     CombItem::DirectCopy { dst_id, .. }
                     | CombItem::FastDirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
+                    CombItem::BulkArrayCopy { runs } => {
+                        let Some(run) = runs.first() else {
+                            continue;
+                        };
+                        self.name_for_id(run.dst_first)
+                    }
                     CombItem::FastDirectFanout { dst_ids, .. } => {
                         let Some(&dst_id) = dst_ids.first() else {
                             continue;

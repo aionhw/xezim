@@ -13,7 +13,7 @@ impl<'a> BytecodeCompiler<'a> {
         &self,
         hier: &HierarchicalIdentifier,
     ) -> Option<(usize, u32, u32)> {
-        let fields_map = self.packed_struct_fields?;
+        let fields_map = self.packed_struct_layouts?;
         if hier.path.len() < 2 || hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
@@ -37,15 +37,19 @@ impl<'a> BytecodeCompiler<'a> {
                 continue;
             };
             // Field layout is keyed by both the bare and scope-qualified base name.
-            let Some(fields) = fields_map.get(base.as_str()).or_else(|| {
-                self.scope_hint
-                    .as_ref()
-                    .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
-            }) else {
+            let Some(layout) = fields_map
+                .get(base.as_str())
+                .or_else(|| {
+                    self.scope_hint
+                        .as_ref()
+                        .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
+                })
+                .filter(|l| !l.is_mixed)
+            else {
                 continue;
             };
-            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| *m == member) {
-                return Some((base_id, *off, *w));
+            if let Some(f) = layout.get(&member) {
+                return Some((base_id, f.offset, f.width));
             }
         }
         None
@@ -63,7 +67,7 @@ impl<'a> BytecodeCompiler<'a> {
         &self,
         lhs: &Expression,
     ) -> Option<(usize, String, String, u32, u32)> {
-        let fields_map = self.packed_struct_fields?;
+        let fields_map = self.packed_struct_layouts?;
         // A local of the frame (a function's own struct) shadows a module
         // signal of the same name; it is not this signal's layout.
         if self.frame_bound_target(lhs) {
@@ -133,13 +137,13 @@ impl<'a> BytecodeCompiler<'a> {
             else {
                 continue;
             };
-            let Some(fields) = fields_map.get(key.as_str()) else {
+            let Some(layout) = fields_map.get(key.as_str()).filter(|l| !l.is_mixed) else {
                 continue;
             };
-            if let Some(&(_, off, w)) = fields.iter().find(|(m, _, _)| *m == member)
-                && w > 0
+            if let Some(f) = layout.get(&member)
+                && f.width > 0
             {
-                return Some((base_id, key, member, off, w));
+                return Some((base_id, key, member, f.offset, f.width));
             }
         }
         None
@@ -216,17 +220,15 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    /// Resolve a packed-struct container and clone its flattened field layout.
-    /// The clone keeps later instruction emission free to mutably borrow the
-    /// compiler without retaining a borrow into elaboration metadata.
+    /// Resolve a packed-struct container and return its interned field layout.
     pub(super) fn packed_struct_layout_for_hier(
         &self,
         hier: &HierarchicalIdentifier,
-    ) -> Option<(String, Vec<(String, u32, u32)>)> {
+    ) -> Option<(String, Arc<super::super::struct_layout::StructLayout>)> {
         if hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
-        let fields_map = self.packed_struct_fields?;
+        let fields_map = self.packed_struct_layouts?;
         let raw = Self::hier_raw_name(hier);
         let mut candidates = Vec::with_capacity(3);
         candidates.push(raw.clone());
@@ -239,8 +241,8 @@ impl<'a> BytecodeCompiler<'a> {
             candidates.push(leaf.name.name.clone());
         }
         for candidate in candidates {
-            if let Some(fields) = fields_map.get(candidate.as_str()) {
-                return Some((candidate, fields.to_vec()));
+            if let Some(layout) = fields_map.get(candidate.as_str()).filter(|l| !l.is_mixed) {
+                return Some((candidate, Arc::clone(layout)));
             }
         }
         None
@@ -255,7 +257,7 @@ impl<'a> BytecodeCompiler<'a> {
         RegId,
         String,
         HierarchicalIdentifier,
-        Vec<(String, u32, u32)>,
+        Arc<super::super::struct_layout::StructLayout>,
     )> {
         let mut unwrapped = expr;
         while let ExprKind::Paren(inner) = &unwrapped.kind {
@@ -277,9 +279,9 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let hier = hier.clone();
-        let (key, fields) = self.packed_struct_layout_for_hier(&hier)?;
+        let (key, layout) = self.packed_struct_layout_for_hier(&hier)?;
         let value = self.compile_expr(unwrapped, 0)?;
-        Some((value, key, hier, fields))
+        Some((value, key, hier, layout))
     }
 
     /// The flattened member layout of a packed-struct formal, computed as the
@@ -635,8 +637,9 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::MemberAccess { expr: root, member } = &cur.kind else {
             return None;
         };
-        let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
-        let &(_, field_offset, field_w) = fields.iter().find(|(n, _, _)| n == &member.name)?;
+        let (root_value, root_key, hier, layout) = self.compile_packed_struct_value(root)?;
+        let f = layout.get(&member.name)?;
+        let (field_offset, field_w) = (f.offset, f.width);
         let all_dims = self.packed_full_dims?;
         let dims: Vec<(i64, i64)> = self
             .packed_member_keys(&root_key, &hier, &member.name)
@@ -760,20 +763,20 @@ impl<'a> BytecodeCompiler<'a> {
                 member: m1,
             } = &mid.kind
         {
-            let (v, key, hier, fields) = self.compile_packed_struct_value(r2)?;
-            let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
+            let (v, key, hier, layout) = self.compile_packed_struct_value(r2)?;
+            let m1_off = layout.get(&m1.name)?.offset;
             let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
             let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
-            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name, stride1)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&layout, &m1.name, &member.name, stride1)?;
             let rel = mem_off.checked_sub(m1_off)?;
             let nested = format!("{}.{}", m1.name, member.name);
             let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
             return self.emit_packed_member_slice(elem, index, dim2, elem_w, rel, elem_w);
         }
-        let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
-        let (_, field_offset, _) = fields.iter().find(|(name, _, _)| name == &member.name)?;
+        let (root_value, root_key, hier, layout) = self.compile_packed_struct_value(root)?;
+        let field_offset = layout.get(&member.name)?.offset;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
-        self.emit_packed_member_slice(root_value, index, dim, elem_w, *field_offset, elem_w)
+        self.emit_packed_member_slice(root_value, index, dim, elem_w, field_offset, elem_w)
     }
 
     /// Compile `container.array_member[index].field` using the flattened
@@ -804,10 +807,10 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
             return None;
         };
-        let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
+        let (root_value, root_key, hier, layout) = self.compile_packed_struct_value(root)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
         let (_, field_offset, field_width) =
-            Self::elem_zero_field(&fields, &member.name, leaf, elem_w)?;
+            Self::elem_zero_field(&layout, &member.name, leaf, elem_w)?;
         self.emit_packed_member_slice(root_value, index, dim, elem_w, field_offset, field_width)
     }
 
@@ -820,23 +823,30 @@ impl<'a> BytecodeCompiler<'a> {
     /// is the most significant element, so the leaf's offset is reduced to
     /// its place within one `stride`-bit element above the member's base.
     fn elem_zero_field(
-        fields: &[(String, u32, u32)],
+        layout: &super::super::struct_layout::StructLayout,
         member: &str,
         leaf: &str,
         stride: u32,
     ) -> Option<(String, u32, u32)> {
         let rel = format!("{}.{}", member, leaf);
-        let per_elem = format!("{}[0].{}", member, leaf);
-        let (name, off, w) = fields
-            .iter()
-            .find(|(name, _, _)| name == &rel || name == &per_elem)
-            .cloned()?;
-        match fields.iter().find(|(n, _, _)| n == member) {
-            Some(&(_, base, _)) if stride > 0 && off >= base => {
-                Some((name, base + (off - base) % stride, w))
-            }
-            _ => Some((name, off, w)),
+        if let Some(f) = layout.get(&rel) {
+            let off = match layout.get(member) {
+                Some(b) if stride > 0 && f.offset >= b.offset => {
+                    b.offset + (f.offset - b.offset) % stride
+                }
+                _ => f.offset,
+            };
+            return Some((rel, off, f.width));
         }
+        let per_elem = format!("{}[0].{}", member, leaf);
+        let f = layout.get(&per_elem)?;
+        let off = match layout.get(member) {
+            Some(b) if stride > 0 && f.offset >= b.offset => {
+                b.offset + (f.offset - b.offset) % stride
+            }
+            _ => f.offset,
+        };
+        Some((per_elem, off, f.width))
     }
 
     /// `<path>.<member>[i].<leaf>` where the container and member arrive as
@@ -859,9 +869,9 @@ impl<'a> BytecodeCompiler<'a> {
         for seg in &mut bare.path {
             seg.selects.clear();
         }
-        let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
+        let (root_key, layout) = self.packed_struct_layout_for_hier(&bare)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf, elem_w)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&layout, member, leaf, elem_w)?;
         let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
             let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
             self.compile_expr(&e, 0)?
@@ -1179,7 +1189,7 @@ impl<'a> BytecodeCompiler<'a> {
         &self,
         hier: &HierarchicalIdentifier,
     ) -> Option<(usize, String, String, u32, u32)> {
-        let fields_tbl = self.packed_struct_fields?;
+        let fields_tbl = self.packed_struct_layouts?;
         if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
@@ -1197,10 +1207,15 @@ impl<'a> BytecodeCompiler<'a> {
             }) else {
                 continue;
             };
-            let Some(layout) = fields_tbl.get(&key).or_else(|| fields_tbl.get(base)) else {
+            let Some(layout) = fields_tbl
+                .get(&key)
+                .or_else(|| fields_tbl.get(base))
+                .filter(|l| !l.is_mixed)
+            else {
                 continue;
             };
-            if let Some(&(_, off, w)) = layout.iter().find(|(m, _, _)| m == member) {
+            if let Some(f) = layout.get(member) {
+                let (off, w) = (f.offset, f.width);
                 // A nested member is compiled only when its declared sign is
                 // known (§7.2.1); otherwise it keeps the interpreter's path.
                 if w == 0

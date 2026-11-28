@@ -4164,10 +4164,12 @@ impl Simulator {
                         let target = resolved_dt.as_ref().unwrap_or(dt);
                         let spec = self.class_type_env(target);
                         let params = self.spec_param_env(&spec);
-                        let w = super::elaborate::resolve_type_width_env(
+                        let w = super::elaborate::resolve_type_width_with_typedef_dims(
                             target,
                             Some(&params),
                             Some(&self.module.typedefs),
+                            &self.module.typedef_types,
+                            &self.module.typedef_unpacked_dims,
                         )
                         .max(1);
                         return Value::from_u64(w as u64, 32);
@@ -4460,6 +4462,11 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                    // §7.3.2 / §20.6.2: `$bits(u.Val)` on a tagged union member
+                    // returns the member's declared width, not the whole union's.
+                    if let Some(w) = self.tagged_union_member_width_of_expr(arg) {
+                        return Value::from_u64(w as u64, 32);
                     }
                     // §20.6.2: `$bits(s.arr)` on a struct member declared
                     // with UNPACKED dimensions is the WHOLE array —

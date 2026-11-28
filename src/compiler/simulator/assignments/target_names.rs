@@ -15,6 +15,7 @@ impl Simulator {
             return Some(id);
         }
         resolve_array_elem_id(name, &self.array_first_id)
+            .or_else(|| resolve_nd_array_elem_id(name, &self.array_nd_first_id))
     }
 
     /// Look up flat signal_id for array element `name[idx]`. With the

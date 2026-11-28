@@ -21,7 +21,9 @@ module sub;
   logic [15:0] regs [0:299];
 endmodule
 module top;
+  logic [15:0] regs [0:299];
   logic [11:0] mem [0:299];
+  real         rmem [0:299];
   logic [11:0] tap, seen, forced;
   logic [15:0] hier;
   int hits = 0;
@@ -30,6 +32,7 @@ module top;
   always @(mem[3]) hits++;
   initial begin
     mem[5] = 12'h123;
+    rmem[5] = 3.5;
     #1 seen = tap;
     mem[3] = 12'h001;
     #1 mem[3] = 12'h002;
@@ -52,10 +55,17 @@ endmodule
     assert_eq!(u(&sim, "hier"), 0xbeef, "hierarchical element reference");
     assert_eq!(u(&sim, "forced"), 0xaa, "force on an element");
     assert_eq!(
-        sim.get_signal("mem[5]")
-            .or_else(|| sim.get_signal("top.mem[5]"))
+        sim.get_signal_value("mem[5]")
+            .or_else(|| sim.get_signal_value("top.mem[5]"))
             .and_then(|v| v.to_u64()),
         Some(0x123),
+        "a packed element's value resolves by name"
+    );
+    assert_eq!(
+        sim.get_signal("rmem[5]")
+            .or_else(|| sim.get_signal("top.rmem[5]"))
+            .map(|v| v.to_f64()),
+        Some(3.5),
         "an element's virtual name resolves"
     );
 }

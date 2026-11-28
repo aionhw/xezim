@@ -160,8 +160,20 @@ impl Simulator {
     /// Render an already-extracted `Value` interpreted as `dt` (used for the
     /// bit-slices of a packed struct, which have no signal of their own).
     pub(super) fn render_p_value_typed(&mut self, v: &Value, dt: &DataType) -> String {
+        self.render_p_value_typed_mode(v, dt, false)
+    }
+
+    fn render_p_value_typed_mode(
+        &mut self,
+        v: &Value,
+        dt: &DataType,
+        lsb_first_unpacked: bool,
+    ) -> String {
         match self.resolve_dt(dt) {
-            DataType::Struct(su) if su.packed => self.render_p_packed(v, &su),
+            DataType::Struct(su) if su.tagged => self.render_p_tagged_union_val(v, &su, None),
+            DataType::Struct(su) if su.packed || lsb_first_unpacked => {
+                self.render_p_packed_mode(v, &su, lsb_first_unpacked)
+            }
             _ => self.p_leaf_value(v, dt),
         }
     }
@@ -233,7 +245,7 @@ impl Simulator {
     }
 
     /// The members of the plain unpacked structure `su` held packed in `v`.
-    fn render_p_plain_struct_value(
+    pub(super) fn render_p_plain_struct_value(
         &mut self,
         su: &crate::ast::types::StructUnionType,
         v: &Value,
@@ -266,6 +278,15 @@ impl Simulator {
         v: &Value,
         su: &crate::ast::types::StructUnionType,
     ) -> String {
+        self.render_p_packed_mode(v, su, false)
+    }
+
+    fn render_p_packed_mode(
+        &mut self,
+        v: &Value,
+        su: &crate::ast::types::StructUnionType,
+        lsb_first_unpacked: bool,
+    ) -> String {
         let mut items: Vec<(String, u32, DataType)> = Vec::new();
         for m in &su.members {
             let w = super::elaborate::resolve_type_width(
@@ -279,12 +300,24 @@ impl Simulator {
             }
         }
         let is_union = matches!(su.kind, crate::ast::types::StructUnionKind::Union);
+        let next_lsb_first = if is_union {
+            !su.packed && !su.soft && !su.tagged
+        } else {
+            lsb_first_unpacked && !su.packed && !su.soft
+        };
         let mut offs = vec![0u32; items.len()];
         if !is_union {
             let mut off = 0u32;
-            for i in (0..items.len()).rev() {
-                offs[i] = off;
-                off += items[i].1;
+            if !su.packed && !su.soft && lsb_first_unpacked {
+                for i in 0..items.len() {
+                    offs[i] = off;
+                    off += items[i].1;
+                }
+            } else {
+                for i in (0..items.len()).rev() {
+                    offs[i] = off;
+                    off += items[i].1;
+                }
             }
         }
         // §7.3 / §21.2.1.7 (#566, majority): a PACKED union prints its first
@@ -311,7 +344,11 @@ impl Simulator {
                     let bits = sub.to_u64().unwrap_or(0);
                     return format!("{}:{}", n, Self::p_real(f64::from_bits(bits)));
                 }
-                format!("{}:{}", n, self.render_p_value_typed(&sub, &mdt))
+                format!(
+                    "{}:{}",
+                    n,
+                    self.render_p_value_typed_mode(&sub, &mdt, next_lsb_first)
+                )
             })
             .collect();
         format!("'{{{}}}", parts.join(", "))
@@ -372,12 +409,12 @@ impl Simulator {
         }
         match self.resolve_dt(dt) {
             DataType::Struct(su) => {
-                // A tagged union prints only its active member.
-                if let Some(tag) = self.active_union_tag.get(name).cloned() {
+                // A tagged union prints only its active member: `'{tagged Tag:val}`.
+                if su.tagged || self.active_union_tag.contains_key(name) {
                     let v = self
-                        .get_signal_value_by_name(name)
-                        .unwrap_or_else(|| Value::zero(1));
-                    return format!("'{{{}:{}}}", tag, v.to_dec_string());
+                        .get_local_or_signal(name)
+                        .unwrap_or_else(|| Value::new(1));
+                    return self.render_p_tagged_union_val(&v, &su, Some(name));
                 }
                 // A PACKED struct has no per-member signals — its members are
                 // bit-slices of the container's own value. So does an untagged

@@ -978,11 +978,7 @@ impl Simulator {
         compiler.set_params(&self.module.parameters);
         compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);
-        compiler.set_packed_struct_fields(
-            self.bc_packed_fields
-                .as_ref()
-                .unwrap_or(&self.module.packed_struct_fields),
-        );
+        compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
         compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
         compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
         compiler.set_typedef_types(&self.module.typedef_types);

@@ -5978,6 +5978,11 @@ impl Simulator {
         // (the same predicate the dump-side fold trusts), driven by the
         // connect alone (the net it drives is its CA lhs), between non-event
         // names.
+        fn is_unpacked_array(m: &ElaboratedModule, n: &str) -> bool {
+            m.arrays.contains_key(n)
+                || m.arrays_2d.contains_key(n)
+                || m.arrays_nd.contains_key(n)
+        }
         let mut port_links: Vec<(usize, usize)> = Vec::new();
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
@@ -5987,6 +5992,8 @@ impl Simulator {
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
                 || self.module.events.contains(parent)
+                || is_unpacked_array(&self.module, child)
+                || is_unpacked_array(&self.module, parent)
             {
                 continue;
             }
@@ -6131,6 +6138,8 @@ impl Simulator {
                         || self.module.specify_delays.contains_key(ln.as_ref())
                         || alias_members.contains(ln.as_ref())
                         || alias_members.contains(rn.as_ref())
+                        || is_unpacked_array(&self.module, ln.as_ref())
+                        || is_unpacked_array(&self.module, rn.as_ref())
                     {
                         return None;
                     }
@@ -6410,6 +6419,9 @@ impl Simulator {
                 if let Some(e) = self.array_first_id.get_mut(port) {
                     e.0 = e.0.wrapping_add(delta);
                 }
+                if let Some(e) = self.array_nd_first_id.get_mut(port) {
+                    e.0 = e.0.wrapping_add(delta);
+                }
                 // Typed as a wire in a dump, as a collapsed scalar port is.
                 self.collapsed_port_children.insert(port.to_string());
                 collapsed[k] = true;
@@ -6484,6 +6496,7 @@ impl Simulator {
             .get(name.as_str())
             .copied()
             .or_else(|| resolve_array_elem_id(&name, &self.array_first_id))
+            .or_else(|| resolve_nd_array_elem_id(&name, &self.array_nd_first_id))
     }
 
     /// Width, realness and two-state-ness of a cell, in the signal table or
@@ -6491,7 +6504,7 @@ impl Simulator {
     pub(super) fn cell_storage(&self, id: usize) -> Option<(u32, bool, bool)> {
         if is_packed_id(id) {
             let (seg, _) = self.packed.locate(id)?;
-            return Some((seg.width as u32, false, seg.xmask == 0));
+            return Some((seg.width, false, seg.xmask == 0));
         }
         Some((
             *self.signal_widths.get(id)?,
@@ -6726,11 +6739,7 @@ impl Simulator {
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
-            compiler.set_packed_struct_fields(
-                self.bc_packed_fields
-                    .as_ref()
-                    .unwrap_or(&self.module.packed_struct_fields),
-            );
+            compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
             compiler.set_typedef_types(&self.module.typedef_types);
@@ -6738,11 +6747,7 @@ impl Simulator {
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             Self::set_pattern_type_tables(&self.module, &mut compiler);
-            compiler.set_packed_struct_fields(
-                self.bc_packed_fields
-                    .as_ref()
-                    .unwrap_or(&self.module.packed_struct_fields),
-            );
+            compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
@@ -7161,11 +7166,7 @@ impl Simulator {
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
-                compiler.set_packed_struct_fields(
-                    self.bc_packed_fields
-                        .as_ref()
-                        .unwrap_or(&self.module.packed_struct_fields),
-                );
+                compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
@@ -7212,11 +7213,7 @@ impl Simulator {
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_param_leaf_idx(self.param_leaf_index());
                 delay_compiler.set_cast_widths(&self.cast_widths);
-                delay_compiler.set_packed_struct_fields(
-                    self.bc_packed_fields
-                        .as_ref()
-                        .unwrap_or(&self.module.packed_struct_fields),
-                );
+                delay_compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler
                     .set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);

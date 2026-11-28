@@ -328,6 +328,7 @@ fn check_module_item(
             check_packed_dims(&d.data_type, scope.elab, errs);
             // §7.4: a net array has fixed-size dimensions only.
             for decl in &d.declarators {
+                check_unpacked_dims(&decl.name.name, &decl.dimensions, scope, errs);
                 let kind = decl.dimensions.iter().find_map(|dim| match dim {
                     UnpackedDimension::Unsized(_) => Some("a dynamic array"),
                     UnpackedDimension::Queue { .. } => Some("a queue"),
@@ -2071,6 +2072,8 @@ fn check_typedef(
         return;
     }
     check_enum_type(&t.data_type, scope, errs);
+    check_packed_dims(&t.data_type, elab, errs);
+    check_unpacked_dims(&t.name.name, &t.dimensions, scope, errs);
     if let DataType::TypeReference { name, .. } = &t.data_type {
         // package-qualified (`pkg::T`) — out of scope for this conservative check
         if name.has_scope() {
@@ -2754,19 +2757,17 @@ fn check_new_array_target(dt: &DataType, decl: &VarDeclarator, errs: &mut Vec<St
     if !is_new_construction(init) {
         return;
     }
-    // Only reason about plainly-integral targets — a class handle legitimately
-    // takes `new(...)`, and a typedef could alias a dynamic array.
-    if !matches!(
-        dt,
-        DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Implicit { .. }
-    ) {
+    let has_dynamic_dim = matches!(decl.dimensions.first(), Some(UnpackedDimension::Unsized(_)));
+    if has_dynamic_dim {
         return;
     }
-    let has_dynamic_dim = decl
-        .dimensions
-        .iter()
-        .any(|d| matches!(d, UnpackedDimension::Unsized(_)));
-    if !has_dynamic_dim {
+    let is_plain_integral = matches!(
+        dt,
+        DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Implicit { .. }
+    );
+    // Reject integral/scalar targets AND any declaration whose outermost
+    // unpacked dimension is not `[]` (fixed array, queue, assoc, `arr[1][2][]`).
+    if is_plain_integral || !decl.dimensions.is_empty() {
         errs.push(format!(
             "the `new[]` array constructor may only initialize a dynamic array, not '{}' \
              (LRM 1800-2017 §7.5)",

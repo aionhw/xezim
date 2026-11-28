@@ -181,7 +181,8 @@ impl Simulator {
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
             | CombItem::ScatterGate { .. }
-            | CombItem::CtlGate { .. } => false,
+            | CombItem::CtlGate { .. }
+            | CombItem::BulkArrayCopy { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
@@ -309,8 +310,8 @@ impl Simulator {
                 Self::exec_fused_and_fanout_isolated(*common, branches, *invert, view, dirtied);
                 true
             }
-            // AST fallback (ContAssign / AlwaysBlock) — needs the full
-            // Simulator (eval_expr / exec_statement). ast_ca=6 on c910.
+            // AST fallback (ContAssign / AlwaysBlock) — need
+            // the full Simulator.
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
         }
     }
@@ -344,7 +345,8 @@ impl Simulator {
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
             | CombItem::ScatterGate { .. }
-            | CombItem::CtlGate { .. } => false,
+            | CombItem::CtlGate { .. }
+            | CombItem::BulkArrayCopy { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).

@@ -43,17 +43,40 @@ enum Kind {
     Scalar(Members),
 }
 
+#[derive(Clone, Copy)]
+enum ReturnMode<'a> {
+    Single(&'a str),
+    Multi,
+}
+
 struct Ctx<'a> {
     names: HashMap<String, Kind>,
     /// The function's own name, its implicit result variable (§13.4.1).
     fname: &'a str,
     ret: &'a Members,
-    sel: &'a str,
+    mode: ReturnMode<'a>,
     replication_allowed: &'a dyn Fn(&Members) -> bool,
 }
 
+pub(crate) struct ScalarizedMultiCall {
+    pub fd: FunctionDeclaration,
+    pub args: Vec<Expression>,
+    /// `(dotted_member_path, scalar_var_name, member_data_type)` in declaration order.
+    pub outputs: Vec<(String, String, DataType)>,
+}
+
 fn leaf(base: &str, m: &str) -> String {
-    format!("{base}__{m}")
+    let mut out = String::with_capacity(base.len() + 2 + m.len());
+    out.push_str(base);
+    out.push_str("__");
+    for ch in m.chars() {
+        if ch == '.' {
+            out.push_str("__");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn ident(name: &str, span: Span) -> Expression {
@@ -88,53 +111,6 @@ fn bare_name(e: &Expression) -> Option<&str> {
     }
 }
 
-/// A side-effect-free constructor can be projected once per destination member.
-/// Only an automatic local may be written; calls and effectful actuals retain
-/// the ordinary single-call path.
-pub(crate) fn projectable_constructor(fd: &FunctionDeclaration, args: &[Expression]) -> bool {
-    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
-        || !args.iter().all(effect_free)
-        || !fd.ports.iter().all(|p| p.direction == PortDirection::Input)
-    {
-        return false;
-    }
-    let Some((last, stmts)) = fd.items.split_last() else {
-        return false;
-    };
-    let StatementKind::Return(Some(result)) = &last.kind else {
-        return false;
-    };
-    let Some(local) = bare_name(result) else {
-        return false;
-    };
-    let Some((decl, writes)) = stmts.split_first() else {
-        return false;
-    };
-    let StatementKind::VarDecl { declarators, .. } = &decl.kind else {
-        return false;
-    };
-    if declarators.len() != 1 || declarators[0].name.name != local || declarators[0].init.is_some()
-    {
-        return false;
-    }
-    writes.iter().all(|stmt| {
-        let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind else {
-            return false;
-        };
-        let local_field = match &lvalue.kind {
-            ExprKind::MemberAccess { expr, .. } => bare_name(expr) == Some(local),
-            ExprKind::Ident(h) => {
-                h.root.is_none()
-                    && h.path.len() == 2
-                    && h.path[0].name.name == local
-                    && h.path.iter().all(|p| p.selects.is_empty())
-            }
-            _ => false,
-        };
-        local_field && effect_free(rvalue)
-    })
-}
-
 /// True when evaluating `e` has no effect: names, literals and operators over
 /// them. A call, an increment or an assignment may, so a part holding one
 /// must not be dropped or evaluated once per member (§13.5).
@@ -167,42 +143,143 @@ fn effect_free(e: &Expression) -> bool {
     }
 }
 
-/// One expression per member from a struct-valued actual or item: an ordered
-/// or named pattern is taken apart, anything else is member-selected, which
-/// evaluates it once per member, so it must have no effect.
+enum MemberGroup {
+    Leaf(String),
+    Sub(String, Members),
+}
+
+fn group_members(members: &[(String, DataType)]) -> Vec<MemberGroup> {
+    let mut groups: Vec<MemberGroup> = Vec::new();
+    for (path, dt) in members {
+        if let Some((head, tail)) = path.split_once('.') {
+            if let Some(MemberGroup::Sub(prev, list)) = groups.last_mut()
+                && prev == head
+            {
+                list.push((tail.to_string(), dt.clone()));
+            } else {
+                groups.push(MemberGroup::Sub(
+                    head.to_string(),
+                    vec![(tail.to_string(), dt.clone())],
+                ));
+            }
+        } else {
+            groups.push(MemberGroup::Leaf(path.clone()));
+        }
+    }
+    groups
+}
+
+/// Build an expression accessing dotted `path` on effect-free `base`.
+fn member_chain_expr(base: &Expression, path: &str) -> Expression {
+    if let ExprKind::Ident(h) = &base.kind
+        && h.root.is_none()
+        && h.path.iter().all(|s| s.selects.is_empty())
+    {
+        let mut new_path = h.path.clone();
+        for seg in path.split('.') {
+            new_path.push(HierPathSegment {
+                name: Identifier {
+                    name: seg.to_string(),
+                    span: base.span,
+                },
+                selects: Vec::new(),
+            });
+        }
+        return Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: new_path,
+                span: base.span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            base.span,
+        );
+    }
+    let mut cur = base.clone();
+    for seg in path.split('.') {
+        cur = Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(cur),
+                member: Identifier {
+                    name: seg.to_string(),
+                    span: base.span,
+                },
+            },
+            base.span,
+        );
+    }
+    cur
+}
+
+/// One expression per leaf member from a struct-valued actual or item (supports
+/// nested unpacked structs recursively): an ordered, named, replicated, or
+/// default pattern is taken apart, anything else is member-selected (only when
+/// effect-free so it may be evaluated per leaf cleanly).
 fn split_value(
     e: &Expression,
-    members: &Members,
+    members: &[(String, DataType)],
     replication_allowed: bool,
 ) -> Option<Vec<Expression>> {
+    if members.is_empty() {
+        return None;
+    }
+    let groups = group_members(members);
     if let ExprKind::AssignmentPattern(items) = &e.peel_typed_pattern().kind {
-        // IEEE 1800-2023 §10.9.2: replicated items become scalar actuals,
-        // each retaining its corresponding member's assignment context.
+        let mut top_exprs: Vec<Expression> = Vec::with_capacity(groups.len());
         if replication_allowed
             && let Some(parts) =
-                xezim_core::elaborate::struct_pattern_replication(items, members.len())
+                xezim_core::elaborate::struct_pattern_replication(items, groups.len())
         {
-            return Some(parts.into_iter().cloned().collect());
-        }
-        if items
+            top_exprs.extend(parts.into_iter().cloned());
+        } else if items
             .iter()
             .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
         {
-            if items.len() != members.len() {
+            if items.len() != groups.len() {
                 return None;
             }
-            return Some(items.iter().map(|it| it.expr().clone()).collect());
+            top_exprs.extend(items.iter().map(|it| it.expr().clone()));
+        } else {
+            let mut default_expr: Option<&Expression> = None;
+            let group_names: Vec<&str> = groups
+                .iter()
+                .map(|g| match g {
+                    MemberGroup::Leaf(n) | MemberGroup::Sub(n, _) => n.as_str(),
+                })
+                .collect();
+            for it in items {
+                match it {
+                    AssignmentPatternItem::Default(v) => default_expr = Some(v),
+                    AssignmentPatternItem::Named(id, _) => {
+                        if !group_names.contains(&id.ident.name.as_str()) {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            for gname in group_names {
+                let mut hit: Option<Expression> = None;
+                for it in items {
+                    if let AssignmentPatternItem::Named(id, v) = it
+                        && id.ident.name == gname
+                    {
+                        hit = Some(v.clone());
+                    }
+                }
+                top_exprs.push(hit.or_else(|| default_expr.cloned())?);
+            }
         }
         let mut out = Vec::with_capacity(members.len());
-        for (m, _) in members {
-            let hit = items.iter().find_map(|it| match it {
-                AssignmentPatternItem::Named(id, v) if id.name == *m => Some(v.clone()),
-                _ => None,
-            });
-            out.push(hit?);
-        }
-        if items.len() != members.len() {
-            return None;
+        for (g, expr) in groups.iter().zip(&top_exprs) {
+            match g {
+                MemberGroup::Leaf(_) => out.push(expr.clone()),
+                MemberGroup::Sub(_, sub_ms) => {
+                    out.extend(split_value(expr, sub_ms, replication_allowed)?);
+                }
+            }
         }
         return Some(out);
     }
@@ -212,43 +289,60 @@ fn split_value(
     Some(
         members
             .iter()
-            .map(|(m, _)| {
-                let mid = Identifier {
-                    name: m.clone(),
-                    span: e.span,
-                };
-                // A plain name's member is its own leaf signal (`n.m`).
-                if let ExprKind::Ident(h) = &e.kind
-                    && h.root.is_none()
-                    && h.path.iter().all(|s| s.selects.is_empty())
-                {
-                    let mut path = h.path.clone();
-                    path.push(HierPathSegment {
-                        name: mid,
-                        selects: Vec::new(),
-                    });
-                    return Expression::new(
-                        ExprKind::Ident(HierarchicalIdentifier {
-                            root: None,
-                            path,
-                            span: e.span,
-                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                            cached_resolved_name: crate::ast::cache::NameCache::new(),
-                            bound: crate::ast::binding::Bound::UNSET,
-                        }),
-                        e.span,
-                    );
-                }
-                Expression::new(
-                    ExprKind::MemberAccess {
-                        expr: Box::new(e.clone()),
-                        member: mid,
-                    },
-                    e.span,
-                )
-            })
+            .map(|(m, _)| member_chain_expr(e, m))
             .collect(),
     )
+}
+
+fn expr_mentions_prefix(e: &Expression, prefix: &str, fname: &str) -> bool {
+    match &e.kind {
+        ExprKind::Ident(h) => h.path.iter().any(|s| {
+            let n = s.name.name.as_str();
+            n == fname || n.starts_with(prefix)
+        }) || h.path.iter().any(|s| {
+            s.selects
+                .iter()
+                .any(|sel| expr_mentions_prefix(sel, prefix, fname))
+        }),
+        ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+            expr_mentions_prefix(x, prefix, fname)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_mentions_prefix(left, prefix, fname) || expr_mentions_prefix(right, prefix, fname)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_mentions_prefix(condition, prefix, fname)
+                || expr_mentions_prefix(then_expr, prefix, fname)
+                || expr_mentions_prefix(else_expr, prefix, fname)
+        }
+        ExprKind::Index { expr, index } => {
+            expr_mentions_prefix(expr, prefix, fname) || expr_mentions_prefix(index, prefix, fname)
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            expr_mentions_prefix(expr, prefix, fname)
+                || expr_mentions_prefix(left, prefix, fname)
+                || expr_mentions_prefix(right, prefix, fname)
+        }
+        ExprKind::MemberAccess { expr, .. } => expr_mentions_prefix(expr, prefix, fname),
+        ExprKind::Concatenation(xs) | ExprKind::SystemCall { args: xs, .. } => {
+            xs.iter().any(|x| expr_mentions_prefix(x, prefix, fname))
+        }
+        ExprKind::Replication { count, exprs } => {
+            expr_mentions_prefix(count, prefix, fname)
+                || exprs.iter().any(|x| expr_mentions_prefix(x, prefix, fname))
+        }
+        ExprKind::Call { func, args } => {
+            expr_mentions_prefix(func, prefix, fname)
+                || args.iter().any(|x| expr_mentions_prefix(x, prefix, fname))
+        }
+        _ => false,
+    }
 }
 
 impl Ctx<'_> {
@@ -262,12 +356,54 @@ impl Ctx<'_> {
         }
     }
 
+    fn sub_members_of(&self, n: &str, prefix: &str) -> Option<Members> {
+        let ms = self.members_of(n)?;
+        let pfx = format!("{prefix}.");
+        let sub: Members = ms
+            .iter()
+            .filter_map(|(m, dt)| m.strip_prefix(&pfx).map(|r| (r.to_string(), dt.clone())))
+            .collect();
+        (!sub.is_empty()).then_some(sub)
+    }
+
+    /// Peel nested `MemberAccess` (and any select-free multi-segment `Ident`)
+    /// into `(root_expr, "m1.m2....")`.
+    fn peel_member_chain<'e>(mut e: &'e Expression) -> (&'e Expression, Vec<&'e str>) {
+        let mut chain = Vec::new();
+        while let ExprKind::MemberAccess { expr, member } = &e.kind {
+            chain.push(member.name.as_str());
+            e = expr;
+        }
+        chain.reverse();
+        (e, chain)
+    }
+
+    /// If `e` names `(struct_var, dotted_path_opt)` belonging to `self.names`/`fname`.
+    fn struct_target_path(&self, e: &Expression) -> Option<(String, Option<String>)> {
+        let (base, chain) = Self::peel_member_chain(e);
+        match &base.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
+                let first = h.path.first()?.name.name.as_str();
+                if self.members_of(first).is_none() {
+                    return None;
+                }
+                let mut segs: Vec<&str> = h.path[1..].iter().map(|s| s.name.name.as_str()).collect();
+                segs.extend(chain);
+                if segs.is_empty() {
+                    Some((first.to_string(), None))
+                } else {
+                    Some((first.to_string(), Some(segs.join("."))))
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The scalar that holds member `m` of struct name `n`.
     fn scalar_of(&self, n: &str, m: &str) -> String {
-        if n == self.fname && m == self.sel {
-            n.to_string()
-        } else {
-            leaf(n, m)
+        match self.mode {
+            ReturnMode::Single(sel) if n == self.fname && m == sel => n.to_string(),
+            _ => leaf(n, m),
         }
     }
 
@@ -278,35 +414,57 @@ impl Ctx<'_> {
     fn expr(&self, e: &mut Expression) -> Option<()> {
         let span = e.span;
         let replace: Option<Expression> = match &mut e.kind {
-            ExprKind::MemberAccess { expr: base, member } => {
-                if let Some(n) = bare_name(base) {
+            ExprKind::MemberAccess {
+                expr: direct_base,
+                member,
+            } => {
+                let outer_member = member.name.as_str();
+                let (root, chain) = Self::peel_member_chain(direct_base);
+                let mut full_chain = chain;
+                full_chain.push(outer_member);
+                if let ExprKind::Ident(h) = &root.kind
+                    && h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let n = h.path[0].name.name.as_str();
                     if let Some(ms) = self.members_of(n) {
-                        ms.iter().any(|(m, _)| *m == member.name).then_some(())?;
-                        Some(ident(&self.scalar_of(n, &member.name), span))
+                        let mut segs: Vec<&str> =
+                            h.path[1..].iter().map(|s| s.name.name.as_str()).collect();
+                        segs.extend(full_chain);
+                        let joined = segs.join(".");
+                        ms.iter().any(|(m, _)| *m == joined).then_some(())?;
+                        Some(ident(&self.scalar_of(n, &joined), span))
                     } else if self.is_struct_name(n) {
                         return None; // a member of the whole array
                     } else {
-                        return self.expr(base);
+                        self.expr(direct_base)?;
+                        None
                     }
-                } else if let ExprKind::Index { expr: arr, index } = &mut base.kind {
+                } else if let ExprKind::Index { expr: arr, index } = &root.kind {
                     match bare_name(arr).and_then(|n| self.names.get(n).map(|k| (n, k))) {
                         Some((n, Kind::Array(ms, _))) => {
-                            ms.iter().any(|(m, _)| *m == member.name).then_some(())?;
+                            let joined = full_chain.join(".");
+                            ms.iter().any(|(m, _)| *m == joined).then_some(())?;
                             let n = n.to_string();
-                            self.expr(index)?;
+                            let mut idx = index.clone();
+                            self.expr(&mut idx)?;
                             Some(Expression::new(
                                 ExprKind::Index {
-                                    expr: Box::new(ident(&leaf(&n, &member.name), arr.span)),
-                                    index: index.clone(),
+                                    expr: Box::new(ident(&leaf(&n, &joined), arr.span)),
+                                    index: idx,
                                 },
                                 span,
                             ))
                         }
                         Some(_) => return None,
-                        None => return self.expr(base),
+                        None => {
+                            self.expr(direct_base)?;
+                            None
+                        }
                     }
                 } else {
-                    return self.expr(base);
+                    self.expr(direct_base)?;
+                    None
                 }
             }
             // `d.size()` / `d.num()`: the call site fixes the element count
@@ -338,22 +496,33 @@ impl Ctx<'_> {
                 }
             }
             ExprKind::Ident(h) => {
-                let n = h
-                    .path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>();
-                if h.root.is_none() && self.is_struct_name(n[0]) {
-                    // A whole struct in an unsupported position, or a dotted
-                    // name (`r.V`) this rewrite does not scalarize.
-                    return None;
-                }
-                for s in &mut h.path {
-                    for sel in &mut s.selects {
-                        self.expr(sel)?;
+                let n = h.path[0].name.name.as_str();
+                if h.root.is_none() && self.is_struct_name(n) {
+                    if h.path.len() >= 2
+                        && h.path.iter().all(|s| s.selects.is_empty())
+                        && let Some(ms) = self.members_of(n)
+                    {
+                        let joined = h.path[1..]
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if ms.iter().any(|(m, _)| *m == joined) {
+                            Some(ident(&self.scalar_of(n, &joined), span))
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
                     }
+                } else {
+                    for s in &mut h.path {
+                        for sel in &mut s.selects {
+                            self.expr(sel)?;
+                        }
+                    }
+                    None
                 }
-                None
             }
             ExprKind::Number(_) | ExprKind::StringLiteral(_) => None,
             ExprKind::Unary { operand, .. } => {
@@ -385,6 +554,30 @@ impl Ctx<'_> {
                 }
                 self.expr(a)?;
                 self.expr(index)?;
+                None
+            }
+            ExprKind::RangeSelect {
+                expr: a,
+                left,
+                right,
+                ..
+            } => {
+                self.expr(a)?;
+                self.expr(left)?;
+                self.expr(right)?;
+                None
+            }
+            ExprKind::Concatenation(xs) => {
+                for x in xs {
+                    self.expr(x)?;
+                }
+                None
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.expr(count)?;
+                for x in exprs {
+                    self.expr(x)?;
+                }
                 None
             }
             ExprKind::SystemCall { args, .. } => {
@@ -524,21 +717,45 @@ impl Ctx<'_> {
                 )]
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
-                if let Some(n) = bare_name(lvalue)
-                    && let Some(ms) = self.members_of(n)
-                {
-                    // Whole-struct write: one write per member. A struct
-                    // source names its scalars directly; anything else is
-                    // split and then rewritten like any expression.
-                    let src: Vec<Expression> = match bare_name(rvalue)
-                        .and_then(|r| self.members_of(r).map(|_| r))
-                    {
-                        Some(r) => ms
+                let target_struct = self.struct_target_path(lvalue).and_then(|(n, pfx_opt)| {
+                    match pfx_opt {
+                        None => Some((n.clone(), None, self.members_of(&n)?.clone())),
+                        Some(pfx) => {
+                            let ms = self.members_of(&n)?;
+                            if ms.iter().any(|(m, _)| m == &pfx) {
+                                None
+                            } else {
+                                Some((n.clone(), Some(pfx.clone()), self.sub_members_of(&n, &pfx)?))
+                            }
+                        }
+                    }
+                });
+                if let Some((n, pfx_opt, ms)) = target_struct {
+                    let dst_name = |m: &str| match &pfx_opt {
+                        None => self.scalar_of(&n, m),
+                        Some(p) => self.scalar_of(&n, &format!("{p}.{m}")),
+                    };
+                    let src_struct = self.struct_target_path(rvalue).and_then(|(r, rpfx)| {
+                        let rms = match &rpfx {
+                            None => self.members_of(&r)?.clone(),
+                            Some(rp) => self.sub_members_of(&r, rp)?,
+                        };
+                        (rms.len() == ms.len() && rms.iter().zip(&ms).all(|(a, b)| a.0 == b.0))
+                            .then_some((r, rpfx))
+                    });
+                    let src: Vec<Expression> = match src_struct {
+                        Some((r, rpfx)) => ms
                             .iter()
-                            .map(|(m, _)| ident(&self.scalar_of(r, m), rvalue.span))
+                            .map(|(m, _)| {
+                                let sm = match &rpfx {
+                                    None => self.scalar_of(&r, m),
+                                    Some(rp) => self.scalar_of(&r, &format!("{rp}.{m}")),
+                                };
+                                ident(&sm, rvalue.span)
+                            })
                             .collect(),
                         None => {
-                            let mut v = split_value(rvalue, ms, (self.replication_allowed)(ms))?;
+                            let mut v = split_value(rvalue, &ms, (self.replication_allowed)(&ms))?;
                             for e in &mut v {
                                 self.expr(e)?;
                             }
@@ -547,7 +764,7 @@ impl Ctx<'_> {
                     };
                     ms.iter()
                         .zip(src)
-                        .map(|((m, _), e)| self.assign(self.scalar_of(n, m), e, span))
+                        .map(|((m, _), e)| self.assign(dst_name(m), e, span))
                         .collect()
                 } else {
                     let (mut l, mut r) = (lvalue.clone(), rvalue.clone());
@@ -560,29 +777,73 @@ impl Ctx<'_> {
                 }
             }
             StatementKind::Return(None) => vec![s.clone()],
-            StatementKind::Return(Some(e)) => {
-                let pick = if let Some(n) = bare_name(e)
-                    && self.members_of(n).is_some()
-                {
-                    ident(&self.scalar_of(n, self.sel), e.span)
-                } else {
-                    let parts = split_value(e, self.ret, (self.replication_allowed)(self.ret))?;
-                    let i = self.ret.iter().position(|(m, _)| m == self.sel)?;
-                    // §10.9.2: every item of the pattern is evaluated; only
-                    // the selected one is kept here.
-                    if parts
-                        .iter()
-                        .enumerate()
-                        .any(|(j, p)| j != i && !effect_free(p))
+            StatementKind::Return(Some(e)) => match self.mode {
+                ReturnMode::Single(sel) => {
+                    let pick = if let Some(n) = bare_name(e)
+                        && self.members_of(n).is_some()
                     {
-                        return None;
+                        ident(&self.scalar_of(n, sel), e.span)
+                    } else {
+                        let parts = split_value(e, self.ret, (self.replication_allowed)(self.ret))?;
+                        let i = self.ret.iter().position(|(m, _)| m == sel)?;
+                        // §10.9.2: every item of the pattern is evaluated; only
+                        // the selected one is kept here.
+                        if parts
+                            .iter()
+                            .enumerate()
+                            .any(|(j, p)| j != i && !effect_free(p))
+                        {
+                            return None;
+                        }
+                        let mut v = parts[i].clone();
+                        self.expr(&mut v)?;
+                        v
+                    };
+                    mk(StatementKind::Return(Some(pick)))
+                }
+                ReturnMode::Multi => {
+                    if bare_name(e) == Some(self.fname) {
+                        mk(StatementKind::Return(None))
+                    } else if let Some(r) = bare_name(e)
+                        && self.members_of(r).is_some_and(|rms| {
+                            rms.len() == self.ret.len()
+                                && rms.iter().zip(self.ret).all(|(a, b)| a.0 == b.0)
+                        })
+                    {
+                        let mut out: Vec<Statement> = self
+                            .ret
+                            .iter()
+                            .map(|(m, _)| {
+                                self.assign(
+                                    leaf(self.fname, m),
+                                    ident(&self.scalar_of(r, m), e.span),
+                                    span,
+                                )
+                            })
+                            .collect();
+                        out.push(Statement::new(StatementKind::Return(None), span));
+                        out
+                    } else {
+                        let mut parts =
+                            split_value(e, self.ret, (self.replication_allowed)(self.ret))?;
+                        let fname_pfx = format!("{}__", self.fname);
+                        for v in &mut parts {
+                            self.expr(v)?;
+                            if expr_mentions_prefix(v, &fname_pfx, self.fname) {
+                                return None;
+                            }
+                        }
+                        let mut out: Vec<Statement> = self
+                            .ret
+                            .iter()
+                            .zip(parts)
+                            .map(|((m, _), v)| self.assign(leaf(self.fname, m), v, span))
+                            .collect();
+                        out.push(Statement::new(StatementKind::Return(None), span));
+                        out
                     }
-                    let mut v = parts[i].clone();
-                    self.expr(&mut v)?;
-                    v
-                };
-                mk(StatementKind::Return(Some(pick)))
-            }
+                }
+            },
             StatementKind::If {
                 unique_priority,
                 condition,
@@ -599,6 +860,63 @@ impl Ctx<'_> {
                         Some(e) => Some(self.one(e)?),
                         None => None,
                     },
+                })
+            }
+            StatementKind::Case {
+                unique_priority,
+                kind,
+                expr,
+                items,
+            } => {
+                let mut ce = expr.clone();
+                self.expr(&mut ce)?;
+                let mut out_items = Vec::with_capacity(items.len());
+                for item in items {
+                    if item.pattern.is_some() || item.guard.is_some() {
+                        return None;
+                    }
+                    let mut pats = item.patterns.clone();
+                    for p in &mut pats {
+                        self.expr(p)?;
+                    }
+                    out_items.push(CaseItem {
+                        patterns: pats,
+                        is_default: item.is_default,
+                        stmt: *self.one(&item.stmt)?,
+                        span: item.span,
+                        pattern: None,
+                        guard: None,
+                    });
+                }
+                mk(StatementKind::Case {
+                    unique_priority: *unique_priority,
+                    kind: *kind,
+                    expr: ce,
+                    items: out_items,
+                })
+            }
+            StatementKind::While { condition, body } => {
+                let mut c = condition.clone();
+                self.expr(&mut c)?;
+                mk(StatementKind::While {
+                    condition: c,
+                    body: self.one(body)?,
+                })
+            }
+            StatementKind::DoWhile { body, condition } => {
+                let mut c = condition.clone();
+                self.expr(&mut c)?;
+                mk(StatementKind::DoWhile {
+                    body: self.one(body)?,
+                    condition: c,
+                })
+            }
+            StatementKind::Repeat { count, body } => {
+                let mut c = count.clone();
+                self.expr(&mut c)?;
+                mk(StatementKind::Repeat {
+                    count: c,
+                    body: self.one(body)?,
                 })
             }
             StatementKind::Foreach { array, vars, body } => {
@@ -658,19 +976,19 @@ impl Ctx<'_> {
     }
 }
 
-/// Rewrite `fd` and its actuals `args` into an equivalent function over
-/// scalars whose result is member `sel` of `fd`'s struct result.
-/// `struct_members` resolves a declared type to its members when it is an
-/// unpacked struct of scalars, and returns None otherwise.
-pub(crate) fn scalarize_member_call(
+fn scalarize_impl(
     fd: &FunctionDeclaration,
     args: &[Expression],
-    sel: &str,
+    mode: ReturnMode<'_>,
     struct_members: &dyn Fn(&DataType) -> Option<Members>,
     replication_allowed: &dyn Fn(&Members) -> bool,
-) -> Option<(FunctionDeclaration, Vec<Expression>)> {
+) -> Option<(FunctionDeclaration, Vec<Expression>, Members)> {
     let ret = struct_members(&fd.return_type)?;
-    let sel_ty = ret.iter().find(|(m, _)| m == sel)?.1.clone();
+    if let ReturnMode::Single(sel) = mode
+        && !ret.iter().any(|(m, _)| m == sel)
+    {
+        return None;
+    }
     if fd.ports.len() != args.len() {
         return None;
     }
@@ -765,7 +1083,16 @@ pub(crate) fn scalarize_member_call(
                         collect(std::slice::from_ref(e), f)?;
                     }
                 }
-                StatementKind::For { body, .. } | StatementKind::Foreach { body, .. } => {
+                StatementKind::Case { items, .. } => {
+                    for item in items {
+                        collect(std::slice::from_ref(&item.stmt), f)?;
+                    }
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. } => {
                     collect(std::slice::from_ref(body), f)?
                 }
                 _ => {}
@@ -808,6 +1135,11 @@ pub(crate) fn scalarize_member_call(
                     out.extend(vars.iter().flatten().map(|v| v.name.clone()));
                     loop_vars(std::slice::from_ref(body), out);
                 }
+                StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. } => {
+                    loop_vars(std::slice::from_ref(body), out);
+                }
                 StatementKind::SeqBlock { stmts, .. } => loop_vars(stmts, out),
                 StatementKind::If {
                     then_stmt,
@@ -817,6 +1149,11 @@ pub(crate) fn scalarize_member_call(
                     loop_vars(std::slice::from_ref(then_stmt), out);
                     if let Some(e) = else_stmt {
                         loop_vars(std::slice::from_ref(e), out);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    for item in items {
+                        loop_vars(std::slice::from_ref(&item.stmt), out);
                     }
                 }
                 _ => {}
@@ -838,13 +1175,20 @@ pub(crate) fn scalarize_member_call(
         names,
         fname: &fname,
         ret: &ret,
-        sel,
+        mode,
         replication_allowed,
     };
     let mut items = Vec::new();
-    // The result's other members, should the body write them through the
-    // function name (`f.I = ...`).
-    for (m, mdt) in ret.iter().filter(|(m, _)| m != sel) {
+    // Declare `fname__m` result variables at the top of the body: in Single mode
+    // only non-`sel` fields need locals (the selected field uses `fname` / ret_slot);
+    // in Multi mode ALL fields are declared so `compile_pure_body` initializes
+    // them with exact types and `fn_is_pure_in_ext` recognizes them as local state.
+    for (m, mdt) in &ret {
+        if let ReturnMode::Single(sel) = mode
+            && m == sel
+        {
+            continue;
+        }
         items.push(Statement::new(
             StatementKind::VarDecl {
                 data_type: mdt.clone(),
@@ -865,11 +1209,56 @@ pub(crate) fn scalarize_member_call(
     }
     items.extend(ctx.stmts(&fd.items)?);
     let mut out = fd.clone();
-    // A span of its own: per-declaration facts (the purity memo) are keyed
-    // by name and span, and this body is not the declared one.
-    out.span = Span::new(fd.span.end, fd.span.end);
-    out.return_type = sel_ty;
+    // Distinct spans keep purity-memo keys separate from the original body
+    // (`start..end`) and between Single (`end..end`) and Multi (`start..start`).
+    if let ReturnMode::Single(sel) = mode {
+        out.span = Span::new(fd.span.end, fd.span.end);
+        out.return_type = ret.iter().find(|(m, _)| m == sel)?.1.clone();
+    } else {
+        out.span = Span::new(fd.span.start, fd.span.start);
+        out.return_type = DataType::Void(fd.span);
+    }
     out.ports = ports;
     out.items = items.into();
+    Some((out, new_args, ret))
+}
+
+/// Rewrite `fd` and its actuals `args` into an equivalent function over
+/// scalars whose result is member `sel` of `fd`'s struct result.
+pub(crate) fn scalarize_member_call(
+    fd: &FunctionDeclaration,
+    args: &[Expression],
+    sel: &str,
+    struct_members: &dyn Fn(&DataType) -> Option<Members>,
+    replication_allowed: &dyn Fn(&Members) -> bool,
+) -> Option<(FunctionDeclaration, Vec<Expression>)> {
+    let (out, new_args, _) =
+        scalarize_impl(fd, args, ReturnMode::Single(sel), struct_members, replication_allowed)?;
     Some((out, new_args))
+}
+
+/// Rewrite `fd` and its actuals `args` into a single void-return body over
+/// scalars writing all leaf outputs `(dotted_member, scalar_var, member_dt)`,
+/// so multi-member struct calls execute ONCE instead of N times.
+pub(crate) fn scalarize_multi_call(
+    fd: &FunctionDeclaration,
+    args: &[Expression],
+    struct_members: &dyn Fn(&DataType) -> Option<Members>,
+    replication_allowed: &dyn Fn(&Members) -> bool,
+) -> Option<ScalarizedMultiCall> {
+    let fname = fd.name.name.name.as_str();
+    let (out, new_args, ret) =
+        scalarize_impl(fd, args, ReturnMode::Multi, struct_members, replication_allowed)?;
+    let outputs = ret
+        .into_iter()
+        .map(|(m, dt)| {
+            let sname = leaf(fname, &m);
+            (m, sname, dt)
+        })
+        .collect();
+    Some(ScalarizedMultiCall {
+        fd: out,
+        args: new_args,
+        outputs,
+    })
 }

@@ -567,7 +567,9 @@ fn deposit(sim: &mut Simulator, id: usize, value: Value) {
 /// told (§38.35) — no wake-ups, no value-change callbacks.
 fn deposit_quiet(sim: &mut Simulator, id: usize, value: Value) {
     if is_packed_id(id) {
-        sim.packed.write(id, &value);
+        if sim.packed.write(id, &value) {
+            sim.note_packed_seg_dirty(id);
+        }
         return;
     }
     write_sig!(sim, id, value);
@@ -1132,6 +1134,25 @@ fn element_id(sim: &Simulator, view: &ArrayView, idx: &[i64]) -> Option<usize> {
         if let Some(&(first, lo, hi)) = sim.array_first_id.get(view.base.as_str()) {
             let i = idx[0];
             return (i >= lo && i <= hi).then(|| first + (i - lo) as usize);
+        }
+    }
+    if view.dims.len() >= 2 {
+        if let Some((first, shape)) = sim.array_nd_first_id.get(view.base.as_str()) {
+            if shape.len() == idx.len() {
+                let mut off = 0usize;
+                let mut ok = true;
+                for (&i, &(lo, hi)) in idx.iter().zip(shape.iter()) {
+                    if i < lo || i > hi {
+                        ok = false;
+                        break;
+                    }
+                    let span = (hi - lo + 1) as usize;
+                    off = off * span + (i - lo) as usize;
+                }
+                if ok {
+                    return Some(*first + off);
+                }
+            }
         }
     }
     let mut name = view.base.clone();
@@ -1973,6 +1994,7 @@ fn set_net_delays(
                 CombItem::ContAssign { .. }
                 | CombItem::DirectCopy { .. }
                 | CombItem::FastDirectCopy { .. }
+                | CombItem::BulkArrayCopy { .. }
                 | CombItem::FusedGate { .. } => {}
                 _ => {
                     return Err(

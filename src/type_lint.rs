@@ -72,17 +72,20 @@ enum Ty {
         bits: Option<u64>,
         signed: bool,
         four: bool,
+        atom: bool,
     },
     /// One enum declaration: `key` identifies it, `name` is for messages.
     Enum {
         key: Rc<str>,
         name: Rc<str>,
+        bits: Option<u64>,
     },
     Real {
         short: bool,
     },
     Str,
     Event,
+    Chandle,
     Class(Rc<str>),
     Null,
     Void,
@@ -98,6 +101,10 @@ enum Ty {
 struct StructTy {
     key: String,
     packed: bool,
+    tagged: bool,
+    has_untagged_union: bool,
+    has_dynamic_or_handle: bool,
+    packed_bits: Option<u64>,
     members: Vec<(String, Ty)>,
 }
 
@@ -116,17 +123,44 @@ enum BaseKind {
     Illegal(&'static str),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+enum AssocKey {
+    Wildcard,
+    Str,
+    Int {
+        bits: Option<u64>,
+        signed: bool,
+        four: bool,
+    },
+    Class(Rc<str>),
+    Enum(Rc<str>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Dim {
-    Fixed(Option<u64>),
+    Fixed { len: Option<u64>, desc: Option<bool> },
     Dynamic,
     Queue,
-    Assoc,
+    Assoc(Option<AssocKey>),
 }
 
 impl Ty {
     fn int(bits: Option<u64>, signed: bool, four: bool) -> Ty {
-        Ty::Int { bits, signed, four }
+        Ty::Int {
+            bits,
+            signed,
+            four,
+            atom: false,
+        }
+    }
+
+    fn atom(bits: Option<u64>, signed: bool, four: bool) -> Ty {
+        Ty::Int {
+            bits,
+            signed,
+            four,
+            atom: true,
+        }
     }
 
     /// Integral in the §6.11.1 sense (packed), which an enum or an unpacked
@@ -141,7 +175,9 @@ impl Ty {
 
     fn describe(&self) -> String {
         match self {
-            Ty::Int { bits, signed, four } => {
+            Ty::Int {
+                bits, signed, four, ..
+            } => {
                 let base = if *four { "logic" } else { "bit" };
                 let sign = if *signed { " signed" } else { "" };
                 match bits {
@@ -155,6 +191,7 @@ impl Ty {
             Ty::Real { short: false } => "real".into(),
             Ty::Str => "string".into(),
             Ty::Event => "event".into(),
+            Ty::Chandle => "chandle".into(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Null => "null".into(),
             Ty::Void => "void".into(),
@@ -170,11 +207,11 @@ impl Ty {
                 s.push_str(" $");
                 for d in dims {
                     match d {
-                        Dim::Fixed(Some(n)) => s.push_str(&format!("[{n}]")),
-                        Dim::Fixed(None) => s.push_str("[N]"),
+                        Dim::Fixed { len: Some(n), .. } => s.push_str(&format!("[{n}]")),
+                        Dim::Fixed { len: None, .. } => s.push_str("[N]"),
                         Dim::Dynamic => s.push_str("[]"),
                         Dim::Queue => s.push_str("[$]"),
-                        Dim::Assoc => s.push_str("[*]"),
+                        Dim::Assoc(_) => s.push_str("[*]"),
                     }
                 }
                 s
@@ -206,17 +243,27 @@ fn with_dims(base: Ty, dims: &[UnpackedDimension]) -> Ty {
 fn unpacked_dim(d: &UnpackedDimension) -> Dim {
     match d {
         UnpackedDimension::Range { left, right, .. } => {
-            Dim::Fixed(match (lit_i64(left), lit_i64(right)) {
-                (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
-                _ => None,
-            })
+            match (lit_i64(left), lit_i64(right)) {
+                (Some(l), Some(r)) => Dim::Fixed {
+                    len: Some(l.abs_diff(r) + 1),
+                    desc: Some(l > r),
+                },
+                _ => Dim::Fixed {
+                    len: None,
+                    desc: None,
+                },
+            }
         }
-        UnpackedDimension::Expression { expr, .. } => {
-            Dim::Fixed(lit_i64(expr).and_then(|n| u64::try_from(n).ok()))
-        }
+        UnpackedDimension::Expression { expr, .. } => Dim::Fixed {
+            len: lit_i64(expr).and_then(|n| u64::try_from(n).ok()),
+            desc: Some(false),
+        },
         UnpackedDimension::Unsized(_) => Dim::Dynamic,
         UnpackedDimension::Queue { .. } => Dim::Queue,
-        UnpackedDimension::Associative { .. } => Dim::Assoc,
+        UnpackedDimension::Associative { data_type: None, .. } => {
+            Dim::Assoc(Some(AssocKey::Wildcard))
+        }
+        UnpackedDimension::Associative { .. } => Dim::Assoc(None),
     }
 }
 
@@ -495,7 +542,7 @@ impl<'a> Ck<'a> {
                     Some(Signing::Unsigned) => false,
                     None => *kind != IntegerAtomType::Time,
                 };
-                Ty::int(Some(bits), signed, four)
+                Ty::atom(Some(bits), signed, four)
             }
             DataType::IntegerVector {
                 kind,
@@ -527,26 +574,71 @@ impl<'a> Ck<'a> {
                 kind: SimpleType::Event,
                 ..
             } => Ty::Event,
-            DataType::Simple { .. } => Ty::Unknown,
+            DataType::Simple {
+                kind: SimpleType::Chandle,
+                ..
+            } => Ty::Chandle,
             DataType::Void(_) => Ty::Void,
             DataType::Enum(et) => self.resolve_enum(et, None),
             DataType::Struct(su) => {
-                if su.tagged || !su.dimensions.is_empty() {
-                    return Ty::Unknown;
-                }
                 let mut members = Vec::new();
                 for m in &su.members {
                     let t = self.resolve(&m.data_type);
                     for d in &m.declarators {
-                        members.push((d.name.name.clone(), with_dims(t.clone(), &d.dimensions)));
+                        let mt = self.with_resolved_dims(t.clone(), &d.dimensions);
+                        members.push((d.name.name.clone(), mt));
                     }
                 }
-                if su.packed {
+                if su.packed || su.soft {
                     self.check_packed_members(su, &members);
+                }
+                let is_untagged_union = su.kind == StructUnionKind::Union && !su.tagged;
+                if is_untagged_union {
+                    self.check_untagged_union_members(su, &members);
+                }
+                let has_untagged_union = is_untagged_union
+                    || members.iter().any(|(_, t)| ty_has_untagged_union(t))
+                    || su.members.iter().any(|m| {
+                        matches!(&m.data_type, DataType::Struct(inner) if inner.kind == StructUnionKind::Union && !inner.tagged)
+                    });
+                let has_dynamic_or_handle =
+                    members.iter().any(|(_, t)| ty_has_dynamic_or_handle(t));
+                let packed_bits = if su.packed {
+                    if su.kind == StructUnionKind::Union {
+                        let max_w = members
+                            .iter()
+                            .map(|(_, t)| ty_packed_bits(t))
+                            .try_fold(0u64, |acc, b| b.map(|v| acc.max(v)));
+                        if su.tagged {
+                            let tag_w = if members.len() <= 1 {
+                                1u64
+                            } else {
+                                (members.len() as u64 - 1).ilog2() as u64 + 1
+                            };
+                            max_w.map(|m| m + tag_w)
+                        } else {
+                            max_w
+                        }
+                    } else {
+                        members
+                            .iter()
+                            .map(|(_, t)| ty_packed_bits(t))
+                            .try_fold(0u64, |acc, b| b.map(|v| acc + v))
+                    }
+                } else {
+                    None
+                };
+                self.check_struct_member_defaults(su, has_untagged_union);
+                if !su.dimensions.is_empty() {
+                    return Ty::Unknown;
                 }
                 Ty::Struct(Rc::new(StructTy {
                     key: format!("struct@{}", su.span.start),
                     packed: su.packed,
+                    tagged: su.tagged,
+                    has_untagged_union,
+                    has_dynamic_or_handle,
+                    packed_bits,
                     members,
                 }))
             }
@@ -554,28 +646,180 @@ impl<'a> Ck<'a> {
                 name,
                 dimensions,
                 type_args,
-                ..
+                span,
             } => {
                 self.check_class_type_args(&name.name.name, type_args);
-                if !dimensions.is_empty() || !type_args.is_empty() {
+                if !type_args.is_empty() {
                     return Ty::Unknown;
                 }
                 let n = name.name.name.as_str();
-                if name.has_scope() || n.contains("::") {
+                let base = if name.has_scope() || n.contains("::") {
                     let mut path: Vec<String> =
                         name.scopes.iter().map(|s| s.name.name.clone()).collect();
                     path.push(n.to_string());
-                    return self.scoped_type(&path).unwrap_or(Ty::Unknown);
+                    self.scoped_type(&path).unwrap_or(Ty::Unknown)
+                } else if let Some(t) = self.lookup_type(n) {
+                    t
+                } else if self.is_class_name(n) {
+                    Ty::Class(n.into())
+                } else {
+                    Ty::Unknown
+                };
+                if dimensions.is_empty() {
+                    base
+                } else {
+                    self.resolve_packed_dims_on_ref(n, &base, dimensions, *span)
                 }
-                if let Some(t) = self.lookup_type(n) {
-                    return t;
+            }
+            DataType::Interface { .. } => Ty::Unknown,
+        }
+    }
+
+    fn resolve_packed_dims_on_ref(
+        &mut self,
+        name: &str,
+        base: &Ty,
+        dimensions: &[PackedDimension],
+        span: Span,
+    ) -> Ty {
+        for pd in dimensions {
+            if let PackedDimension::Unsized(_) = pd {
+                if self.seen.insert(span.start as usize) {
+                    self.report(
+                        span,
+                        "an unsized packed dimension `[]` is not allowed here \
+                         (IEEE 1800-2023 §7.4.1)"
+                            .into(),
+                    );
                 }
-                if self.is_class_name(n) {
-                    return Ty::Class(n.into());
+                return Ty::Unknown;
+            }
+        }
+        match base {
+            Ty::Int {
+                bits: inner_bits,
+                signed,
+                four,
+                atom: false,
+            } => {
+                let mult = packed_bits(dimensions);
+                let bits = inner_bits.zip(mult).and_then(|(a, b)| a.checked_mul(b));
+                Ty::int(bits, *signed, *four)
+            }
+            Ty::Struct(s) if s.packed => {
+                let mult = packed_bits(dimensions);
+                let bits = s.packed_bits.zip(mult).and_then(|(a, b)| a.checked_mul(b));
+                Ty::int(bits, false, true)
+            }
+            Ty::Enum { bits, .. } => {
+                let mult = packed_bits(dimensions);
+                let bits = bits.zip(mult).and_then(|(a, b)| a.checked_mul(b));
+                Ty::int(bits, false, true)
+            }
+            Ty::Unknown => Ty::Unknown,
+            other => {
+                if self.seen.insert(span.start as usize) {
+                    self.report(
+                        span,
+                        format!(
+                            "packed dimensions cannot be applied to non-packed type '{}' ({}) \
+                             (IEEE 1800-2023 §7.4.1)",
+                            name,
+                            other.describe()
+                        ),
+                    );
                 }
                 Ty::Unknown
             }
-            DataType::Interface { .. } => Ty::Unknown,
+        }
+    }
+
+    fn resolve_unpacked_dim(&mut self, d: &UnpackedDimension) -> Dim {
+        match d {
+            UnpackedDimension::Range { left, right, .. } => {
+                match (self.eval_const(left), self.eval_const(right)) {
+                    (Some(CVal::Int(l)), Some(CVal::Int(r))) => Dim::Fixed {
+                        len: Some(l.abs_diff(r) + 1),
+                        desc: Some(l > r),
+                    },
+                    _ => Dim::Fixed {
+                        len: None,
+                        desc: None,
+                    },
+                }
+            }
+            UnpackedDimension::Expression { expr, .. } => {
+                let len = match self.eval_const(expr) {
+                    Some(CVal::Int(n)) => u64::try_from(n).ok(),
+                    _ => None,
+                };
+                Dim::Fixed {
+                    len,
+                    desc: Some(false),
+                }
+            }
+            UnpackedDimension::Unsized(_) => Dim::Dynamic,
+            UnpackedDimension::Queue { .. } => Dim::Queue,
+            UnpackedDimension::Associative {
+                data_type: None, ..
+            } => Dim::Assoc(Some(AssocKey::Wildcard)),
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                ..
+            } => {
+                if let DataType::TypeReference {
+                    name,
+                    dimensions,
+                    type_args,
+                    ..
+                } = dt.as_ref()
+                    && !name.has_scope()
+                    && dimensions.is_empty()
+                    && type_args.is_empty()
+                {
+                    let n = name.name.name.as_str();
+                    let is_known_type =
+                        matches!(self.lookup_type(n), Some(t) if !matches!(t, Ty::Unknown));
+                    if !is_known_type
+                        && !self.is_class_name(n)
+                        && let Some(v) = self.lookup_const_val(n)
+                    {
+                        return Dim::Fixed {
+                            len: u64::try_from(v).ok(),
+                            desc: Some(false),
+                        };
+                    }
+                }
+                let kty = self.resolve(dt);
+                let key = match kty {
+                    Ty::Str => Some(AssocKey::Str),
+                    Ty::Int {
+                        bits, signed, four, ..
+                    } => Some(AssocKey::Int { bits, signed, four }),
+                    Ty::Class(c) => Some(AssocKey::Class(c)),
+                    Ty::Enum { key, .. } => Some(AssocKey::Enum(key)),
+                    _ => None,
+                };
+                Dim::Assoc(key)
+            }
+        }
+    }
+
+    fn with_resolved_dims(&mut self, base: Ty, dims: &[UnpackedDimension]) -> Ty {
+        if dims.is_empty() || base == Ty::Unknown {
+            return base;
+        }
+        let mut out: Vec<Dim> = dims.iter().map(|d| self.resolve_unpacked_dim(d)).collect();
+        let elem = match base {
+            Ty::Unpacked { dims: inner, elem } => {
+                out.extend(inner);
+                *elem
+            }
+            other => other,
+        };
+        Ty::Unpacked {
+            dims: out,
+            elem: Box::new(elem),
         }
     }
 
@@ -584,10 +828,18 @@ impl<'a> Ck<'a> {
         if !et.dimensions.is_empty() || et.members.is_empty() {
             return Ty::Unknown;
         }
+        let bits = match et.base_type.as_deref() {
+            Some(bt) => {
+                let r = self.resolve(bt);
+                ty_packed_bits(&r)
+            }
+            None => Some(32),
+        };
         let key: Rc<str> = format!("{}@{}", et.members[0].name.name, et.span.start).into();
         let t = Ty::Enum {
             key,
             name: name.unwrap_or("<anonymous>").into(),
+            bits,
         };
         // §6.19: the members are constants of the enum type, declared in the
         // scope that declares the enum.
@@ -606,11 +858,12 @@ impl<'a> Ck<'a> {
         if td.forward || matches!(td.data_type, DataType::Void(_)) {
             return;
         }
+        self.check_const_dims(&td.name.name, &td.data_type, &td.dimensions);
         let t = match &td.data_type {
             DataType::Enum(et) => self.resolve_enum(et, Some(&td.name.name)),
             dt => self.resolve(dt),
         };
-        let t = with_dims(t, &td.dimensions);
+        let t = self.with_resolved_dims(t, &td.dimensions);
         let base = self.base_kind(td);
         let top = self.top();
         top.types.insert(td.name.name.clone(), t);
@@ -732,12 +985,15 @@ impl<'a> Ck<'a> {
                 Ty::Unpacked { dims, .. } => Some(match dims[0] {
                     Dim::Dynamic => "a dynamic array",
                     Dim::Queue => "a queue",
-                    Dim::Assoc => "an associative array",
-                    Dim::Fixed(_) => "an unpacked array",
+                    Dim::Assoc(_) => "an associative array",
+                    Dim::Fixed { .. } => "an unpacked array",
                 }),
                 Ty::Real { .. } => Some("a real"),
                 Ty::Str => Some("a string"),
                 Ty::Class(_) => Some("a class handle"),
+                Ty::Chandle => Some("a chandle"),
+                Ty::Event => Some("an event"),
+                Ty::Void if !su.tagged => Some("void"),
                 Ty::Struct(s) if !s.packed => Some("an unpacked struct"),
                 _ if simple => Some("an event or chandle"),
                 _ => None,
@@ -752,6 +1008,100 @@ impl<'a> Ck<'a> {
                          (IEEE 1800-2017 §7.2.1)"
                     ),
                 );
+            }
+        }
+        // §7.3.1: every member of a hard (non-`soft`, non-`tagged`) packed
+        // union shall be the same bit size.
+        if su.kind == StructUnionKind::Union && su.packed && !su.soft && !su.tagged {
+            let mut expected: Option<u64> = None;
+            let mut span_it = su.members.iter().flat_map(|m| m.declarators.iter());
+            for (d, (name, t)) in span_it.by_ref().zip(members) {
+                let Some(w) = ty_packed_bits(t) else {
+                    continue;
+                };
+                if let Some(prev) = expected {
+                    if prev != w && self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "member '{name}' of hard packed union has width {w}, expected {prev} \
+                                 (all members must match; IEEE 1800-2023 §7.3.1)"
+                            ),
+                        );
+                    }
+                } else {
+                    expected = Some(w);
+                }
+            }
+        }
+    }
+
+    /// §7.3: dynamic types, handles, strings, chandles, and events are forbidden
+    /// in untagged unions.
+    fn check_untagged_union_members(&mut self, su: &StructUnionType, members: &[(String, Ty)]) {
+        let decls = su.members.iter().flat_map(|m| m.declarators.iter());
+        for (d, (name, t)) in decls.zip(members) {
+            if ty_has_dynamic_or_handle(t) && self.seen.insert(d.span.start as usize) {
+                self.report(
+                    d.span,
+                    format!(
+                        "member '{name}' of type {} is illegal in an untagged union \
+                         (IEEE 1800-2023 §7.3)",
+                        t.describe()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// §7.2.2: member default initializers must be constant, and are forbidden
+    /// in packed structs/unions, untagged unions, and structs containing an
+    /// untagged union.
+    fn check_struct_member_defaults(
+        &mut self,
+        su: &StructUnionType,
+        has_untagged_union: bool,
+    ) {
+        for m in &su.members {
+            for d in &m.declarators {
+                let Some(init) = &d.init else {
+                    continue;
+                };
+                if su.packed || su.soft {
+                    if self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "packed struct/union member '{}' cannot have a default value \
+                                 (IEEE 1800-2023 §7.2.2)",
+                                d.name.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                if has_untagged_union {
+                    if self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "member '{}' cannot have a default value in an untagged union \
+                                 or a struct containing an untagged union (IEEE 1800-2023 §7.2.2)",
+                                d.name.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                let prev = self.errs.len();
+                self.report_nonconst(
+                    init,
+                    &|| format!("default value of struct member '{}'", d.name.name),
+                    "§7.2.2",
+                );
+                if self.errs.len() > prev {
+                    self.seen.insert(d.span.start as usize);
+                }
             }
         }
     }
@@ -887,7 +1237,7 @@ impl<'a> Ck<'a> {
                 PortSig {
                     name: p.name.name.clone(),
                     dir: p.direction,
-                    ty: with_dims(t, dims),
+                    ty: self.with_resolved_dims(t, dims),
                     has_default: p.default.is_some(),
                 }
             })
@@ -907,21 +1257,21 @@ impl<'a> Ck<'a> {
                 ModuleItem::DataDeclaration(d) => {
                     let t = self.resolve(&d.data_type);
                     for dc in &d.declarators {
-                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        let vt = self.with_resolved_dims(t.clone(), &dc.dimensions);
                         self.declare_value(&dc.name.name, vt);
                     }
                 }
                 ModuleItem::NetDeclaration(n) => {
                     let t = self.resolve(&n.data_type);
                     for dc in &n.declarators {
-                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        let vt = self.with_resolved_dims(t.clone(), &dc.dimensions);
                         self.declare_value(&dc.name.name, vt);
                     }
                 }
                 ModuleItem::PortDeclaration(pd) => {
                     let t = self.resolve(&pd.data_type);
                     for dc in &pd.declarators {
-                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        let vt = self.with_resolved_dims(t.clone(), &dc.dimensions);
                         self.declare_value(&dc.name.name, vt);
                     }
                 }
@@ -1002,7 +1352,7 @@ impl<'a> Ck<'a> {
                     Some(dt) => self.resolve(dt),
                     None => Ty::Unknown,
                 };
-                let t = with_dims(t, &p.dimensions);
+                let t = self.with_resolved_dims(t, &p.dimensions);
                 self.declare_value(&p.name.name, t);
             }
         }
@@ -1029,7 +1379,8 @@ impl<'a> Ck<'a> {
                 ClassItem::Property(p) => {
                     let t = self.resolve(&p.data_type);
                     for d in &p.declarators {
-                        props.insert(d.name.name.clone(), with_dims(t.clone(), &d.dimensions));
+                        let vt = self.with_resolved_dims(t.clone(), &d.dimensions);
+                        props.insert(d.name.name.clone(), vt);
                     }
                 }
                 ClassItem::Method(m) => match &m.kind {
@@ -1282,21 +1633,31 @@ impl<'a> Ck<'a> {
                 right,
             } => match self.ty_of(expr) {
                 Ty::Unpacked { mut dims, elem } => {
-                    // §7.4.5, §11.5.1: `a[l:r]` has |l - r| + 1 elements;
-                    // `a[b +: w]` and `a[b -: w]` have `w`, whatever the base
-                    // (it may vary at run time). Counting the base and the
-                    // width as the bounds of a range rejected `a[0 +: 6] = b`
-                    // (#869).
-                    let n = match kind {
-                        RangeKind::Constant => match (lit_i64(left), lit_i64(right)) {
-                            (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
-                            _ => None,
-                        },
-                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                            lit_i64(right).filter(|&w| w > 0).map(|w| w.unsigned_abs())
+                    let (len, desc) = match kind {
+                        RangeKind::Constant => {
+                            match (self.eval_const(left), self.eval_const(right)) {
+                                (Some(CVal::Int(l)), Some(CVal::Int(r))) => {
+                                    (Some(l.abs_diff(r) + 1), Some(l > r))
+                                }
+                                _ => (None, None),
+                            }
                         }
+                        RangeKind::IndexedUp => (
+                            self.eval_const(right).and_then(|c| match c {
+                                CVal::Int(w) if w > 0 => Some(w.unsigned_abs()),
+                                _ => None,
+                            }),
+                            Some(false),
+                        ),
+                        RangeKind::IndexedDown => (
+                            self.eval_const(right).and_then(|c| match c {
+                                CVal::Int(w) if w > 0 => Some(w.unsigned_abs()),
+                                _ => None,
+                            }),
+                            Some(true),
+                        ),
                     };
-                    dims[0] = Dim::Fixed(n);
+                    dims[0] = Dim::Fixed { len, desc };
                     Ty::Unpacked { dims, elem }
                 }
                 t if t.is_packed_value() => Ty::int(None, false, four_state(&t)),
@@ -1708,24 +2069,57 @@ impl<'a> Ck<'a> {
                 );
                 return;
             }
-            // `new(args)` and `new[n](init)` share one AST shape; only the
-            // bare `new` is certainly a class constructor.
-            if matches!(rhs.kind, ExprKind::Ident(_))
-                && matches!(
-                    lt,
-                    Ty::Int { .. }
-                        | Ty::Enum { .. }
-                        | Ty::Real { .. }
-                        | Ty::Str
-                        | Ty::Unpacked { .. }
-                )
+            // §7.5: sized `new[n]` / `new[n](src)` initializes only a variable
+            // whose outermost dimension is dynamic `[]`.
+            let is_sized_new_with_src = matches!(
+                &rhs.kind,
+                ExprKind::Call { func, .. } if matches!(&func.kind, ExprKind::Call { .. })
+            );
+            let is_bare_new = matches!(rhs.kind, ExprKind::Ident(_));
+            if let Ty::Unpacked { dims, .. } = lt {
+                if !matches!(dims.first(), Some(Dim::Dynamic)) || is_bare_new {
+                    let what = what();
+                    self.report(
+                        rhs.span,
+                        format!(
+                            "'new' can only initialize a dynamic array, not {what} of type {} \
+                             (IEEE 1800-2023 §7.5, §8.7)",
+                            lt.describe()
+                        ),
+                    );
+                }
+                return;
+            }
+            if matches!(lt, Ty::Class(_)) {
+                if is_sized_new_with_src {
+                    let what = what();
+                    self.report(
+                        rhs.span,
+                        format!(
+                            "'new[]' cannot construct a class handle {what} \
+                             (IEEE 1800-2023 §7.5, §8.7)"
+                        ),
+                    );
+                }
+                return;
+            }
+            if matches!(
+                lt,
+                Ty::Int { .. }
+                    | Ty::Enum { .. }
+                    | Ty::Real { .. }
+                    | Ty::Str
+                    | Ty::Chandle
+                    | Ty::Void
+                    | Ty::Struct(_)
+            ) && (is_bare_new || matches!(rhs.kind, ExprKind::Call { .. }))
             {
                 let what = what();
                 self.report(
                     rhs.span,
                     format!(
-                        "'new' can only be assigned to a class or covergroup handle, not to \
-                         {what} of type {} (IEEE 1800-2017 §8.7)",
+                        "'new' can only be assigned to a class handle or dynamic array, not to \
+                         {what} of type {} (IEEE 1800-2023 §7.5, §8.7)",
                         lt.describe()
                     ),
                 );
@@ -1755,6 +2149,12 @@ impl<'a> Ck<'a> {
     /// Why a value of type `rt` cannot be assigned to type `lt` (None when it
     /// can, or when that is not certain).
     fn incompatible(&self, lt: &Ty, rt: &Ty) -> Option<String> {
+        if lt.is_packed_value() && matches!(rt, Ty::Unpacked { .. }) {
+            return Some(
+                "a packed variable cannot be assigned an unpacked array (IEEE 1800-2023 §7.6)"
+                    .into(),
+            );
+        }
         match lt {
             Ty::Enum { key, .. } => match rt {
                 Ty::Enum { key: k2, .. } if k2 != key => Some(
@@ -1781,9 +2181,6 @@ impl<'a> Ck<'a> {
                     "an unpacked array takes only an unpacked array (IEEE 1800-2017 §7.6)".into(),
                 ),
                 Ty::Unpacked { dims: rd, elem: re } => {
-                    if ld.contains(&Dim::Assoc) || rd.contains(&Dim::Assoc) {
-                        return None;
-                    }
                     if ld.len() != rd.len() {
                         return Some(format!(
                             "the arrays have {} and {} unpacked dimensions (IEEE 1800-2017 §7.6)",
@@ -1791,13 +2188,44 @@ impl<'a> Ck<'a> {
                             rd.len()
                         ));
                     }
-                    for (a, b) in ld.iter().zip(rd.iter()) {
-                        if let (Dim::Fixed(Some(x)), Dim::Fixed(Some(y))) = (a, b)
-                            && x != y
-                        {
-                            return Some(format!(
-                                "the arrays have {x} and {y} elements (IEEE 1800-2017 §7.6)"
-                            ));
+                    for (idx, (a, b)) in ld.iter().zip(rd.iter()).enumerate() {
+                        match (a, b) {
+                            (Dim::Assoc(ka), Dim::Assoc(kb)) => {
+                                if let (Some(x), Some(y)) = (ka, kb)
+                                    && x != y
+                                {
+                                    return Some(
+                                        "associative arrays have incompatible key types \
+                                         (IEEE 1800-2023 §7.8)"
+                                            .into(),
+                                    );
+                                }
+                            }
+                            (Dim::Assoc(_), _) | (_, Dim::Assoc(_)) => {
+                                return Some(
+                                    "an associative array is incompatible with a non-associative \
+                                     array (IEEE 1800-2023 §7.8)"
+                                        .into(),
+                                );
+                            }
+                            (Dim::Fixed { len: Some(x), .. }, Dim::Fixed { len: Some(y), .. })
+                                if x != y =>
+                            {
+                                return Some(format!(
+                                    "the arrays have {x} and {y} elements (IEEE 1800-2017 §7.6)"
+                                ));
+                            }
+                            (Dim::Fixed { .. }, Dim::Dynamic | Dim::Queue)
+                            | (Dim::Dynamic | Dim::Queue, Dim::Fixed { .. })
+                                if idx >= 1 =>
+                            {
+                                return Some(
+                                    "inner (faster-varying) dimensions must match in fixed/dynamic \
+                                     kind (IEEE 1800-2023 §7.6)"
+                                        .into(),
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     // An enum array takes no plain integral array (§6.19.3);
@@ -1817,6 +2245,32 @@ impl<'a> Ck<'a> {
                 }
                 _ => None,
             },
+            Ty::Struct(ls) if !ls.packed => match rt {
+                Ty::Struct(rs) if !rs.packed && ls.key != rs.key => Some(
+                    "unpacked struct types are nominally distinct and not assignment-compatible \
+                     (IEEE 1800-2023 §6.22.1, §7.2.2)"
+                        .into(),
+                ),
+                t if t.is_packed_value()
+                    || matches!(
+                        t,
+                        Ty::Real { .. }
+                            | Ty::Str
+                            | Ty::Class(_)
+                            | Ty::Null
+                            | Ty::Event
+                            | Ty::Chandle
+                            | Ty::Unpacked { .. }
+                    ) =>
+                {
+                    Some(
+                        "an unpacked struct cannot be assigned a non-struct value \
+                         (IEEE 1800-2023 §7.2.2)"
+                            .into(),
+                    )
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1824,6 +2278,7 @@ impl<'a> Ck<'a> {
     fn check_assign(&mut self, lv: &Expression, rv: &Expression) {
         self.check_const_selects(lv);
         self.check_struct_members(lv);
+        self.check_tagged_union_member_write(lv);
         self.check_target_is_variable(lv);
         // `{r1, r2} = v` with a real `r1` is a concatenation too.
         self.check_operands(lv);
@@ -1870,9 +2325,69 @@ impl<'a> Ck<'a> {
                 continue;
             };
             bound[i] = true;
-            if p.dir == PortDirection::Input {
-                let t = p.ty.clone();
-                self.check_value(&t, e, || format!("argument '{}' of '{name}'", p.name));
+            match p.dir {
+                PortDirection::Input => {
+                    let t = p.ty.clone();
+                    self.check_value(&t, e, || format!("argument '{}' of '{name}'", p.name));
+                }
+                PortDirection::Output | PortDirection::Inout => {
+                    let actual_ty = self.ty_of(peel_parens(e));
+                    let p_ty = p.ty.clone();
+                    let need_check = matches!(
+                        p_ty,
+                        Ty::Unpacked { .. } | Ty::Class(_) | Ty::Struct(_) | Ty::Enum { .. }
+                    ) || matches!(
+                        actual_ty,
+                        Ty::Unpacked { .. } | Ty::Class(_) | Ty::Struct(_) | Ty::Enum { .. }
+                    );
+                    if need_check && actual_ty != Ty::Unknown {
+                        if let Some(why) = self.incompatible(&actual_ty, &p_ty) {
+                            self.report(
+                                e.span,
+                                format!(
+                                    "incompatible argument '{}' for {} formal '{}' of '{name}': {why}",
+                                    actual_ty.describe(),
+                                    if p.dir == PortDirection::Output {
+                                        "output"
+                                    } else {
+                                        "inout"
+                                    },
+                                    p.name
+                                ),
+                            );
+                        } else if p.dir == PortDirection::Inout
+                            && let Some(why) = self.incompatible(&p_ty, &actual_ty)
+                        {
+                            self.report(
+                                e.span,
+                                format!(
+                                    "incompatible argument '{}' for inout formal '{}' of '{name}': {why}",
+                                    actual_ty.describe(),
+                                    p.name
+                                ),
+                            );
+                        }
+                    }
+                }
+                PortDirection::Ref => {
+                    let actual_ty = self.ty_of(peel_parens(e));
+                    let p_ty = p.ty.clone();
+                    if actual_ty != Ty::Unknown
+                        && p_ty != Ty::Unknown
+                        && Self::not_ref_equivalent(&p_ty, &actual_ty)
+                    {
+                        self.report(
+                            e.span,
+                            format!(
+                                "ref formal '{}' of '{name}' (type {}) is not equivalent to \
+                                 actual argument (type {}) (IEEE 1800-2023 §13.5.2)",
+                                p.name,
+                                p_ty.describe(),
+                                actual_ty.describe()
+                            ),
+                        );
+                    }
+                }
             }
         }
         if let Some(p) = sig
@@ -2318,19 +2833,39 @@ impl<'a> Ck<'a> {
         }
     }
 
-    /// §6.9.1/§7.4: every dimension of a declaration is a constant range.
+    /// §6.9.1/§7.4: every dimension of a declaration is a constant range,
+    /// packed dimensions are sized, and fixed `[N]` sizes are positive.
     fn check_const_dims(&mut self, name: &str, dt: &DataType, dims: &[UnpackedDimension]) {
-        let packed: &[PackedDimension] = match dt {
-            DataType::IntegerVector { dimensions, .. }
-            | DataType::Implicit { dimensions, .. }
-            | DataType::TypeReference { dimensions, .. } => dimensions,
-            _ => &[],
+        let (packed, span): (&[PackedDimension], Span) = match dt {
+            DataType::IntegerVector {
+                dimensions, span, ..
+            }
+            | DataType::Implicit {
+                dimensions, span, ..
+            }
+            | DataType::TypeReference {
+                dimensions, span, ..
+            } => (dimensions, *span),
+            _ => (&[], Span::dummy()),
         };
         let what = || format!("the range of '{name}'");
         for d in packed {
-            if let PackedDimension::Range { left, right, .. } = d {
-                self.report_nonconst(left, &what, "§6.9.1");
-                self.report_nonconst(right, &what, "§6.9.1");
+            match d {
+                PackedDimension::Range { left, right, .. } => {
+                    self.report_nonconst(left, &what, "§6.9.1");
+                    self.report_nonconst(right, &what, "§6.9.1");
+                }
+                PackedDimension::Unsized(_) => {
+                    if self.seen.insert(span.start as usize) {
+                        self.report(
+                            span,
+                            format!(
+                                "an unsized packed dimension `[]` is not allowed on '{name}' \
+                                 (IEEE 1800-2023 §7.4.1)"
+                            ),
+                        );
+                    }
+                }
             }
         }
         for d in dims {
@@ -2340,10 +2875,102 @@ impl<'a> Ck<'a> {
                     self.report_nonconst(right, &what, "§7.4");
                 }
                 UnpackedDimension::Expression { expr, .. } => {
-                    self.report_nonconst(expr, &what, "§7.4")
+                    self.report_nonconst(expr, &what, "§7.4");
+                    if matches!(self.eval_const(expr), Some(CVal::Xz) | Some(CVal::Int(..=0))) {
+                        self.report(
+                            expr.span,
+                            format!(
+                                "unpacked array '{name}' dimension size must be greater than zero \
+                                 (IEEE 1800-2023 §7.4)"
+                            ),
+                        );
+                    }
+                }
+                UnpackedDimension::Associative {
+                    data_type: Some(kdt),
+                    span: dspan,
+                } => {
+                    if let DataType::TypeReference {
+                        name: kname,
+                        dimensions,
+                        type_args,
+                        ..
+                    } = kdt.as_ref()
+                        && !kname.has_scope()
+                        && dimensions.is_empty()
+                        && type_args.is_empty()
+                    {
+                        let kn = kname.name.name.as_str();
+                        let is_known_type =
+                            matches!(self.lookup_type(kn), Some(t) if !matches!(t, Ty::Unknown));
+                        if !is_known_type
+                            && !self.is_class_name(kn)
+                            && let Some(v) = self.lookup_const_val(kn)
+                            && v <= 0
+                        {
+                            self.report(
+                                *dspan,
+                                format!(
+                                    "unpacked array '{name}' dimension size must be greater than zero \
+                                     (IEEE 1800-2023 §7.4)"
+                                ),
+                            );
+                        }
+                    }
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn lookup_const_val(&self, n: &str) -> Option<i64> {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if s.vars.contains_key(n) {
+                return match s.consts.get(n).copied() {
+                    Some(CVal::Int(v)) => Some(v),
+                    _ => None,
+                };
+            }
+            if s.opaque {
+                break;
+            }
+        }
+        if let Some(unit) = self.stack.first() {
+            let s = unit.get();
+            if s.vars.contains_key(n)
+                && let Some(CVal::Int(v)) = s.consts.get(n).copied()
+            {
+                return Some(v);
+            }
+        }
+        self.elab.parameters.get(n).and_then(|v| v.to_i64())
+    }
+
+    fn not_ref_equivalent(lt: &Ty, rt: &Ty) -> bool {
+        match (lt, rt) {
+            (Ty::Unpacked { dims: ld, elem: le }, Ty::Unpacked { dims: rd, elem: re }) => {
+                if ld.len() != rd.len() || equivalent(le, re) == Some(false) {
+                    return true;
+                }
+                for (a, b) in ld.iter().zip(rd.iter()) {
+                    let mismatch = match (a, b) {
+                        (Dim::Fixed { len: lx, .. }, Dim::Fixed { len: ly, .. }) => {
+                            lx.zip(*ly).is_some_and(|(x, y)| x != y)
+                        }
+                        (Dim::Dynamic, Dim::Dynamic) | (Dim::Queue, Dim::Queue) => false,
+                        (Dim::Assoc(ka), Dim::Assoc(kb)) => {
+                            ka.as_ref().zip(kb.as_ref()).is_some_and(|(x, y)| x != y)
+                        }
+                        _ => true,
+                    };
+                    if mismatch {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => equivalent(lt, rt) == Some(false),
         }
     }
 
@@ -2508,8 +3135,31 @@ impl<'a> Ck<'a> {
                     self.operand_errors(a, false, out);
                 }
             }
-            ExprKind::Unary { operand, .. } => self.operand_errors(operand, false, out),
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Unary { operand, .. } => {
+                if matches!(self.ty_of(operand), Ty::Unpacked { .. }) {
+                    out.push((
+                        e.span,
+                        "unary operator cannot be applied to an unpacked array operand \
+                         (IEEE 1800-2023 §7.4, §11.3)"
+                            .into(),
+                    ));
+                }
+                self.operand_errors(operand, false, out);
+            }
+            ExprKind::Binary { op, left, right } => {
+                if !matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) && (matches!(self.ty_of(left), Ty::Unpacked { .. })
+                    || matches!(self.ty_of(right), Ty::Unpacked { .. }))
+                {
+                    out.push((
+                        e.span,
+                        "operator cannot be applied to an unpacked array operand \
+                         (IEEE 1800-2023 §7.4, §11.4)"
+                            .into(),
+                    ));
+                }
                 self.operand_errors(left, false, out);
                 self.operand_errors(right, false, out);
             }
@@ -2547,11 +3197,26 @@ impl<'a> Ck<'a> {
     }
 
     /// §11.5.1: a part-select's bounds, and an indexed part-select's width,
-    /// are constant expressions — of a packed value; a queue slice `q[a:b]`
-    /// takes variable bounds (§7.10.1).
+    /// are constant expressions — of a packed value or fixed/dynamic unpacked
+    /// array; a queue slice `q[a:b]` takes variable bounds (§7.10.1); an
+    /// associative array cannot be sliced (§7.8).
     fn check_const_selects(&mut self, e: &Expression) {
         let mut found: Vec<(&Expression, &'static str)> = Vec::new();
+        let mut msgs: Vec<(Span, String)> = Vec::new();
+        let mut stream_ranges: HashSet<usize> = HashSet::default();
         visit_expr(e, &mut |x| {
+            if let ExprKind::StreamOp { exprs, .. } = &x.kind {
+                for item in exprs {
+                    let mut cur = item;
+                    while let ExprKind::Paren(inner) = &cur.kind {
+                        cur = inner;
+                    }
+                    if matches!(cur.kind, ExprKind::RangeSelect { .. }) {
+                        stream_ranges.insert(std::ptr::from_ref(cur) as usize);
+                    }
+                }
+                return;
+            }
             let ExprKind::RangeSelect {
                 expr,
                 kind,
@@ -2561,18 +3226,154 @@ impl<'a> Ck<'a> {
             else {
                 return;
             };
-            if !self.ty_of(expr).is_packed_value() {
+            let base_ty = self.ty_of(expr);
+            if base_ty.is_packed_value() {
+                if *kind == RangeKind::Constant {
+                    found.push((left, "a part-select bound"));
+                    found.push((right, "a part-select bound"));
+                } else {
+                    found.push((right, "an indexed part-select width"));
+                }
                 return;
             }
-            if *kind == RangeKind::Constant {
-                found.push((left, "a part-select bound"));
-                found.push((right, "a part-select bound"));
-            } else {
-                found.push((right, "an indexed part-select width"));
+            if stream_ranges.contains(&(std::ptr::from_ref(x) as usize)) {
+                return;
+            }
+            if let Ty::Unpacked { dims, .. } = base_ty
+                && let Some(outer) = dims.first()
+            {
+                match outer {
+                    Dim::Queue => {}
+                    Dim::Assoc(_) => {
+                        msgs.push((
+                            x.span,
+                            "a slice select cannot be applied to an associative array \
+                             (IEEE 1800-2023 §7.8)"
+                                .into(),
+                        ));
+                    }
+                    Dim::Fixed { .. } | Dim::Dynamic => {
+                        if *kind == RangeKind::Constant {
+                            found.push((left, "an unpacked array slice bound"));
+                            found.push((right, "an unpacked array slice bound"));
+                            if let (Some(CVal::Int(l)), Some(CVal::Int(r))) =
+                                (self.eval_const(left), self.eval_const(right))
+                            {
+                                match outer {
+                                    Dim::Dynamic if l > r => {
+                                        msgs.push((
+                                            x.span,
+                                            format!(
+                                                "reversed slice `[{l}:{r}]` on a dynamic array is \
+                                                 not allowed (IEEE 1800-2023 §7.4.6)"
+                                            ),
+                                        ));
+                                    }
+                                    Dim::Fixed { desc: Some(d), .. }
+                                        if l != r && (l > r) != *d =>
+                                    {
+                                        msgs.push((
+                                            x.span,
+                                            format!(
+                                                "slice `[{l}:{r}]` direction does not match \
+                                                 declared array range (IEEE 1800-2023 §7.4.6)"
+                                            ),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            // `a[i +: 2]` (variable base, constant width) is legal per §7.4.6;
+                            // variable width `a[0 +: w]` is illegal.
+                            found.push((right, "an indexed array slice width"));
+                        }
+                    }
+                }
             }
         });
         for (b, what) in found {
-            self.report_nonconst(b, &|| what.to_string(), "§11.5.1");
+            self.report_nonconst(b, &|| what.to_string(), "§7.4.6, §11.5.1");
+        }
+        for (span, msg) in msgs {
+            self.report(span, msg);
+        }
+    }
+
+    /// §7.3.2: members of a tagged union cannot be assigned directly (`u.Val = 5`).
+    fn check_tagged_union_member_write(&mut self, lv: &Expression) {
+        match &lv.kind {
+            ExprKind::Concatenation(xs) => {
+                for x in xs {
+                    self.check_tagged_union_member_write(x);
+                }
+            }
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::Paren(expr) => {
+                self.check_tagged_union_member_write(expr);
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if let Ty::Struct(st) = self.ty_of(expr)
+                    && st.tagged
+                    && self.seen.insert(member.span.start as usize)
+                {
+                    self.report(
+                        member.span,
+                        format!(
+                            "cannot write directly to member '{}' of a tagged union; \
+                             assign a tagged union expression instead (IEEE 1800-2023 §7.3.2)",
+                            member.name
+                        ),
+                    );
+                    return;
+                }
+                self.check_tagged_union_member_write(expr);
+            }
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() >= 2 => {
+                let mut cur = match self.lookup_var(&h.path[0].name.name) {
+                    Some(t) => t,
+                    None => return,
+                };
+                for _ in &h.path[0].selects {
+                    cur = match cur {
+                        Ty::Unpacked { dims, elem } if dims.len() > 1 => Ty::Unpacked {
+                            dims: dims[1..].to_vec(),
+                            elem,
+                        },
+                        Ty::Unpacked { elem, .. } => *elem,
+                        _ => break,
+                    };
+                }
+                for seg in &h.path[1..] {
+                    if let Ty::Struct(st) = &cur
+                        && st.tagged
+                        && self.seen.insert(seg.name.span.start as usize)
+                    {
+                        self.report(
+                            seg.name.span,
+                            format!(
+                                "cannot write directly to member '{}' of a tagged union; \
+                                 assign a tagged union expression instead (IEEE 1800-2023 §7.3.2)",
+                                seg.name.name
+                            ),
+                        );
+                        return;
+                    }
+                    cur = self.member_ty(cur, &seg.name.name);
+                    for _ in &seg.selects {
+                        cur = match cur {
+                            Ty::Unpacked { dims, elem } if dims.len() > 1 => Ty::Unpacked {
+                                dims: dims[1..].to_vec(),
+                                elem,
+                            },
+                            Ty::Unpacked { elem, .. } => *elem,
+                            _ => break,
+                        };
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2715,7 +3516,7 @@ impl<'a> Ck<'a> {
                 let t = self.resolve(data_type);
                 for d in declarators {
                     self.check_const_dims(&d.name.name, data_type, &d.dimensions);
-                    let vt = with_dims(t.clone(), &d.dimensions);
+                    let vt = self.with_resolved_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
                         self.walk_rhs(&vt, init);
                         self.check_value(&vt, init, || format!("'{}'", d.name.name));
@@ -2738,7 +3539,7 @@ impl<'a> Ck<'a> {
                 let t = self.resolve(data_type);
                 for d in declarators {
                     self.check_const_dims(&d.name.name, data_type, &d.dimensions);
-                    let vt = with_dims(t.clone(), &d.dimensions);
+                    let vt = self.with_resolved_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
                         self.walk_expr(init);
                         self.check_value(&vt, init, || format!("'{}'", d.name.name));
@@ -2883,8 +3684,9 @@ impl<'a> Ck<'a> {
                 ClassItem::Property(p) => {
                     let t = self.resolve(&p.data_type);
                     for d in &p.declarators {
+                        self.check_const_dims(&d.name.name, &p.data_type, &d.dimensions);
                         if let Some(init) = &d.init {
-                            let vt = with_dims(t.clone(), &d.dimensions);
+                            let vt = self.with_resolved_dims(t.clone(), &d.dimensions);
                             self.check_value(&vt, init, || format!("'{}'", d.name.name));
                         }
                     }
@@ -2910,7 +3712,7 @@ impl<'a> Ck<'a> {
                     for dc in &d.declarators {
                         self.check_const_dims(&dc.name.name, &d.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
-                            let vt = with_dims(t.clone(), &dc.dimensions);
+                            let vt = self.with_resolved_dims(t.clone(), &dc.dimensions);
                             self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
@@ -2921,7 +3723,7 @@ impl<'a> Ck<'a> {
                     for dc in &n.declarators {
                         self.check_const_dims(&dc.name.name, &n.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
-                            let vt = with_dims(t.clone(), &dc.dimensions);
+                            let vt = self.with_resolved_dims(t.clone(), &dc.dimensions);
                             self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
@@ -2951,6 +3753,9 @@ impl<'a> Ck<'a> {
                 }
                 ModuleItem::TaskDeclaration(t) if t.name.scopes.is_empty() => self.walk_task(t),
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
+                ModuleItem::TypedefDeclaration(td) if !td.forward => {
+                    self.resolve(&td.data_type);
+                }
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
                     let conds: Vec<Option<&Expression>> =
@@ -3060,17 +3865,22 @@ fn int_shape(t: &Ty) -> (Option<u64>, bool) {
 /// §6.22.2 type equivalence of array elements: Some(false) only when the two
 /// types are definitely not equivalent.
 fn equivalent(a: &Ty, b: &Ty) -> Option<bool> {
+    if matches!(a, Ty::Unknown) || matches!(b, Ty::Unknown) {
+        return None;
+    }
     match (a, b) {
         (
             Ty::Int {
                 bits: ab,
                 signed: asg,
                 four: af,
+                ..
             },
             Ty::Int {
                 bits: bb,
                 signed: bsg,
                 four: bf,
+                ..
             },
         ) => {
             if asg != bsg || af != bf {
@@ -3087,6 +3897,41 @@ fn equivalent(a: &Ty, b: &Ty) -> Option<bool> {
         (Ty::Str, Ty::Int { .. } | Ty::Real { .. })
         | (Ty::Int { .. } | Ty::Real { .. }, Ty::Str) => Some(false),
         (Ty::Enum { key: x, .. }, Ty::Enum { key: y, .. }) => Some(x == y),
+        (Ty::Struct(x), Ty::Struct(y)) if !x.packed && !y.packed => Some(x.key == y.key),
+        (Ty::Struct(x), Ty::Struct(y)) if x.packed != y.packed => Some(false),
+        (Ty::Class(x), Ty::Class(y)) => Some(x == y),
+        (Ty::Class(_), _) | (_, Ty::Class(_)) => Some(false),
+        _ => None,
+    }
+}
+
+fn ty_has_untagged_union(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(s) => s.has_untagged_union,
+        Ty::Unpacked { elem, .. } => ty_has_untagged_union(elem),
+        _ => false,
+    }
+}
+
+fn ty_has_dynamic_or_handle(t: &Ty) -> bool {
+    match t {
+        Ty::Str | Ty::Chandle | Ty::Event | Ty::Class(_) => true,
+        Ty::Struct(s) => s.has_dynamic_or_handle,
+        Ty::Unpacked { dims, elem } => {
+            dims.iter()
+                .any(|d| matches!(d, Dim::Dynamic | Dim::Queue | Dim::Assoc(_)))
+                || ty_has_dynamic_or_handle(elem)
+        }
+        _ => false,
+    }
+}
+
+fn ty_packed_bits(t: &Ty) -> Option<u64> {
+    match t {
+        Ty::Int { bits, .. } => *bits,
+        Ty::Enum { bits, .. } => *bits,
+        Ty::Struct(s) if s.packed => s.packed_bits,
+        Ty::Void => Some(0),
         _ => None,
     }
 }

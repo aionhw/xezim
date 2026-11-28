@@ -5,6 +5,431 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    fn exprs_structurally_eq(a: &Expression, b: &Expression) -> bool {
+        if std::mem::discriminant(&a.kind) != std::mem::discriminant(&b.kind) {
+            return false;
+        }
+        match (&a.kind, &b.kind) {
+            (ExprKind::Number(na), ExprKind::Number(nb)) => match (na, nb) {
+                (
+                    NumberLiteral::Integer {
+                        size: sa,
+                        signed: sga,
+                        base: ba,
+                        value: va,
+                        ..
+                    },
+                    NumberLiteral::Integer {
+                        size: sb,
+                        signed: sgb,
+                        base: bb,
+                        value: vb,
+                        ..
+                    },
+                ) => sa == sb && sga == sgb && ba == bb && va == vb,
+                (NumberLiteral::Real(ra), NumberLiteral::Real(rb))
+                | (NumberLiteral::Time(ra), NumberLiteral::Time(rb)) => {
+                    ra.to_bits() == rb.to_bits()
+                }
+                (NumberLiteral::UnbasedUnsized(ca), NumberLiteral::UnbasedUnsized(cb)) => ca == cb,
+                _ => false,
+            },
+            (ExprKind::StringLiteral(sa), ExprKind::StringLiteral(sb)) => sa == sb,
+            (ExprKind::Ident(ha), ExprKind::Ident(hb)) => {
+                ha.root.is_some() == hb.root.is_some()
+                    && ha.path.len() == hb.path.len()
+                    && ha.path.iter().zip(&hb.path).all(|(pa, pb)| {
+                        pa.name.name == pb.name.name
+                            && pa.selects.len() == pb.selects.len()
+                            && pa
+                                .selects
+                                .iter()
+                                .zip(&pb.selects)
+                                .all(|(x, y)| Self::exprs_structurally_eq(x, y))
+                    })
+            }
+            (
+                ExprKind::Unary {
+                    op: oa,
+                    operand: xa,
+                },
+                ExprKind::Unary {
+                    op: ob,
+                    operand: xb,
+                },
+            ) => oa == ob && Self::exprs_structurally_eq(xa, xb),
+            (
+                ExprKind::Binary {
+                    op: oa,
+                    left: la,
+                    right: ra,
+                },
+                ExprKind::Binary {
+                    op: ob,
+                    left: lb,
+                    right: rb,
+                },
+            ) => oa == ob && Self::exprs_structurally_eq(la, lb) && Self::exprs_structurally_eq(ra, rb),
+            (
+                ExprKind::Conditional {
+                    condition: ca,
+                    then_expr: ta,
+                    else_expr: ea,
+                },
+                ExprKind::Conditional {
+                    condition: cb,
+                    then_expr: tb,
+                    else_expr: eb,
+                },
+            ) => {
+                Self::exprs_structurally_eq(ca, cb)
+                    && Self::exprs_structurally_eq(ta, tb)
+                    && Self::exprs_structurally_eq(ea, eb)
+            }
+            (ExprKind::Paren(xa), ExprKind::Paren(xb)) => Self::exprs_structurally_eq(xa, xb),
+            (
+                ExprKind::MemberAccess {
+                    expr: ea,
+                    member: ma,
+                },
+                ExprKind::MemberAccess {
+                    expr: eb,
+                    member: mb,
+                },
+            ) => ma.name == mb.name && Self::exprs_structurally_eq(ea, eb),
+            (
+                ExprKind::Index {
+                    expr: ea,
+                    index: ia,
+                },
+                ExprKind::Index {
+                    expr: eb,
+                    index: ib,
+                },
+            ) => Self::exprs_structurally_eq(ea, eb) && Self::exprs_structurally_eq(ia, ib),
+            (
+                ExprKind::RangeSelect {
+                    expr: ea,
+                    kind: ka,
+                    left: la,
+                    right: ra,
+                },
+                ExprKind::RangeSelect {
+                    expr: eb,
+                    kind: kb,
+                    left: lb,
+                    right: rb,
+                },
+            ) => {
+                ka == kb
+                    && Self::exprs_structurally_eq(ea, eb)
+                    && Self::exprs_structurally_eq(la, lb)
+                    && Self::exprs_structurally_eq(ra, rb)
+            }
+            (ExprKind::Concatenation(va), ExprKind::Concatenation(vb)) => {
+                va.len() == vb.len()
+                    && va
+                        .iter()
+                        .zip(vb)
+                        .all(|(x, y)| Self::exprs_structurally_eq(x, y))
+            }
+            (
+                ExprKind::Replication {
+                    count: ca,
+                    exprs: va,
+                },
+                ExprKind::Replication {
+                    count: cb,
+                    exprs: vb,
+                },
+            ) => {
+                Self::exprs_structurally_eq(ca, cb)
+                    && va.len() == vb.len()
+                    && va
+                        .iter()
+                        .zip(vb)
+                        .all(|(x, y)| Self::exprs_structurally_eq(x, y))
+            }
+            (
+                ExprKind::Call { func: fa, args: aa },
+                ExprKind::Call { func: fb, args: ab },
+            ) => {
+                Self::exprs_structurally_eq(fa, fb)
+                    && aa.len() == ab.len()
+                    && aa
+                        .iter()
+                        .zip(ab)
+                        .all(|(x, y)| Self::exprs_structurally_eq(x, y))
+            }
+            (
+                ExprKind::SystemCall { name: na, args: aa },
+                ExprKind::SystemCall { name: nb, args: ab },
+            ) => {
+                na == nb
+                    && aa.len() == ab.len()
+                    && aa
+                        .iter()
+                        .zip(ab)
+                        .all(|(x, y)| Self::exprs_structurally_eq(x, y))
+            }
+            (ExprKind::AssignmentPattern(ia), ExprKind::AssignmentPattern(ib)) => {
+                use crate::ast::expr::AssignmentPatternItem as API;
+                ia.len() == ib.len()
+                    && ia.iter().zip(ib).all(|(x, y)| match (x, y) {
+                        (API::Ordered(ea), API::Ordered(eb))
+                        | (API::Default(ea), API::Default(eb)) => Self::exprs_structurally_eq(ea, eb),
+                        (API::Named(ida, ea), API::Named(idb, eb)) => {
+                            ida.ident.name == idb.ident.name && Self::exprs_structurally_eq(ea, eb)
+                        }
+                        (API::Keyed(ka, ea), API::Keyed(kb, eb)) => {
+                            Self::exprs_structurally_eq(ka, kb)
+                                && Self::exprs_structurally_eq(ea, eb)
+                        }
+                        _ => false,
+                    })
+            }
+            (
+                ExprKind::NamedArg { name: na, expr: ea },
+                ExprKind::NamedArg { name: nb, expr: eb },
+            ) => {
+                na.name == nb.name
+                    && match (ea, eb) {
+                        (Some(xa), Some(xb)) => Self::exprs_structurally_eq(xa, xb),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (ExprKind::Empty, ExprKind::Empty)
+            | (ExprKind::Dollar, ExprKind::Dollar)
+            | (ExprKind::Null, ExprKind::Null)
+            | (ExprKind::This, ExprKind::This) => true,
+            _ => false,
+        }
+    }
+
+    fn coalesce_struct_call_leaf<'c>(
+        &self,
+        ca: &'c crate::compiler::elaborate::FullContinuousAssignment,
+    ) -> Option<(usize, String, &'c Expression, String)> {
+        if ca.delay != 0
+            || ca.delay_fall().is_some()
+            || ca.delay_off().is_some()
+            || ca.delay_exprs().is_some()
+            || ca.gate_delay_fall().is_some()
+            || ca.rhs_parent_scoped
+        {
+            return None;
+        }
+        let ExprKind::Ident(lhs_hier) = &ca.lhs.kind else {
+            return None;
+        };
+        if !lhs_hier.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let leaf_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
+        let &leaf_id = self.signal_name_to_id.get(leaf_name.as_str())?;
+        if self.sdf_delays.get(leaf_id).copied().unwrap_or(0) != 0
+            || (self.preserve_sdf_wiring
+                && self
+                    .module_paths
+                    .as_ref()
+                    .is_some_and(|p| p.is_path_net(leaf_id)))
+        {
+            return None;
+        }
+        let mut chain = Vec::new();
+        let mut cur = &ca.rhs;
+        while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+            chain.push(member.name.as_str());
+            cur = expr;
+        }
+        if chain.is_empty() || !matches!(cur.kind, ExprKind::Call { .. }) {
+            return None;
+        }
+        chain.reverse();
+        let member_chain = chain.join(".");
+        let base_name = leaf_name
+            .strip_suffix(&member_chain)
+            .and_then(|s| s.strip_suffix('.'))?;
+        if base_name.is_empty() {
+            return None;
+        }
+        Some((leaf_id, base_name.to_string(), cur, member_chain))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn try_coalesce_struct_call_run(
+        &mut self,
+        run: &[(crate::compiler::elaborate::FullContinuousAssignment, usize, String, String)],
+        reads: &mut HashSet<String>,
+        writes: &mut HashSet<String>,
+        t0_effects: &mut super::time0_effects::Time0Effects,
+    ) -> Option<(
+        CombItem,
+        Vec<usize>,
+        HashSet<String>,
+        Option<String>,
+        crate::ast::Span,
+        bool,
+        Option<Arc<str>>,
+        HashSet<String>,
+    )> {
+        let (ca0, _, base_name, _) = run.first()?;
+        let mut cur = &ca0.rhs;
+        while let ExprKind::MemberAccess { expr, .. } = &cur.kind {
+            cur = expr;
+        }
+        let ExprKind::Call { func, args } = &cur.kind else {
+            return None;
+        };
+        let ca_span = ca0.lhs.span;
+        let call_expr = cur.clone();
+
+        reads.clear();
+        writes.clear();
+        let frame_local_reads = Self::with_frame_local_reads(|| {
+            Self::collect_expr_reads(&call_expr, &self.module, reads)
+        });
+        let mut rooted_reads: HashSet<String> = HashSet::default();
+        Self::collect_rooted_ident_names(&call_expr, &mut rooted_reads);
+        for &(_, id, _, _) in run {
+            writes.insert(self.name_for_id(id).to_string());
+        }
+        let scope_hint = if self.signal_name_to_id.contains_key(base_name.as_str()) {
+            base_name
+                .rsplit_once('.')
+                .map(|(sc, _)| sc.to_string())
+                .or_else(|| self.infer_scope_from_rw_sets(writes, reads))
+        } else {
+            self.infer_scope_from_rw_sets(writes, reads)
+        };
+
+        let wids: Vec<usize> = run.iter().map(|&(_, id, _, _)| id).collect();
+        let mut compiler = super::bytecode::BytecodeCompiler::new(
+            &self.signal_name_to_id,
+            &self.signal_signed,
+            &self.signal_widths,
+            &self.module.arrays,
+            &self.widths,
+        );
+        compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
+        compiler.set_scope_hint(scope_hint.clone());
+        compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
+        compiler.set_params(&self.module.parameters);
+        compiler.set_param_leaf_idx(self.param_leaf_index());
+        compiler.set_cast_widths(&self.cast_widths);
+        compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
+        compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+        compiler.set_signal_two_state(&self.signal_two_state);
+        compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+        compiler.set_typedef_types(&self.module.typedef_types);
+        compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+        compiler.set_assoc_arrays(&self.module.associative_arrays);
+        compiler.set_packed_full_dims(&self.module.packed_full_dims);
+        Self::set_pattern_type_tables(&self.module, &mut compiler);
+        compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+        compiler.set_arrays_2d(&self.module.arrays_2d);
+        compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
+        compiler.set_array_first_id(&self.array_first_id);
+        compiler.set_functions(&self.module.functions);
+        compiler.set_signal_real(&self.signal_real);
+        compiler.set_deferred_callables(
+            &self.module.deferred_function_bodies,
+            &self.module.deferred_task_bodies,
+            &self.module.packages,
+        );
+        compiler.top_module_name = Some(self.module.name.clone());
+
+        let item = if let Some(outputs) =
+            compiler.compile_struct_call_multi(func.as_ref(), args.as_slice())
+        {
+            let mut matched = Vec::with_capacity(run.len());
+            for &(_, leaf_id, _, ref member) in run {
+                if let Some((_, out_reg, _, _)) = outputs.iter().find(|(m, _, _, _)| m == member) {
+                    matched.push((leaf_id, *out_reg, self.signal_widths[leaf_id]));
+                } else {
+                    matched.clear();
+                    break;
+                }
+            }
+            if matched.len() == run.len() {
+                for (leaf_id, out_reg, w) in matched {
+                    compiler.emit(super::bytecode::Insn::BlockingAssign(
+                        super::bytecode::as_sig_id(leaf_id),
+                        out_reg,
+                        w,
+                    ));
+                }
+                Some(CombItem::CompiledContAssign {
+                    compiled: compiler.finish(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let item = match item {
+            Some(compiled) => compiled,
+            None => {
+                // Interpreted single-eval fallback: evaluate `f(args)` ONCE in
+                // `CombItem::ContAssign` via `spread_into_unpacked_struct`,
+                // provided `base_name` resolves to a member-wise unpacked struct.
+                let base_is_struct = self
+                    .module
+                    .var_decl_types
+                    .get(base_name.as_str())
+                    .is_some_and(|dt| {
+                        matches!(
+                            self.resolve_dt_ref(dt),
+                            DataType::Struct(su) if Self::spreads_member_wise(su)
+                        )
+                    })
+                    && !self.module.dynamic_arrays.contains(base_name.as_str())
+                    && !self.module.arrays.contains_key(base_name.as_str())
+                    && !self.names_nd_subarray(base_name.as_str())
+                    && !self.module.associative_arrays.contains_key(base_name.as_str());
+                if !base_is_struct {
+                    return None;
+                }
+                CombItem::ContAssign {
+                    lhs: Box::new(super::property_initialization::prop_ident_expr(base_name)),
+                    rhs: Box::new(call_expr.clone()),
+                    delay: 0,
+                    delay_target: None,
+                    delay_exprs: None,
+                }
+            }
+        };
+
+        let ca_time0_effects = {
+            let frame = super::time0_effects::T0Frame::expr();
+            self.t0_expr_has_effects(&call_expr, None, &frame, t0_effects)
+        };
+        for &(_, id, _, _) in run {
+            let name = self.name_for_id(id);
+            if !self.collapsed_port_children.contains(name) {
+                self.cont_driven.insert(id);
+            }
+        }
+        let origin_scope = ca0
+            .extras
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+            .map(|(_, s)| Arc::clone(s));
+        Some((
+            item,
+            wids,
+            rooted_reads,
+            scope_hint,
+            ca_span,
+            ca_time0_effects,
+            origin_scope,
+            frame_local_reads,
+        ))
+    }
+
     /// §23.6: fold a hierarchical reference that walks through an INDEXED
     /// scope (`tb.gl[0].u.sig`) into the single hierarchical `Ident` spelling
     /// flat signal names use.
@@ -654,6 +1079,7 @@ impl Simulator {
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
         self.initialize_continuously_driven_nets();
+        self.rebuild_packed_seg_deps();
         self.gate_fall_delay_by_id
             .extend(cache.gate_fall_delay_by_id);
         self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
@@ -826,15 +1252,36 @@ impl Simulator {
             Vec::new();
         let mut expanded_cas: Vec<crate::compiler::elaborate::FullContinuousAssignment> =
             Vec::new();
-        for raw_ca in cas
+        let mut raw_iter = cas
             .into_iter()
             .map(Ok)
-            .chain(pending_ca.into_iter().map(Err))
-        {
-            let mut raw_ca = match raw_ca {
-                Ok(c) => c,
-                Err(p) => p.materialize(&self.module.parameters),
-            };
+            .chain(pending_ca.into_iter().map(Err));
+        let mut ready_cas: std::collections::VecDeque<
+            crate::compiler::elaborate::FullContinuousAssignment,
+        > = std::collections::VecDeque::new();
+        let mut flush_queue: std::collections::VecDeque<
+            crate::compiler::elaborate::FullContinuousAssignment,
+        > = std::collections::VecDeque::new();
+        let mut pending_run: Vec<(
+            crate::compiler::elaborate::FullContinuousAssignment,
+            usize,
+            String,
+            String,
+        )> = Vec::new();
+        let mut eof = false;
+        loop {
+            let mut single_ca = flush_queue.pop_front();
+            let mut coalesced = None;
+            if single_ca.is_none() {
+                while ready_cas.is_empty() && !eof {
+                    let Some(raw_ca) = raw_iter.next() else {
+                        eof = true;
+                        break;
+                    };
+                    let mut raw_ca = match raw_ca {
+                        Ok(c) => c,
+                        Err(p) => p.materialize(&self.module.parameters),
+                    };
             expanded_parts.clear();
             if let crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } = &raw_ca
                 && !self.module.unpacked_decl_dims.contains_key(lhs.as_str())
@@ -846,7 +1293,23 @@ impl Simulator {
                 // §10.6.2 / §10.10: expand whole-array / row / slice / pattern /
                 // concat unpacked-array assigns using borrowed module tables.
                 raw_ca.make_full_mut();
-                let expanded = {
+                let is_bulk_candidate = if let Some(f) = raw_ca.as_full()
+                    && !f.rhs_parent_scoped
+                    && f.delay == 0
+                    && f.delay_fall().is_none()
+                    && f.delay_off().is_none()
+                    && f.delay_exprs().is_none()
+                    && self.module.is_bulk_array_copy_candidate(&raw_ca)
+                {
+                    let bulk_scope = self.infer_contassign_scope_hint(&f.lhs, &f.rhs);
+                    self.try_build_bulk_array_copy(&f.lhs, &f.rhs, bulk_scope.as_deref())
+                        .is_some()
+                } else {
+                    false
+                };
+                let expanded = if is_bulk_candidate {
+                    None
+                } else {
                     let f = raw_ca.as_full().expect("promoted to Full above");
                     let m = &self.module;
                     let is_other_array = |n: &str| {
@@ -975,52 +1438,148 @@ impl Simulator {
                     }
                 }
             }
-            for mut ca in expanded_cas.drain(..) {
-            // §7.2: a member target written as a member access on a plain
-            // name (`n.V`, the form the nettype pass emits for a struct net)
-            // is the member's own leaf signal. Name it so before compiling:
-            // the width inference otherwise took the access for a 32-bit
-            // integral target and converted a `real` member's value.
-            if let ExprKind::MemberAccess { expr: base, member } = &ca.lhs.kind
-                && let ExprKind::Ident(h) = &base.kind
-                && h.root.is_none()
-                && h.path.iter().all(|s| s.selects.is_empty())
-            {
-                let leaf = format!(
-                    "{}.{}",
-                    h.path
-                        .iter()
-                        .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join("."),
-                    member.name
-                );
-                if self.signal_name_to_id.contains_key(leaf.as_str()) {
-                    let span = ca.lhs.span;
-                    ca.lhs = Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: None,
-                            path: vec![crate::ast::expr::HierPathSegment {
-                                name: crate::ast::Identifier { name: leaf, span },
-                                selects: Vec::new(),
-                            }],
-                            span,
-                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                            cached_resolved_name: crate::ast::cache::NameCache::new(),
-                            bound: crate::ast::binding::Bound::UNSET,
-                        }),
-                        span,
+            // Normalize `n.V` member targets and indexed paths up front so
+            // multi-leaf struct driver coalescing sees canonical leaf idents.
+            for ca in &mut expanded_cas {
+                if let ExprKind::MemberAccess { expr: base, member } = &ca.lhs.kind
+                    && let ExprKind::Ident(h) = &base.kind
+                    && h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let leaf = format!(
+                        "{}.{}",
+                        h.path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                        member.name
                     );
+                    if self.signal_name_to_id.contains_key(leaf.as_str()) {
+                        let span = ca.lhs.span;
+                        ca.lhs = Expression::new(
+                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                root: None,
+                                path: vec![crate::ast::expr::HierPathSegment {
+                                    name: crate::ast::Identifier { name: leaf, span },
+                                    selects: Vec::new(),
+                                }],
+                                span,
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
+                            }),
+                            span,
+                        );
+                    }
+                }
+                if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
+                    ca.lhs = folded;
+                }
+                if !self.modport_names.is_empty() && self.has_indexed_scopes() {
+                    self.fold_indexed_modport_reads(&mut ca.rhs);
                 }
             }
-            // §23.6: the same fold for a path that enters a scope through a
-            // SELECT (`tb.gl[0].u.sig`). See `fold_indexed_hier_path`.
-            if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
-                ca.lhs = folded;
+                    ready_cas.extend(expanded_cas.drain(..));
+                }
+                if let Some(ca) = ready_cas.pop_front() {
+                    if self.code_cov.is_none()
+                        && let Some((idk, basek, callk, memk)) =
+                            self.coalesce_struct_call_leaf(&ca)
+                    {
+                        if pending_run.is_empty() {
+                            pending_run.push((ca, idk, basek, memk));
+                            continue;
+                        }
+                        let (ca0, _, base0, _) = &pending_run[0];
+                        let mut call0 = &ca0.rhs;
+                        while let ExprKind::MemberAccess { expr, .. } = &call0.kind {
+                            call0 = expr;
+                        }
+                        if basek == *base0
+                            && Self::exprs_structurally_eq(call0, callk)
+                            && !pending_run
+                                .iter()
+                                .any(|(_, id, _, m)| *id == idk || m == &memk)
+                        {
+                            pending_run.push((ca, idk, basek, memk));
+                            continue;
+                        }
+                        ready_cas.push_front(ca);
+                    } else if pending_run.is_empty() {
+                        single_ca = Some(ca);
+                    } else {
+                        ready_cas.push_front(ca);
+                    }
+                }
+                if single_ca.is_none() {
+                    if pending_run.is_empty() {
+                        break;
+                    }
+                    if pending_run.len() >= 2 {
+                        if let Some(built) = self.try_coalesce_struct_call_run(
+                            &pending_run,
+                            &mut reads,
+                            &mut writes,
+                            &mut t0_effects,
+                        ) {
+                            pending_run.clear();
+                            coalesced = Some(built);
+                        } else {
+                            flush_queue.extend(pending_run.drain(..).map(|(c, ..)| c));
+                            continue;
+                        }
+                    } else {
+                        single_ca = Some(pending_run.pop().unwrap().0);
+                    }
+                }
             }
-            if !self.modport_names.is_empty() && self.has_indexed_scopes() {
-                self.fold_indexed_modport_reads(&mut ca.rhs);
-            }
+                let (
+                    item,
+                    wids,
+                    rooted_reads,
+                    scope_hint,
+                    lhs_is_absolute,
+                    ca_span,
+                    ca_time0_effects,
+                    cov_counter,
+                    rhs_parent_scoped,
+                    origin_scope_preset,
+                    frame_local_reads,
+                ) = if let Some((
+                    item,
+                    wids,
+                    rooted_reads,
+                    scope_hint,
+                    ca_span,
+                    ca_time0_effects,
+                    origin_scope_preset,
+                    frame_local_reads,
+                )) = coalesced
+                {
+                    (
+                        item,
+                        wids,
+                        rooted_reads,
+                        scope_hint,
+                        false,
+                        ca_span,
+                        ca_time0_effects,
+                        None,
+                        false,
+                        origin_scope_preset,
+                        frame_local_reads,
+                    )
+                } else {
+                    let Some(mut ca) = single_ca else {
+                        unreachable!("single_ca is always populated when coalesced is None");
+                    };
+            let rhs_parent_scoped = ca.rhs_parent_scoped;
+            let origin_scope_preset = ca
+                .extras
+                .as_ref()
+                .and_then(|e| e.origin.as_ref())
+                .map(|(_, s)| Arc::clone(s));
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
@@ -1072,12 +1631,20 @@ impl Simulator {
                     {
                         let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
                         let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
-                        match (
-                            self.signal_name_to_id.get(dst_name.as_str()),
-                            self.signal_name_to_id.get(src_name.as_str()),
-                        ) {
-                            (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
-                            _ => None,
+                        let is_arr = |n: &str| {
+                            self.array_first_id.contains_key(n)
+                                || self.array_nd_first_id.contains_key(n)
+                        };
+                        if is_arr(dst_name.as_str()) || is_arr(src_name.as_str()) {
+                            None
+                        } else {
+                            match (
+                                self.signal_name_to_id.get(dst_name.as_str()),
+                                self.signal_name_to_id.get(src_name.as_str()),
+                            ) {
+                                (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
+                                _ => None,
+                            }
                         }
                     } else {
                         None
@@ -1087,6 +1654,46 @@ impl Simulator {
                 };
             if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
                 continue;
+            }
+            if !ca.rhs_parent_scoped
+                && explicit_delay == 0
+                && ca.delay_fall().is_none()
+                && ca.delay_off().is_none()
+                && ca.delay_exprs().is_none()
+                && cov_counter.is_none()
+                && !ca_time0_effects
+            {
+                let bulk_scope = self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs);
+                if let Some((runs, mut rids, mut wids)) =
+                    self.try_build_bulk_array_copy(&ca.lhs, &ca.rhs, bulk_scope.as_deref())
+                {
+                    if runs.is_empty() {
+                        continue;
+                    }
+                    for &d in &wids {
+                        self.cont_driven.insert(d);
+                    }
+                    rids.shrink_to_fit();
+                    wids.shrink_to_fit();
+                    entries.push(CombEntry {
+                        item: CombItem::BulkArrayCopy {
+                            runs: runs.into_boxed_slice(),
+                        },
+                        cold: Box::new(CombEntryCold {
+                            rhs_time_scope: None,
+                            scope_hint: bulk_scope,
+                            read_signal_ids: rids,
+                            write_signal_ids: wids,
+                            span: ca_span,
+                            cov: None,
+                            time0_effects: false,
+                            alias_t0_reads: None,
+                        }),
+                        has_unresolved_reads: false,
+                        defer_at_time0: false,
+                    });
+                    continue;
+                }
             }
             // So is an element connect of an unpacked-array port collapsed
             // onto its actual (see `collapse_array_port_nets`).
@@ -1295,17 +1902,15 @@ impl Simulator {
                                 })
                             });
                     let has_field = self
-                        .module
-                        .packed_struct_fields
+                        .packed_struct_layouts
                         .get(base.as_str())
                         .or_else(|| {
                             scope_hint.as_ref().and_then(|sc| {
-                                self.module
-                                    .packed_struct_fields
+                                self.packed_struct_layouts
                                     .get(&format!("{}.{}", sc, base))
                             })
                         })
-                        .is_some_and(|f| f.iter().any(|(m, _, _)| m == member));
+                        .is_some_and(|l| l.get(member).is_some());
                     base_id.filter(|_| has_field)
                 } else {
                     None
@@ -1489,11 +2094,7 @@ impl Simulator {
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
-                compiler.set_packed_struct_fields(
-                    self.bc_packed_fields
-                        .as_ref()
-                        .unwrap_or(&self.module.packed_struct_fields),
-                );
+                compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_signal_two_state(&self.signal_two_state);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
@@ -1586,11 +2187,7 @@ impl Simulator {
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
-                compiler.set_packed_struct_fields(
-                    self.bc_packed_fields
-                        .as_ref()
-                        .unwrap_or(&self.module.packed_struct_fields),
-                );
+                compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_signal_two_state(&self.signal_two_state);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
@@ -1603,11 +2200,7 @@ impl Simulator {
                 compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler
                     .set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
-                compiler.set_packed_struct_fields(
-                    self.bc_packed_fields
-                        .as_ref()
-                        .unwrap_or(&self.module.packed_struct_fields),
-                );
+                compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Same omission as the single-dest site above: without the
                 // function table a concat-LHS decode assign
@@ -1676,6 +2269,21 @@ impl Simulator {
                     delay_exprs: None,
                 }
             };
+
+                    (
+                        item,
+                        wids,
+                        rooted_reads,
+                        scope_hint,
+                        lhs_is_absolute,
+                        ca_span,
+                        ca_time0_effects,
+                        cov_counter,
+                        rhs_parent_scoped,
+                        origin_scope_preset,
+                        frame_local_reads,
+                    )
+                };
 
             // Resolve reads, retrying with scope_hint prefix for bare local names.
             // Without this, references like `mem_valid` from a top-level cont_assign
@@ -2094,14 +2702,10 @@ impl Simulator {
             let rhs_time_scope = if matches!(&item, CombItem::ContAssign { .. })
                 || matches!(&item, CombItem::CompiledContAssign { compiled } if compiled.has_fallback)
             {
-                ca.extras
-                    .take()
-                    .and_then(|e| e.origin)
-                    .map(|(_, scope)| scope)
-                    .or_else(|| {
+                origin_scope_preset.or_else(|| {
                     let name = self.name_opt(*wids.first()?)?;
                     let (owner, _) = name.rsplit_once('.')?;
-                    let input_port = ca.rhs_parent_scoped
+                    let input_port = rhs_parent_scoped
                         && matches!(
                             self.vpi_port_directions.get(name),
                             Some(PortDirection::Input | PortDirection::Inout)
@@ -2137,7 +2741,6 @@ impl Simulator {
                 has_unresolved_reads,
                 defer_at_time0: false,
             });
-            }
         }
 
         self.initialize_continuously_driven_nets();
@@ -2455,11 +3058,7 @@ impl Simulator {
                     compiler.set_params(&self.module.parameters);
                     compiler.set_param_leaf_idx(self.param_leaf_index());
                     compiler.set_cast_widths(&self.cast_widths);
-                    compiler.set_packed_struct_fields(
-                        self.bc_packed_fields
-                            .as_ref()
-                            .unwrap_or(&self.module.packed_struct_fields),
-                    );
+                    compiler.set_packed_struct_layouts(&self.packed_struct_layouts);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
@@ -5751,6 +6350,7 @@ impl Simulator {
         }
         self.comb_writer_index = None;
         self.comb_entries = entries;
+        self.rebuild_packed_seg_deps();
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
         // continuous_assigns live on in CombItem::ContAssign (fallback) or
@@ -5839,5 +6439,463 @@ impl Simulator {
                 })
                 .collect(),
         )
+    }
+
+    /// Lower a continuous whole/slice/row unpacked-array assignment into
+    /// [`CombItem::BulkArrayCopy`] runs, preserving declared ascending /
+    /// descending element correspondence without expanding per-element AST nodes.
+    fn try_build_bulk_array_copy(
+        &self,
+        lhs: &Expression,
+        rhs: &Expression,
+        scope_hint: Option<&str>,
+    ) -> Option<(Vec<super::comb_network::BulkCopyRun>, Vec<usize>, Vec<usize>)> {
+        use super::comb_network::BulkCopyRun;
+        use crate::ast::expr::RangeKind;
+        use crate::compiler::elaborate::{const_eval_i64_with_params, eval_const_expr_val_env};
+
+        enum ArraySpec {
+            OneD {
+                first: usize,
+                lo: i64,
+                hi: i64,
+                desc: bool,
+            },
+            Nd {
+                first: usize,
+                shape: Vec<(i64, i64)>,
+                descs: Vec<bool>,
+            },
+        }
+
+        let dotted_ok = |h: &crate::ast::expr::HierarchicalIdentifier| -> bool {
+            h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) && !h.path.is_empty()
+        };
+        let top_prefix = format!("{}.", self.module.name);
+        let resolve_array_spec = |h: &crate::ast::expr::HierarchicalIdentifier| -> Option<ArraySpec> {
+            if !dotted_ok(h) {
+                return None;
+            }
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            let mut cands: Vec<String> = Vec::with_capacity(3);
+            if h.path.len() == 1
+                && let Some(sc) = scope_hint
+            {
+                cands.push(format!("{sc}.{raw}"));
+            }
+            cands.push(raw.clone());
+            if let Some(stripped) = raw.strip_prefix(&top_prefix) {
+                cands.push(stripped.to_string());
+            }
+            let cand = cands.into_iter().find(|n| {
+                self.array_first_id.contains_key(n.as_str())
+                    || self.array_nd_first_id.contains_key(n.as_str())
+            })?;
+            let n = cand.as_str();
+            if self.module.dynamic_arrays.contains(n)
+                || self.module.queue_vars.contains(n)
+                || self.module.associative_arrays.contains_key(n)
+                || self.module.resolved_net_kinds.contains_key(n)
+            {
+                return None;
+            }
+            if let Some(dt) = self.module.var_decl_types.get(n) {
+                let r = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                if matches!(r, DataType::Struct(su) if !su.packed)
+                    || super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types)
+                {
+                    return None;
+                }
+            }
+            if let Some(&(first, lo, hi)) = self.array_first_id.get(n) {
+                if hi < lo {
+                    return None;
+                }
+                if !is_packed_id(first)
+                    && (self.signal_real.get(first).copied().unwrap_or(false)
+                        || self.sdf_delays.get(first).copied().unwrap_or(0) != 0
+                        || self
+                            .module_paths
+                            .as_ref()
+                            .is_some_and(|p| (first..first + (hi - lo + 1) as usize).any(|id| p.is_path_net(id))))
+                {
+                    return None;
+                }
+                let desc = self.module.descending_arrays.contains(n);
+                return Some(ArraySpec::OneD {
+                    first,
+                    lo,
+                    hi,
+                    desc,
+                });
+            }
+            if let Some((first, shape)) = self.array_nd_first_id.get(n) {
+                if shape.iter().any(|&(lo, hi)| hi < lo) {
+                    return None;
+                }
+                let total = shape.iter().fold(1usize, |acc, &(lo, hi)| {
+                    acc.saturating_mul((hi - lo + 1) as usize)
+                });
+                if !is_packed_id(*first)
+                    && (self.signal_real.get(*first).copied().unwrap_or(false)
+                        || self.sdf_delays.get(*first).copied().unwrap_or(0) != 0
+                        || self
+                            .module_paths
+                            .as_ref()
+                            .is_some_and(|p| (*first..*first + total).any(|id| p.is_path_net(id))))
+                {
+                    return None;
+                }
+                let descs = match self.module.unpacked_decl_dims.get(n) {
+                    Some(dd) if dd.len() == shape.len() => {
+                        dd.iter().map(|&(l, r)| l > r).collect()
+                    }
+                    _ => vec![false; shape.len()],
+                };
+                return Some(ArraySpec::Nd {
+                    first: *first,
+                    shape: shape.clone(),
+                    descs,
+                });
+            }
+            None
+        };
+
+        let mut runs: Vec<BulkCopyRun> = Vec::new();
+        let params = &self.module.parameters;
+
+        match (&lhs.kind, &rhs.kind) {
+            // Case 1: whole-array `assign dst = src;` (1-D, 2-D, or N-D).
+            (ExprKind::Ident(lh), ExprKind::Ident(rh)) => {
+                match (resolve_array_spec(lh)?, resolve_array_spec(rh)?) {
+                    (
+                        ArraySpec::OneD {
+                            first: df,
+                            lo: dlo,
+                            hi: dhi,
+                            desc: ddesc,
+                        },
+                        ArraySpec::OneD {
+                            first: sf,
+                            lo: slo,
+                            hi: shi,
+                            desc: sdesc,
+                        },
+                    ) => {
+                        let dlen = (dhi - dlo + 1) as usize;
+                        let slen = (shi - slo + 1) as usize;
+                        if dlen != slen || dlen == 0 {
+                            return None;
+                        }
+                        runs.push(BulkCopyRun {
+                            dst_first: if ddesc { df + dlen - 1 } else { df },
+                            src_first: if sdesc { sf + slen - 1 } else { sf },
+                            len: dlen,
+                            dst_step: if ddesc { -1 } else { 1 },
+                            src_step: if sdesc { -1 } else { 1 },
+                        });
+                    }
+                    (
+                        ArraySpec::Nd {
+                            first: df,
+                            shape: dshape,
+                            descs: ddescs,
+                        },
+                        ArraySpec::Nd {
+                            first: sf,
+                            shape: sshape,
+                            descs: sdescs,
+                        },
+                    ) => {
+                        if dshape.len() != sshape.len() || dshape.is_empty() {
+                            return None;
+                        }
+                        let dlens: Vec<usize> =
+                            dshape.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).collect();
+                        let slens: Vec<usize> =
+                            sshape.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).collect();
+                        if dlens != slens {
+                            return None;
+                        }
+                        let total: usize = dlens.iter().product();
+                        if total == 0 {
+                            return None;
+                        }
+                        if ddescs == sdescs && !ddescs.iter().any(|&d| d) {
+                            runs.push(BulkCopyRun {
+                                dst_first: df,
+                                src_first: sf,
+                                len: total,
+                                dst_step: 1,
+                                src_step: 1,
+                            });
+                        } else {
+                            let ndim = dlens.len();
+                            let inner_len = dlens[ndim - 1];
+                            let d_step = if ddescs[ndim - 1] { -1isize } else { 1isize };
+                            let s_step = if sdescs[ndim - 1] { -1isize } else { 1isize };
+                            let d_inner_start = if ddescs[ndim - 1] { inner_len - 1 } else { 0 };
+                            let s_inner_start = if sdescs[ndim - 1] { inner_len - 1 } else { 0 };
+                            let mut dst_strides = vec![1usize; ndim];
+                            let mut src_strides = vec![1usize; ndim];
+                            for k in (0..ndim - 1).rev() {
+                                dst_strides[k] = dst_strides[k + 1] * dlens[k + 1];
+                                src_strides[k] = src_strides[k + 1] * slens[k + 1];
+                            }
+                            fn emit_rows(
+                                dim: usize,
+                                d_off: usize,
+                                s_off: usize,
+                                dlens: &[usize],
+                                ddescs: &[bool],
+                                sdescs: &[bool],
+                                d_strides: &[usize],
+                                s_strides: &[usize],
+                                df: usize,
+                                sf: usize,
+                                d_inner_start: usize,
+                                s_inner_start: usize,
+                                d_step: isize,
+                                s_step: isize,
+                                out: &mut Vec<BulkCopyRun>,
+                            ) {
+                                if dim + 1 == dlens.len() {
+                                    out.push(BulkCopyRun {
+                                        dst_first: df + d_off + d_inner_start,
+                                        src_first: sf + s_off + s_inner_start,
+                                        len: dlens[dim],
+                                        dst_step: d_step,
+                                        src_step: s_step,
+                                    });
+                                    return;
+                                }
+                                let n = dlens[dim];
+                                for pos in 0..n {
+                                    let dp = if ddescs[dim] { n - 1 - pos } else { pos };
+                                    let sp = if sdescs[dim] { n - 1 - pos } else { pos };
+                                    emit_rows(
+                                        dim + 1,
+                                        d_off + dp * d_strides[dim],
+                                        s_off + sp * s_strides[dim],
+                                        dlens,
+                                        ddescs,
+                                        sdescs,
+                                        d_strides,
+                                        s_strides,
+                                        df,
+                                        sf,
+                                        d_inner_start,
+                                        s_inner_start,
+                                        d_step,
+                                        s_step,
+                                        out,
+                                    );
+                                }
+                            }
+                            emit_rows(
+                                0,
+                                0,
+                                0,
+                                &dlens,
+                                &ddescs,
+                                &sdescs,
+                                &dst_strides,
+                                &src_strides,
+                                df,
+                                sf,
+                                d_inner_start,
+                                s_inner_start,
+                                d_step,
+                                s_step,
+                                &mut runs,
+                            );
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            // Case 2: constant 1-D slice `assign dst[a:b] = src[c:d];` (or whole 1-D side).
+            _ if matches!(lhs.kind, ExprKind::RangeSelect { .. })
+                || matches!(rhs.kind, ExprKind::RangeSelect { .. }) =>
+            {
+                let resolve_1d_slice = |e: &Expression| -> Option<(usize, usize, isize)> {
+                    match &e.kind {
+                        ExprKind::Ident(h) => {
+                            let ArraySpec::OneD { first, lo, hi, desc } = resolve_array_spec(h)?
+                            else {
+                                return None;
+                            };
+                            let len = (hi - lo + 1) as usize;
+                            let start = if desc { first + len - 1 } else { first };
+                            Some((start, len, if desc { -1 } else { 1 }))
+                        }
+                        ExprKind::RangeSelect {
+                            expr: base,
+                            kind,
+                            left,
+                            right,
+                        } => {
+                            let ExprKind::Ident(h) = &base.kind else {
+                                return None;
+                            };
+                            let ArraySpec::OneD { first, lo, hi, desc } = resolve_array_spec(h)?
+                            else {
+                                return None;
+                            };
+                            if eval_const_expr_val_env(left, params).has_xz()
+                                || eval_const_expr_val_env(right, params).has_xz()
+                            {
+                                return None;
+                            }
+                            let lv = const_eval_i64_with_params(left, Some(params))?;
+                            let rv = const_eval_i64_with_params(right, Some(params))?;
+                            match kind {
+                                RangeKind::Constant => {
+                                    if lv.min(rv) < lo || lv.max(rv) > hi {
+                                        return None;
+                                    }
+                                    let len = (lv.abs_diff(rv) + 1) as usize;
+                                    let start = first + (lv - lo) as usize;
+                                    let step = if lv <= rv { 1 } else { -1 };
+                                    Some((start, len, step))
+                                }
+                                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                    if rv <= 0 {
+                                        return None;
+                                    }
+                                    let (slo, shi) = if matches!(kind, RangeKind::IndexedUp) {
+                                        (lv, lv + rv - 1)
+                                    } else {
+                                        (lv - rv + 1, lv)
+                                    };
+                                    if slo < lo || shi > hi {
+                                        return None;
+                                    }
+                                    let (start_idx, step) = if desc { (shi, -1) } else { (slo, 1) };
+                                    let start = first + (start_idx - lo) as usize;
+                                    Some((start, rv as usize, step))
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                let (d_start, d_len, d_step) = resolve_1d_slice(lhs)?;
+                let (s_start, s_len, s_step) = resolve_1d_slice(rhs)?;
+                if d_len != s_len || d_len == 0 {
+                    return None;
+                }
+                runs.push(BulkCopyRun {
+                    dst_first: d_start,
+                    src_first: s_start,
+                    len: d_len,
+                    dst_step: d_step,
+                    src_step: s_step,
+                });
+            }
+            // Case 3: constant row `assign dst = src[row];`.
+            (ExprKind::Ident(lh), ExprKind::Index { expr, index }) => {
+                let ExprKind::Ident(rh) = &expr.kind else {
+                    return None;
+                };
+                let ArraySpec::OneD {
+                    first: df,
+                    lo: dlo,
+                    hi: dhi,
+                    desc: ddesc,
+                } = resolve_array_spec(lh)?
+                else {
+                    return None;
+                };
+                let ArraySpec::Nd {
+                    first: sf,
+                    shape: sshape,
+                    descs: sdescs,
+                } = resolve_array_spec(rh)?
+                else {
+                    return None;
+                };
+                if sshape.len() != 2 {
+                    return None;
+                }
+                if eval_const_expr_val_env(index, params).has_xz() {
+                    return None;
+                }
+                let row = const_eval_i64_with_params(index, Some(params))?;
+                let (rlo, rhi) = sshape[0];
+                if row < rlo || row > rhi {
+                    return None;
+                }
+                let (ilo, ihi) = sshape[1];
+                let dlen = (dhi - dlo + 1) as usize;
+                let ilen = (ihi - ilo + 1) as usize;
+                if dlen != ilen || dlen == 0 {
+                    return None;
+                }
+                let s_row_first = sf + ((row - rlo) as usize) * ilen;
+                let sdesc = sdescs[1];
+                runs.push(BulkCopyRun {
+                    dst_first: if ddesc { df + dlen - 1 } else { df },
+                    src_first: if sdesc { s_row_first + ilen - 1 } else { s_row_first },
+                    len: dlen,
+                    dst_step: if ddesc { -1 } else { 1 },
+                    src_step: if sdesc { -1 } else { 1 },
+                });
+            }
+            _ => return None,
+        }
+
+        // Drop trivial self-copies.
+        runs.retain(|r| !(r.dst_first == r.src_first && r.dst_step == r.src_step));
+        let mut rids = Vec::new();
+        let mut wids = Vec::new();
+        for r in &runs {
+            if !is_packed_id(r.src_first) {
+                rids.reserve(r.len);
+                let mut s = r.src_first as isize;
+                for _ in 0..r.len {
+                    rids.push(s as usize);
+                    s += r.src_step;
+                }
+            }
+            if !is_packed_id(r.dst_first) {
+                wids.reserve(r.len);
+                let mut d = r.dst_first as isize;
+                for _ in 0..r.len {
+                    wids.push(d as usize);
+                    d += r.dst_step;
+                }
+            }
+        }
+        Some((runs, rids, wids))
+    }
+
+    /// Build `packed_seg_deps`: for every [`CombItem::BulkArrayCopy`] entry
+    /// reading a [`PackedMem`] source segment, record that entry in
+    /// `packed_seg_deps[seg]` so writes to that packed segment wake it.
+    pub(super) fn rebuild_packed_seg_deps(&mut self) {
+        let n_segs = self.packed.num_segs();
+        self.packed_seg_deps = vec![Vec::new(); n_segs];
+        self.packed_seg_dirty = vec![false; n_segs];
+        self.dirty_packed_segs.clear();
+        if n_segs == 0 {
+            return;
+        }
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            if let CombItem::BulkArrayCopy { runs } = &entry.item {
+                for run in runs.iter() {
+                    if is_packed_id(run.src_first) {
+                        let seg = packed_mem::packed_seg_idx(run.src_first);
+                        if seg < self.packed_seg_deps.len() {
+                            let deps = &mut self.packed_seg_deps[seg];
+                            if deps.last() != Some(&(eidx as u32)) && !deps.contains(&(eidx as u32))
+                            {
+                                deps.push(eidx as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

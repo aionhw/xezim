@@ -38,12 +38,18 @@ impl Simulator {
         let lo = pos
             .map(|p| p.saturating_mul(ew))
             .filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w))?;
-        let mut cur = self.signal_table[id].clone();
-        let prev = cur.clone();
-        for b in 0..ew {
-            cur.set_bit((lo + b) as usize, val.get_bit(b as usize));
+        let src = if val.width != ew {
+            let mut z = Value::zero(ew);
+            z.copy_bits_from(0, val, 0, (val.width.min(ew)) as usize);
+            std::borrow::Cow::Owned(z)
+        } else {
+            std::borrow::Cow::Borrowed(val)
+        };
+        if let Some(changed) = self.splice_signal_bits(id, lo as usize, &src) {
+            return Some(changed);
         }
-        let changed = cur != prev;
+        let mut cur = self.signal_table[id].clone();
+        let changed = cur.copy_bits_from(lo as usize, &src, 0, ew as usize);
         if changed {
             if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;

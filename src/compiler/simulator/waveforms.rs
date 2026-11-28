@@ -481,9 +481,18 @@ impl Simulator {
             .filter(|(_, first, _, _)| *first < n)
             .map(|(b, _, lo, hi)| (b.as_ref(), lo, hi))
             .collect();
+        let packed_arrays: Vec<(&str, i64, i64)> = self
+            .array_first_id
+            .iter()
+            .filter(|&(_, &(first, lo, hi))| {
+                packed_mem::is_packed_id(first)
+                    && (hi - lo + 1).max(0) as usize <= self.large_array_threshold
+            })
+            .map(|(b, &(_, lo, hi))| (b.as_ref(), lo, hi))
+            .collect();
         let mut scope_names: HashSet<&str> = HashSet::default();
         let mut expanded_bases: HashSet<&str> = HashSet::default();
-        for &(base, _, _) in &virtual_arrays {
+        for &(base, _, _) in virtual_arrays.iter().chain(packed_arrays.iter()) {
             let mut cut = 0usize;
             while let Some(p) = base[cut..].find('.') {
                 let end = cut + p;
@@ -592,7 +601,7 @@ impl Simulator {
                 out.push(name.to_string());
             }
         }
-        for &(base, lo, hi) in &virtual_arrays {
+        for &(base, lo, hi) in virtual_arrays.iter().chain(packed_arrays.iter()) {
             for idx in lo..=hi {
                 let name = format!("{}[{}]", base, idx);
                 if keep(&name) && !excluded(&name) {
@@ -634,17 +643,29 @@ impl Simulator {
     /// `$dumpvars(0, top.u_sub)` still dumps `u_sub.din` under its own code), at
     /// a width change, and at a `real`/`event` boundary — a shared code may only
     /// carry one width and one record shape.
+    pub(super) fn dump_signal_id(&self, name: &str) -> Option<usize> {
+        if let Some(&i) = self.signal_name_to_id.get(name)
+            && i < self.signal_table.len()
+        {
+            return Some(i);
+        }
+        signal_map::resolve_array_elem_id(name, &self.array_first_id)
+            .filter(|&i| packed_mem::is_packed_id(i))
+    }
+
+    pub(super) fn dump_signal_width(&self, id: usize) -> u32 {
+        if packed_mem::is_packed_id(id) {
+            self.packed.width(id)
+        } else {
+            self.signal_widths[id]
+        }
+    }
+
     pub(super) fn dump_backing_ids(&self, names: &[String]) -> HashMap<String, usize> {
         let selected: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
-        let tbl_id = |n: &str| -> Option<usize> {
-            match self.signal_name_to_id.get(n) {
-                Some(&i) if i < self.signal_table.len() => Some(i),
-                _ => None,
-            }
-        };
         let mut out: HashMap<String, usize> = HashMap::default();
         for name in names {
-            let own = match tbl_id(name.as_str()) {
+            let own = match self.dump_signal_id(name.as_str()) {
                 Some(i) => i,
                 None => continue,
             };
@@ -659,11 +680,11 @@ impl Simulator {
                 if !selected.contains(parent) {
                     break;
                 }
-                let pid = match tbl_id(parent) {
+                let pid = match self.dump_signal_id(parent) {
                     Some(i) => i,
                     None => break,
                 };
-                if self.signal_widths[pid] != self.signal_widths[rep]
+                if self.dump_signal_width(pid) != self.dump_signal_width(rep)
                     || self.lookup_signal_width(parent) != self.lookup_signal_width(rep_name)
                 {
                     break;
@@ -791,6 +812,9 @@ impl Simulator {
     /// declaration so a `real` always formats as an `r<decimal>` record even if
     /// the stored `Value` lost its flag along the way.
     pub(super) fn dump_value(&self, id: usize) -> Value {
+        if packed_mem::is_packed_id(id) {
+            return self.packed.read(id);
+        }
         let mut v = self.signal_table[id].clone();
         if self.signal_real.get(id).copied().unwrap_or(false) {
             v.is_real = true;
@@ -984,9 +1008,9 @@ impl Simulator {
             std::env::var("XEZIM_VCD_PARAM_AS_WIRE").ok().as_deref() == Some("1");
         let mut root = ScopeNode::new();
         for name in &sig_names {
-            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
-                _ => continue,
+            let tbl_id = match self.dump_signal_id(name.as_str()) {
+                Some(i) => i,
+                None => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
             let mut kind = self.dump_var_kind(name, tbl_id);
@@ -1130,11 +1154,14 @@ impl Simulator {
             let code = id_map[name].clone();
             // An `event` has no level, so it contributes no checkpoint record —
             // it only ever emits a `1<id>` pulse when triggered.
-            if kind != VcdVarKind::Event {
-                let val = self.dump_value(sid);
-                super::vcd_sink::write_vcd_value(&mut hdr, &val, &code);
-            }
-            prev.push(self.signal_table[sid].clone());
+            let val = if kind != VcdVarKind::Event {
+                let v = self.dump_value(sid);
+                super::vcd_sink::write_vcd_value(&mut hdr, &v, &code);
+                v
+            } else {
+                self.dump_value(sid)
+            };
+            prev.push(val);
             kinds.push(kind);
             trace.push((sid, code));
         }
@@ -1167,16 +1194,20 @@ impl Simulator {
             let nsig = self.signal_table.len();
             let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
             let mut event_indices: Vec<usize> = Vec::new();
+            let mut packed_indices: Vec<usize> = Vec::new();
             for (idx, &(sid, _)) in self.vcd_trace.iter().enumerate() {
                 if self.vcd_var_kinds[idx] == VcdVarKind::Event {
                     event_indices.push(idx);
                 }
-                if sid < nsig {
+                if packed_mem::is_packed_id(sid) {
+                    packed_indices.push(idx);
+                } else if sid < nsig {
                     id_to_trace[sid].push(idx as u32);
                 }
             }
             self.vcd_id_to_trace = id_to_trace;
             self.vcd_event_indices = event_indices;
+            self.vcd_packed_indices = packed_indices;
             self.enable_dump_dirty_tracking();
         }
     }
@@ -1368,6 +1399,12 @@ impl Simulator {
                     }
                     // Keep the level mirror in step so the toggle never leaks out.
                     self.vcd_prev_signals[idx] = self.signal_table[id].clone();
+                } else if packed_mem::is_packed_id(id) {
+                    let val = self.packed.read(id);
+                    if self.vcd_prev_signals[idx] != val {
+                        self.vcd_prev_signals[idx] = val.clone();
+                        changes.push((self.vcd_trace[idx].1.clone(), val));
+                    }
                 } else {
                     let val = &self.signal_table[id];
                     if self.vcd_prev_signals[idx] != *val {
@@ -1390,8 +1427,9 @@ impl Simulator {
         // `dump_write_changes` once every writer has read it.
         let dirty_slots = self.dump_dirty_slots(&self.vcd_id_to_trace);
         if let Some(mut slots) = dirty_slots {
-            if !self.vcd_event_indices.is_empty() {
+            if !self.vcd_event_indices.is_empty() || !self.vcd_packed_indices.is_empty() {
                 slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
+                slots.extend(self.vcd_packed_indices.iter().map(|&i| i as u32));
                 slots.sort_unstable();
                 slots.dedup();
             }
@@ -1446,7 +1484,7 @@ impl Simulator {
             let val = self.dump_value(sid);
             let code = self.vcd_trace[idx].1.clone();
             super::vcd_sink::write_vcd_value(&mut buf, &val, &code);
-            self.vcd_prev_signals[idx] = self.signal_table[sid].clone();
+            self.vcd_prev_signals[idx] = val;
         }
         let _ = writeln!(buf, "$end");
         self.vcd_last_time = self.time;
@@ -1484,7 +1522,7 @@ impl Simulator {
                     let _ = writeln!(buf, "z{}", code);
                 }
                 _ => {
-                    let width = self.signal_table[self.vcd_trace[idx].0].width;
+                    let width = self.dump_signal_width(self.vcd_trace[idx].0);
                     if width == 1 {
                         let _ = writeln!(buf, "x{}", code);
                     } else {
@@ -1808,11 +1846,7 @@ impl Simulator {
 
             // Kind is read from the name's OWN table entry (a real/event is
             // never folded into an alias group by `dump_backing_ids`).
-            let own_id = self
-                .signal_name_to_id
-                .get(*name)
-                .copied()
-                .unwrap_or(*tbl_id);
+            let own_id = self.dump_signal_id(*name).unwrap_or(*tbl_id);
             let kind = self.dump_var_kind(name, own_id);
             let is_event = kind == VcdVarKind::Event;
             let is_real = kind == VcdVarKind::Real;
@@ -1968,7 +2002,12 @@ impl Simulator {
         // signal_table and reseeds it from settled values.
         self.xtrace_prev_signals = trace
             .iter()
-            .map(|(id, _)| self.signal_table[*id].clone())
+            .map(|(id, _)| self.dump_value(*id))
+            .collect();
+        self.xtrace_packed_indices = trace
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (id, _))| packed_mem::is_packed_id(*id).then_some(i))
             .collect();
         // Incremental change detection: narrow each flush to the slots of
         // signals actually written (see the `dump_dirty` field docs). Shared
@@ -1994,7 +2033,7 @@ impl Simulator {
         let mut snap_parts: Vec<String> = Vec::with_capacity(self.xtrace_trace.len());
         for idx in 0..self.xtrace_trace.len() {
             let (tbl_id, sid) = &self.xtrace_trace[idx];
-            let val = self.signal_table[*tbl_id].clone();
+            let val = self.dump_value(*tbl_id);
             snap_parts.push(format!(
                 "{}={}",
                 sid,
@@ -2082,20 +2121,38 @@ impl Simulator {
             ($idx:expr_2021) => {{
                 let idx = $idx;
                 let id = self.xtrace_trace[idx].0;
-                let val = &self.signal_table[id];
-                if self.xtrace_prev_signals[idx] != *val {
-                    changes.push((
-                        self.xtrace_trace[idx].1.clone(),
-                        val.clone(),
-                        self.xtrace_real[idx],
-                        self.xtrace_string[idx],
-                    ));
-                    self.xtrace_prev_signals[idx] = val.clone();
+                if packed_mem::is_packed_id(id) {
+                    let val = self.packed.read(id);
+                    if self.xtrace_prev_signals[idx] != val {
+                        changes.push((
+                            self.xtrace_trace[idx].1.clone(),
+                            val.clone(),
+                            self.xtrace_real[idx],
+                            self.xtrace_string[idx],
+                        ));
+                        self.xtrace_prev_signals[idx] = val;
+                    }
+                } else {
+                    let val = &self.signal_table[id];
+                    if self.xtrace_prev_signals[idx] != *val {
+                        changes.push((
+                            self.xtrace_trace[idx].1.clone(),
+                            val.clone(),
+                            self.xtrace_real[idx],
+                            self.xtrace_string[idx],
+                        ));
+                        self.xtrace_prev_signals[idx] = val.clone();
+                    }
                 }
             }};
         }
         match self.dump_dirty_slots(&self.xtrace_id_to_trace) {
-            Some(slots) => {
+            Some(mut slots) => {
+                if !self.xtrace_packed_indices.is_empty() {
+                    slots.extend(self.xtrace_packed_indices.iter().map(|&i| i as u32));
+                    slots.sort_unstable();
+                    slots.dedup();
+                }
                 for &idx in &slots {
                     check_xt_slot!(idx as usize);
                 }
@@ -2458,11 +2515,7 @@ impl Simulator {
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
-            let own_id = self
-                .signal_name_to_id
-                .get(name.as_str())
-                .copied()
-                .unwrap_or(tbl_id);
+            let own_id = self.dump_signal_id(name.as_str()).unwrap_or(tbl_id);
             let kind = self.dump_var_kind(name, own_id);
             let signal_type = if kind == VcdVarKind::Real {
                 FstSignalType::real()
@@ -2608,7 +2661,7 @@ impl Simulator {
         for (tbl_id, (fid, width)) in &trace {
             let val = self.dump_value(*tbl_id);
             let _ = body.signal_change(*fid, &Self::fst_format_value(&val, *width));
-            prev.push(self.signal_table[*tbl_id].clone());
+            prev.push(val);
         }
         for (_, fid) in &events {
             let _ = body.signal_change(*fid, b"0");
@@ -2616,6 +2669,11 @@ impl Simulator {
 
         // Incremental change detection, shared with the VCD and XTrace writers
         // (see the `dump_dirty` field docs).
+        self.fst_packed_indices = trace
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (id, _))| packed_mem::is_packed_id(*id).then_some(i))
+            .collect();
         self.fst_id_to_trace = self.build_dump_id_to_trace(&trace);
         self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
@@ -2648,15 +2706,28 @@ impl Simulator {
             ($idx:expr_2021) => {{
                 let idx = $idx;
                 let (tbl_id, (fid, width)) = self.fst_trace[idx];
-                let val = &self.signal_table[tbl_id];
-                if self.fst_prev_signals[idx] != *val {
-                    changes.push((fid, self.dump_value(tbl_id), width));
-                    self.fst_prev_signals[idx] = val.clone();
+                if packed_mem::is_packed_id(tbl_id) {
+                    let val = self.packed.read(tbl_id);
+                    if self.fst_prev_signals[idx] != val {
+                        self.fst_prev_signals[idx] = val.clone();
+                        changes.push((fid, val, width));
+                    }
+                } else {
+                    let val = &self.signal_table[tbl_id];
+                    if self.fst_prev_signals[idx] != *val {
+                        changes.push((fid, self.dump_value(tbl_id), width));
+                        self.fst_prev_signals[idx] = val.clone();
+                    }
                 }
             }};
         }
         match self.dump_dirty_slots(&self.fst_id_to_trace) {
-            Some(slots) => {
+            Some(mut slots) => {
+                if !self.fst_packed_indices.is_empty() {
+                    slots.extend(self.fst_packed_indices.iter().map(|&i| i as u32));
+                    slots.sort_unstable();
+                    slots.dedup();
+                }
                 for &idx in &slots {
                     check_fst_slot!(idx as usize);
                 }

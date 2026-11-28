@@ -1838,7 +1838,10 @@ impl Simulator {
                                 // and 8-bit u in an int function is 9 bits).
                                 // §10.8: a pattern takes the return type.
                                 None => match self
-                                    .ret_struct_elem_value(e)
+                                    .return_frame_type()
+                                    .and_then(|dt| self.resolve_tagged_su(&dt))
+                                    .and_then(|su| self.eval_tagged_rhs(&su, e).map(|(_, v, _)| v))
+                                    .or_else(|| self.ret_struct_elem_value(e))
                                     .or_else(|| self.ret_pattern_value(e))
                                 {
                                     Some(v) => v,

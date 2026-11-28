@@ -141,9 +141,25 @@ pub(super) enum CombItem {
     /// while the other input holds the controlling value: the gate is
     /// `ctl_gates[slot]` (see `CtlGate`). Made from `FusedGate` entries at
     /// the first settle, never before the prepared-comb cache is written.
+    /// Controlling-value skip for a binary gate or one mux data arm.
     CtlGate {
         slot: u32,
     },
+    /// Whole-array, slice, or row continuous copy between fixed unpacked arrays,
+    /// lowered without expanding into per-element AST entries.
+    BulkArrayCopy {
+        runs: Box<[BulkCopyRun]>,
+    },
+}
+
+/// One contiguous run of element copies in [`CombItem::BulkArrayCopy`].
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct BulkCopyRun {
+    pub(super) dst_first: usize,
+    pub(super) src_first: usize,
+    pub(super) len: usize,
+    pub(super) dst_step: isize,
+    pub(super) src_step: isize,
 }
 
 /// Controlling-value skip for a binary gate or one mux data arm.

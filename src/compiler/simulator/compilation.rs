@@ -1311,6 +1311,7 @@ impl Simulator {
                             CombItem::ContAssign { .. } => "ca",
                             CombItem::DirectCopy { .. } => "dc",
                             CombItem::FastDirectCopy { .. } => "fdc",
+                            CombItem::BulkArrayCopy { .. } => "bac",
                             CombItem::CompiledAlwaysBlock { .. } => "cab",
                             CombItem::AlwaysBlock { .. } => "ab",
                             _ => "other",
@@ -1676,7 +1677,18 @@ impl Simulator {
                 self.dirty_list.push(i);
             }
         }
-        self.dirty_any = !self.dirty_list.is_empty() || !self.comb_time0_idx.is_empty();
+        for seg in 0..self.packed_seg_deps.len() {
+            if !self.packed_seg_deps[seg].is_empty()
+                && seg < self.packed_seg_dirty.len()
+                && !self.packed_seg_dirty[seg]
+            {
+                self.packed_seg_dirty[seg] = true;
+                self.dirty_packed_segs.push(seg);
+            }
+        }
+        self.dirty_any = !self.dirty_list.is_empty()
+            || !self.dirty_packed_segs.is_empty()
+            || !self.comb_time0_idx.is_empty();
         let t_settle0 = std::time::Instant::now();
         let entries_before = self.entry_evals;
         let iters_before = self.settle_iters;

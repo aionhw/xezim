@@ -3,6 +3,139 @@
 use super::*;
 
 impl<'a> BytecodeCompiler<'a> {
+    /// Compile whole unpacked-struct `==`, `!=`, `===`, `!==` leaf-by-leaf.
+    /// Returns `None` if neither side names a registered unpacked struct,
+    /// `Some(Some(reg))` on success, or `Some(None)` (after bailing) when an
+    /// unpacked-struct comparison must fall back to the interpreter.
+    fn compile_unpacked_struct_eq(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Option<RegId>> {
+        if !matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+        ) {
+            return None;
+        }
+        let map = self.unpacked_structs?;
+        enum StructLeaves<'m> {
+            NotStruct,
+            Ambiguous,
+            Leaves(&'m [(String, String)]),
+        }
+        let resolve_side = |e: &Expression| -> StructLeaves<'_> {
+            let mut cur = e;
+            while let ExprKind::Paren(inner) = &cur.kind {
+                cur = inner;
+            }
+            let ExprKind::Ident(h) = &cur.kind else {
+                return StructLeaves::NotStruct;
+            };
+            if !h.path.iter().all(|s| s.selects.is_empty()) {
+                return StructLeaves::NotStruct;
+            }
+            let Some(id) = self.lookup_signal_id(h) else {
+                return StructLeaves::NotStruct;
+            };
+            if map.contains_key(&id) && self.names_local(&h.path[0].name.name) {
+                return StructLeaves::Ambiguous;
+            }
+            if let (Some(scope), Some((path, leaf))) = (
+                self.scope_hint.as_deref(),
+                map.get(&id).and_then(|v| v.first()),
+            ) {
+                let raw = Self::hier_raw_cow(h);
+                let shadowed = scope
+                    .match_indices('.')
+                    .map(|(i, _)| i)
+                    .chain([scope.len()])
+                    .any(|end| {
+                        let key = format!("{}.{raw}.{path}", &scope[..end]);
+                        key != *leaf && self.signal_name_to_id.get(key.as_str()).is_some()
+                    });
+                if shadowed {
+                    return StructLeaves::Ambiguous;
+                }
+            }
+            match map.get(&id) {
+                Some(v) if !v.is_empty() => StructLeaves::Leaves(v.as_slice()),
+                Some(_) => StructLeaves::Ambiguous,
+                None => StructLeaves::NotStruct,
+            }
+        };
+        let (ls, rs) = (resolve_side(left), resolve_side(right));
+        let (l_leaves, r_leaves) = match (ls, rs) {
+            (StructLeaves::NotStruct, StructLeaves::NotStruct) => return None,
+            (StructLeaves::Leaves(l), StructLeaves::Leaves(r))
+                if l.len() == r.len() && l.iter().zip(r).all(|(a, b)| a.0 == b.0) =>
+            {
+                (l, r)
+            }
+            _ => {
+                self.bail("Expr_unpacked_struct_eq");
+                return Some(None);
+            }
+        };
+        let is_case = matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq);
+        let pairs: Option<Vec<(usize, usize, bool)>> = l_leaves
+            .iter()
+            .zip(r_leaves)
+            .map(|((_, lname), (_, rname))| {
+                let lid = *self.signal_name_to_id.get(lname.as_str())?;
+                let rid = *self.signal_name_to_id.get(rname.as_str())?;
+                let l_str = self.string_signals.is_some_and(|s| s.contains(lname.as_str()));
+                let r_str = self.string_signals.is_some_and(|s| s.contains(rname.as_str()));
+                if l_str != r_str || (l_str && is_case) {
+                    return None;
+                }
+                let l_real = self.signal_real.and_then(|r| r.get(lid).copied()).unwrap_or(false);
+                let r_real = self.signal_real.and_then(|r| r.get(rid).copied()).unwrap_or(false);
+                if (l_real || r_real) && is_case {
+                    return None;
+                }
+                Some((lid, rid, l_str))
+            })
+            .collect();
+        let Some(pairs) = pairs else {
+            self.bail("Expr_unpacked_struct_eq");
+            return Some(None);
+        };
+        let mut acc: Option<RegId> = None;
+        for (lid, rid, is_str) in pairs {
+            let lr = self.alloc_reg();
+            let rr = self.alloc_reg();
+            self.emit(Insn::LoadSignal(lr, as_sig_id(lid)));
+            self.emit(Insn::LoadSignal(rr, as_sig_id(rid)));
+            let cmp = self.alloc_reg();
+            if is_str {
+                let ord = self.alloc_reg();
+                self.emit(Insn::StrOp(ord, StrOpKind::Order, Box::new(vec![lr, rr])));
+                let zero = self.alloc_reg();
+                let mut zv = Value::from_u64(0, 32);
+                zv.is_signed = true;
+                self.emit(Insn::LoadConst(zero, Box::new(zv)));
+                self.emit(Insn::Eq(cmp, ord, zero));
+            } else if is_case {
+                self.emit(Insn::CaseEq(cmp, lr, rr));
+            } else {
+                self.emit(Insn::Eq(cmp, lr, rr));
+            }
+            match acc {
+                None => acc = Some(cmp),
+                Some(prev) => {
+                    self.emit(Insn::BitAnd(prev, prev, cmp));
+                }
+            }
+        }
+        let acc = acc?;
+        if matches!(op, BinaryOp::Neq | BinaryOp::CaseNeq) {
+            self.emit(Insn::LogNot(acc, acc));
+        }
+        Some(Some(acc))
+    }
+
     pub(super) fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
         // §8.8: a bare typed constructor `C::new` constructs, as `C::new()`
         // does, rather than reading a class-scope name.
@@ -530,6 +663,9 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     self.bail("string_formal_non_eq_binary");
                     return None;
+                }
+                if let Some(res) = self.compile_unpacked_struct_eq(*op, left, right) {
+                    return res;
                 }
                 // §11.8.2: an operator with a REAL operand follows the real
                 // rules, not the integral width/sign propagation below.
@@ -2655,12 +2791,12 @@ impl<'a> BytecodeCompiler<'a> {
                 // are already flattened in the layout table.
                 let direct_start = self.insns.len();
                 let direct_reg = self.next_reg;
-                if let Some((root, key, hier, fields)) = self.compile_packed_struct_value(base)
-                    && let Some((_, off, width)) =
-                        fields.iter().find(|(name, _, _)| name == &member.name)
+                if let Some((root, key, hier, layout)) = self.compile_packed_struct_value(base)
+                    && let Some(f) = layout.get(&member.name)
                 {
+                    let (off, width) = (f.offset, f.width);
                     let dest = self.alloc_reg();
-                    self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
+                    self.emit(Insn::RangeSelectConst(dest, root, off + width - 1, off));
                     // §7.2.1: the member keeps its declared type's sign.
                     let var = Self::hier_raw_name(&hier);
                     if self

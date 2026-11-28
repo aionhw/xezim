@@ -136,6 +136,10 @@ impl Simulator {
             delayed_nba,
             delayed_nba_queue,
             packed_nba,
+            packed_wide_nba,
+            packed_seg_deps,
+            packed_seg_dirty,
+            dirty_packed_segs,
             this_stack,
             local_stack,
             block_scope_saves,
@@ -545,6 +549,7 @@ impl Simulator {
             local_coll_shapes,
             local_coll_elems,
             active_union_tag,
+            mixed_local_two_state,
             static_struct_holders,
             rand_ranges,
             rand_elem_ranges

@@ -249,7 +249,7 @@ impl Simulator {
         // The deferred updates are PENDING WORK: without this, a caller that
         // gates its settle on dirty_any (the tick top) skips the drain and a
         // process in the NEXT slot reads stale nets.
-        if !self.deferred_proc_entries.is_empty() {
+        if !self.deferred_proc_entries.is_empty() || !self.dirty_packed_segs.is_empty() {
             self.dirty_any = true;
         }
         if env_set_cached!("XEZIM_PSETTLE_STATS") {

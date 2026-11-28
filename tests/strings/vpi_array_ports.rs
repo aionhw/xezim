@@ -156,7 +156,7 @@ fn vpi_writes_reach_unpacked_array_ports() {
     );
     expect(&packed);
     assert!(
-        packed.contains("[PACKED-MEM] arrays=3 cells=24"),
+        packed.contains("[PACKED-MEM] arrays=5 cells=36"),
         "the variables are not in the packed arena:\n{packed}"
     );
     // Cached lowering must retain the same deposit and force/release

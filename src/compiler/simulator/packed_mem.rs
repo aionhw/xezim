@@ -33,9 +33,17 @@ const PACKED_OFF_MASK: usize = (1usize << PACKED_SEG_SHIFT) - 1;
 /// Segment numbers fit in the 16 bits between the offset and `PACKED_BASE`.
 const PACKED_MAX_SEGS: usize = 1 << (48 - PACKED_SEG_SHIFT);
 
+/// Maximum element width (in bits) admitted to `PackedMem`.
+pub(crate) const PACKED_MAX_WIDTH: u32 = 65_536;
+
 #[inline]
 pub(crate) fn is_packed_id(id: usize) -> bool {
     id >= PACKED_BASE
+}
+
+#[inline]
+pub(crate) fn packed_seg_idx(id: usize) -> usize {
+    (id - PACKED_BASE) >> PACKED_SEG_SHIFT
 }
 
 pub(super) fn packed_mem_enabled() -> bool {
@@ -50,25 +58,25 @@ pub(super) fn packed_mem_enabled() -> bool {
 /// One admitted array.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PackedSeg {
-    /// Byte offset of cell 0 in `PackedMem::data`.
+    /// Byte offset of cell 0 in `PackedMem::data` (8-byte aligned when `width > 64`).
     base: usize,
     /// Number of cells.
     count: usize,
-    /// Element-width mask of the value plane.
+    /// Element-width mask of the value plane (`<=64`: whole element; `>64`: top u64 word).
     vmask: u64,
     /// Mask of the x/z plane: `vmask`, or 0 for a two-state element (which
-    /// stores no x/z plane; its "x/z" load reads a neighbour and is masked
-    /// to nothing).
+    /// stores no x/z plane).
     pub(super) xmask: u64,
-    /// The bytes of one plane (`plane` bytes of ones), for the 8-byte
-    /// read-modify-write stores.
+    /// The bytes of one plane (`plane` bytes of ones) for `<=64`-bit 8-byte RMW stores.
     pmask: u64,
-    /// Bytes per plane: 1, 2, 4 or 8.
-    plane: u8,
+    /// Bytes per plane: 1, 2, 4 or 8 for `width <= 64`; `8 * words` for `width > 64`.
+    plane: u32,
     /// Bytes per cell: `plane` (two-state) or `2 * plane` (value + x/z).
-    cell: u8,
-    /// Declared element width in bits (1..=64).
-    pub(super) width: u8,
+    cell: u32,
+    /// Declared element width in bits (`1..=PACKED_MAX_WIDTH`).
+    pub(super) width: u32,
+    /// Number of 64-bit words per plane (`1` for `<= 64`, `width.div_ceil(64)` for `> 64`).
+    words: u16,
     /// `SEG_SIGNED` / `SEG_TWO_STATE` / `SEG_FORCED`.
     flags: u8,
 }
@@ -110,7 +118,7 @@ impl PackedMem {
         if width == 0 || width > 64 || count == 0 || self.segs.len() >= PACKED_MAX_SEGS {
             return None;
         }
-        let plane: u8 = match width {
+        let plane: u32 = match width {
             1..=8 => 1,
             9..=16 => 2,
             17..=32 => 4,
@@ -130,11 +138,12 @@ impl PackedMem {
             pmask: if plane == 8 {
                 u64::MAX
             } else {
-                (1u64 << (8 * plane as u32)) - 1
+                (1u64 << (8 * plane)) - 1
             },
             plane,
             cell,
-            width: width as u8,
+            width,
+            words: 1,
             flags: if signed { SEG_SIGNED } else { 0 } | if two_state { SEG_TWO_STATE } else { 0 },
         };
         let (iv, ix) = (init.0 & seg.vmask, init.1 & seg.xmask);
@@ -157,6 +166,93 @@ impl PackedMem {
         let first = PACKED_BASE | (self.segs.len() << PACKED_SEG_SHIFT);
         self.segs.push(seg);
         Some(first)
+    }
+
+    /// Admit an array of `count` cells of `width` bits (supporting both
+    /// `<= 64`-bit inline words and `> 64`-bit multi-word elements up to
+    /// [`PACKED_MAX_WIDTH`]), every cell initialized from `init`.
+    pub(super) fn admit_value(
+        &mut self,
+        count: usize,
+        width: u32,
+        signed: bool,
+        two_state: bool,
+        init: &Value,
+    ) -> Option<usize> {
+        if width <= 64 {
+            return self.admit(count, width, signed, two_state, init.raw_bits());
+        }
+        if width > PACKED_MAX_WIDTH || count == 0 || self.segs.len() >= PACKED_MAX_SEGS {
+            return None;
+        }
+        let words = width.div_ceil(64) as usize;
+        let words_u16 = u16::try_from(words).ok()?;
+        let plane = (words * 8) as u32;
+        let cell = if two_state { plane } else { 2 * plane };
+        let rem = width % 64;
+        let vmask = if rem == 0 {
+            u64::MAX
+        } else {
+            (1u64 << rem) - 1
+        };
+        let xmask = if two_state { 0 } else { vmask };
+        // Keep wide segments 8-byte aligned for direct word loads/stores.
+        while !self.data.len().is_multiple_of(8) {
+            self.data.push(0);
+        }
+        let base = self.data.len();
+        let seg = PackedSeg {
+            base,
+            count,
+            vmask,
+            xmask,
+            pmask: u64::MAX,
+            plane,
+            cell,
+            width,
+            words: words_u16,
+            flags: if signed { SEG_SIGNED } else { 0 } | if two_state { SEG_TWO_STATE } else { 0 },
+        };
+        let mut iv = vec![0u64; words];
+        let mut ix = vec![0u64; words];
+        init.write_val_xz_words(&mut iv, &mut ix);
+        iv[words - 1] &= seg.vmask;
+        if two_state {
+            ix.fill(0);
+        } else {
+            ix[words - 1] &= seg.xmask;
+        }
+        let bytes = count.checked_mul(cell as usize)?;
+        if iv.iter().all(|&w| w == 0) && ix.iter().all(|&w| w == 0) {
+            self.data.resize(self.data.len() + bytes, 0);
+        } else {
+            let mut pattern = Vec::with_capacity(cell as usize);
+            for &w in &iv {
+                pattern.extend_from_slice(&w.to_le_bytes());
+            }
+            if !two_state {
+                for &w in &ix {
+                    pattern.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            self.data.reserve(bytes + PACKED_PAD);
+            for _ in 0..count {
+                self.data.extend_from_slice(&pattern);
+            }
+        }
+        self.data.resize(self.data.len() + PACKED_PAD, 0);
+        let first = PACKED_BASE | (self.segs.len() << PACKED_SEG_SHIFT);
+        self.segs.push(seg);
+        Some(first)
+    }
+
+    #[inline]
+    pub(crate) fn is_wide(&self, id: usize) -> bool {
+        self.locate(id).is_some_and(|(seg, _)| seg.width > 64)
+    }
+
+    pub(crate) fn num_segs(&self) -> usize {
+        self.segs.len()
     }
 
     pub(super) fn reserve(&mut self, bytes: usize) {
@@ -235,7 +331,11 @@ impl PackedMem {
 
     #[inline(always)]
     fn store_at(&mut self, seg: &PackedSeg, at: usize, v: u64, x: u64) -> bool {
-        let nv = v & seg.vmask;
+        let nv = if seg.xmask == 0 {
+            (v & !x) & seg.vmask
+        } else {
+            v & seg.vmask
+        };
         let nx = x & seg.xmask;
         let xat = at + seg.plane as usize;
         let ov = self.load8(at);
@@ -255,6 +355,7 @@ impl PackedMem {
     /// Land `(v, x)` in the cell even if it is forced, leaving the force as
     /// it is: for a swap undone before anything else reads the cell (a
     /// concurrent assertion's sampled values, §16.5.1).
+    #[allow(dead_code)]
     pub(super) fn put_raw(&mut self, id: usize, v: u64, x: u64) {
         if let Some((seg, at)) = self.locate(id) {
             let seg = *seg;
@@ -264,6 +365,7 @@ impl PackedMem {
 
     /// §10.6.2 `force`: land `(v, x)` in the cell even if it is already
     /// forced, and pin it there until `release_forced`.
+    #[allow(dead_code)]
     pub(crate) fn force_raw(&mut self, id: usize, v: u64, x: u64) -> bool {
         let Some((seg, at)) = self.locate(id) else {
             return false;
@@ -282,37 +384,149 @@ impl PackedMem {
         self.forced.remove(&id);
     }
 
+    /// Read `id` (`<= 64` or `> 64` bits) as a `Value`.
+    #[inline]
+    pub(crate) fn read(&self, id: usize) -> Value {
+        let Some((seg, at)) = self.locate(id) else {
+            return Value::new(1);
+        };
+        if seg.width <= 64 {
+            let v = self.load8(at) & seg.vmask;
+            let x = self.load8(at + seg.plane as usize) & seg.xmask;
+            let mut value = Value::from_inline(v, x, seg.width);
+            value.is_signed = seg.flags & SEG_SIGNED != 0;
+            return value;
+        }
+        let words = seg.words as usize;
+        let mut vwords = Vec::with_capacity(words);
+        for k in 0..words {
+            vwords.push(self.load8(at + k * 8));
+        }
+        vwords[words - 1] &= seg.vmask;
+        let mut xwords = if seg.flags & SEG_TWO_STATE != 0 {
+            Vec::new()
+        } else {
+            let xat = at + seg.plane as usize;
+            let mut xs = Vec::with_capacity(words);
+            for k in 0..words {
+                xs.push(self.load8(xat + k * 8));
+            }
+            xs[words - 1] &= seg.xmask;
+            xs
+        };
+        if xwords.is_empty() {
+            xwords.resize(words, 0);
+        }
+        Value::from_val_xz_words(&vwords, &xwords, seg.width, seg.flags & SEG_SIGNED != 0)
+    }
+
+    fn store_wide_at(&mut self, seg: &PackedSeg, at: usize, val: &Value) -> bool {
+        let words = seg.words as usize;
+        let mut iv = vec![0u64; words];
+        let mut ix = vec![0u64; words];
+        if val.width == seg.width && !val.is_real && !val.is_fill {
+            val.write_val_xz_words(&mut iv, &mut ix);
+        } else {
+            val.resize(seg.width).write_val_xz_words(&mut iv, &mut ix);
+        }
+        let two_state = seg.flags & SEG_TWO_STATE != 0;
+        if two_state {
+            for k in 0..words {
+                iv[k] &= !ix[k];
+            }
+            iv[words - 1] &= seg.vmask;
+            ix.fill(0);
+        } else {
+            iv[words - 1] &= seg.vmask;
+            ix[words - 1] &= seg.xmask;
+        }
+        let xat = at + seg.plane as usize;
+        let mut changed = false;
+        for k in 0..words {
+            if self.load8(at + k * 8) != iv[k] {
+                changed = true;
+                break;
+            }
+            if !two_state && self.load8(xat + k * 8) != ix[k] {
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return false;
+        }
+        for (k, &w) in iv.iter().enumerate() {
+            self.data[at + k * 8..at + k * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        if !two_state {
+            for (k, &w) in ix.iter().enumerate() {
+                self.data[xat + k * 8..xat + k * 8 + 8].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        true
+    }
+
+    /// Returns true when the cell actually changed.
+    #[inline]
+    pub(crate) fn write(&mut self, id: usize, val: &Value) -> bool {
+        let Some((seg, at)) = self.locate(id) else {
+            return false;
+        };
+        let seg = *seg;
+        if seg.width <= 64 {
+            let (v, x) = if val.width == seg.width && !val.is_real && !val.is_fill {
+                val.raw_bits()
+            } else {
+                val.resize(seg.width).raw_bits()
+            };
+            return self.set_raw(id, v, x);
+        }
+        if seg.flags & SEG_FORCED != 0 && self.forced.contains(&id) {
+            return false;
+        }
+        self.store_wide_at(&seg, at, val)
+    }
+
+    /// Store `val` even if the cell is forced, leaving the force flag intact.
+    pub(super) fn put_value(&mut self, id: usize, val: &Value) {
+        let Some((seg, at)) = self.locate(id) else {
+            return;
+        };
+        let seg = *seg;
+        if seg.width <= 64 {
+            let (v, x) = val.resize(seg.width).raw_bits();
+            self.store_at(&seg, at, v, x);
+        } else {
+            self.store_wide_at(&seg, at, val);
+        }
+    }
+
+    /// `force` a packed cell (supports both `<= 64` and `> 64` bits).
+    pub(crate) fn force_value(&mut self, id: usize, val: &Value) -> bool {
+        let Some((seg, at)) = self.locate(id) else {
+            return false;
+        };
+        let seg_idx = (id - PACKED_BASE) >> PACKED_SEG_SHIFT;
+        let seg_copy = *seg;
+        let changed = if seg_copy.width <= 64 {
+            let (v, x) = val.resize(seg_copy.width).raw_bits();
+            self.store_at(&seg_copy, at, v, x)
+        } else {
+            self.store_wide_at(&seg_copy, at, val)
+        };
+        self.segs[seg_idx].flags |= SEG_FORCED;
+        self.forced.insert(id);
+        changed
+    }
+
     #[inline]
     pub(crate) fn width(&self, id: usize) -> u32 {
-        self.locate(id)
-            .map(|(seg, _)| seg.width as u32)
-            .unwrap_or(1)
+        self.locate(id).map(|(seg, _)| seg.width).unwrap_or(1)
     }
     #[inline]
     pub(crate) fn is_signed(&self, id: usize) -> bool {
         self.locate(id)
             .is_some_and(|(seg, _)| seg.flags & SEG_SIGNED != 0)
-    }
-    #[inline]
-    pub(crate) fn read(&self, id: usize) -> Value {
-        if self.locate(id).is_none() {
-            return Value::new(1);
-        }
-        let (v, x, w, signed) = self.raw_signed(id);
-        let mut value = Value::from_inline(v, x, w);
-        value.is_signed = signed;
-        value
-    }
-    /// Returns true when the cell actually changed.
-    #[inline]
-    pub(crate) fn write(&mut self, id: usize, val: &Value) -> bool {
-        let w = self.width(id);
-        let (v, x) = if val.width == w && !val.is_real && !val.is_fill {
-            val.raw_bits()
-        } else {
-            val.resize(w).raw_bits()
-        };
-        self.set_raw(id, v, x)
     }
 }
 

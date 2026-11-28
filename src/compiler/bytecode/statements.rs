@@ -142,7 +142,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// struct variable.
     /// True when `name` is a register-bound local, a formal or a local
     /// collection of the code being compiled, or a member of one (`name.m`).
-    fn names_local(&self, name: &str) -> bool {
+    pub(super) fn names_local(&self, name: &str) -> bool {
         let member = format!("{name}.");
         self.local_var_regs
             .keys()
@@ -151,6 +151,94 @@ impl<'a> BytecodeCompiler<'a> {
             || self.local_coll_names.contains(name)
             || self.decl_local_regs.contains(name)
             || self.process_local_names.contains(name)
+    }
+
+    /// Recursively match an assignment pattern `items` onto flattened unpacked-struct
+    /// `(member_path, leaf_index)` entries in declaration order, yielding the RHS
+    /// expression for each leaf. Returns `None` on unsupported keys (`Typed`,
+    /// `Keyed`, sub-struct non-pattern expressions, missing/duplicate keys).
+    fn match_unpacked_pattern_leaves<'e>(
+        leaves: &[(&str, usize)],
+        items: &'e [crate::ast::expr::AssignmentPatternItem],
+    ) -> Option<Vec<(usize, &'e Expression)>> {
+        use crate::ast::expr::AssignmentPatternItem as API;
+        enum PatGroup<'s> {
+            Leaf(&'s str, usize),
+            Sub(&'s str, Vec<(&'s str, usize)>),
+        }
+        if leaves.is_empty() {
+            return None;
+        }
+        let mut groups: Vec<PatGroup<'_>> = Vec::new();
+        for &(path, idx) in leaves {
+            if let Some((head, tail)) = path.split_once('.') {
+                if let Some(PatGroup::Sub(prev, list)) = groups.last_mut()
+                    && *prev == head
+                {
+                    list.push((tail, idx));
+                } else {
+                    groups.push(PatGroup::Sub(head, vec![(tail, idx)]));
+                }
+            } else {
+                groups.push(PatGroup::Leaf(path, idx));
+            }
+        }
+        let mut group_exprs: Vec<&'e Expression> = Vec::with_capacity(groups.len());
+        if let Some(parts) =
+            crate::compiler::elaborate::struct_pattern_replication(items, groups.len())
+        {
+            group_exprs.extend(parts);
+        } else if items.iter().all(|it| matches!(it, API::Ordered(_))) {
+            if items.len() != groups.len() {
+                return None;
+            }
+            group_exprs.extend(items.iter().map(|it| it.expr()));
+        } else {
+            let group_names: Vec<&str> = groups
+                .iter()
+                .map(|g| match g {
+                    PatGroup::Leaf(n, _) | PatGroup::Sub(n, _) => *n,
+                })
+                .collect();
+            let mut default_expr: Option<&'e Expression> = None;
+            let mut named_hits: Vec<Option<&'e Expression>> = vec![None; groups.len()];
+            for it in items {
+                match it {
+                    API::Default(v) => default_expr = Some(v),
+                    API::Named(id, v) => {
+                        let pos = group_names.iter().position(|n| *n == id.ident.name)?;
+                        if named_hits[pos].replace(v).is_some() {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            for hit in named_hits {
+                group_exprs.push(hit.or(default_expr)?);
+            }
+        }
+        let mut out = Vec::with_capacity(leaves.len());
+        for (g, expr) in groups.into_iter().zip(group_exprs) {
+            match g {
+                PatGroup::Leaf(_, idx) => out.push((idx, expr)),
+                PatGroup::Sub(_, sub_leaves) => {
+                    let mut inner = expr;
+                    loop {
+                        match &inner.kind {
+                            ExprKind::Paren(x) => inner = x,
+                            ExprKind::TypedPattern { pattern, .. } => inner = pattern,
+                            _ => break,
+                        }
+                    }
+                    let ExprKind::AssignmentPattern(sub_items) = &inner.kind else {
+                        return None;
+                    };
+                    out.extend(Self::match_unpacked_pattern_leaves(&sub_leaves, sub_items)?);
+                }
+            }
+        }
+        Some(out)
     }
 
     fn compile_unpacked_struct_copy(&mut self, stmt: &Statement) -> Option<bool> {
@@ -208,32 +296,126 @@ impl<'a> BytecodeCompiler<'a> {
             return Some(false);
         };
         let dst = map.get(&dst)?;
-        // §7.2 / §13.5: project an automatic scalar-member constructor to
-        // registers, then scatter. The destination may also be an actual.
-        if nb_delay.is_none()
+        if dst.is_empty() {
+            return Some(false);
+        }
+        let simple_nba = nb_delay.is_some_and(|d| d.is_none());
+        // §7.2 / §13.5: compile a pure struct-returning call ONCE (via
+        // multi-output `struct_sra`) and scatter its output registers across
+        // the destination leaf signals.
+        if (nb_delay.is_none() || simple_nba)
             && let ExprKind::Call { func, args } = &rvalue.kind
         {
-            let ExprKind::Ident(h) = &func.kind else { return Some(false); };
-            let [segment] = h.path.as_slice() else { return Some(false); };
-            let constructor = self.scoped_callee_name(segment.name.name.clone())
-                .and_then(|name| self.functions?.get(&name));
-            if !constructor.is_some_and(|f| super::struct_sra::projectable_constructor(f, args)) {
+            let leaves: Option<Vec<_>> = dst
+                .iter()
+                .map(|(member, leaf)| {
+                    let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
+                    Some((member.clone(), id, *self.signal_widths.get(id)?))
+                })
+                .collect();
+            let Some(leaves) = leaves else {
                 return Some(false);
-            }
-            let leaves: Option<Vec<_>> = dst.iter().map(|(member, leaf)| {
-                let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
-                Some((member.clone(), id, *self.signal_widths.get(id)?))
-            }).collect();
-            let Some(leaves) = leaves else { return Some(false); };
+            };
+            let start = self.insns.len();
+            let start_reg = self.next_reg;
+            let saved_reason = self.bail_reason;
+            let Some(outputs) = self.compile_struct_call_multi(func, args) else {
+                self.truncate_insns(start);
+                self.next_reg = start_reg;
+                self.bail_reason = saved_reason;
+                return Some(false);
+            };
             let mut writes = Vec::with_capacity(leaves.len());
             for (member, id, width) in leaves {
-                let Some(value) = self.compile_struct_member_call(func, args, &member) else {
+                let Some((_, out_reg, _, _)) = outputs.iter().find(|(m, _, _, _)| *m == member)
+                else {
+                    self.truncate_insns(start);
+                    self.next_reg = start_reg;
+                    self.bail_reason = saved_reason;
                     return Some(false);
                 };
-                writes.push(Insn::BlockingAssign(as_sig_id(id), value, width));
+                writes.push(if nb_delay.is_none() {
+                    Insn::BlockingAssign(as_sig_id(id), *out_reg, width)
+                } else {
+                    Insn::NbaAssign(as_sig_id(id), *out_reg, width)
+                });
             }
             for insn in writes {
                 self.emit(insn);
+            }
+            return Some(true);
+        }
+        // §10.9.2 / §7.2: compile unpacked-struct `'{...}` assignment
+        // patterns (ordered, named, nested, default, swap) directly into
+        // leaf register evaluations followed by leaf stores.
+        let pat_inner = rvalue.peel_typed_pattern();
+        if (nb_delay.is_none() || simple_nba)
+            && let ExprKind::AssignmentPattern(items) = &pat_inner.kind
+        {
+            let leaf_meta: Option<Vec<_>> = dst
+                .iter()
+                .map(|(member, leaf)| {
+                    if self.string_signals.is_some_and(|s| s.contains(leaf.as_str())) {
+                        return None;
+                    }
+                    let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
+                    let w = *self.signal_widths.get(id)?;
+                    if w == 0 {
+                        return None;
+                    }
+                    let is_real = self.signal_real.and_then(|r| r.get(id).copied()).unwrap_or(false);
+                    let is_ts = self
+                        .signal_two_state
+                        .and_then(|t| t.get(id).copied())
+                        .unwrap_or(false);
+                    Some((member.as_str(), id, w, is_real, is_ts))
+                })
+                .collect();
+            let Some(leaf_meta) = leaf_meta else {
+                return Some(false);
+            };
+            let indexed_paths: Vec<(&str, usize)> = leaf_meta
+                .iter()
+                .enumerate()
+                .map(|(i, (m, ..))| (*m, i))
+                .collect();
+            let Some(matched) = Self::match_unpacked_pattern_leaves(&indexed_paths, items) else {
+                return Some(false);
+            };
+            if matched.len() != leaf_meta.len() {
+                return Some(false);
+            }
+            let start = self.insns.len();
+            let start_reg = self.next_reg;
+            let saved_reason = self.bail_reason;
+            let mut writes: Vec<(usize, RegId, u32)> = Vec::with_capacity(matched.len());
+            for (idx, rhs_expr) in matched {
+                let &(_, id, w, is_real, is_ts) = &leaf_meta[idx];
+                let Some(src_reg) = self.compile_expr(rhs_expr, if is_real { 0 } else { w }) else {
+                    self.truncate_insns(start);
+                    self.next_reg = start_reg;
+                    self.bail_reason = saved_reason;
+                    return Some(false);
+                };
+                let tmp = self.alloc_reg();
+                self.emit(Insn::Move(tmp, src_reg));
+                if is_real {
+                    self.emit_to_real(tmp);
+                } else {
+                    self.emit_real_to_int_fit(tmp, rhs_expr, w);
+                    self.emit(Insn::Resize(tmp, w));
+                    if is_ts {
+                        self.emit(Insn::DropXz(tmp));
+                    }
+                }
+                writes.push((id, tmp, w));
+            }
+            for (id, reg, width) in writes {
+                self.emit(if nb_delay.is_none() {
+                    Insn::BlockingAssign(as_sig_id(id), reg, width)
+                } else {
+                    Insn::NbaAssign(as_sig_id(id), reg, width)
+                });
             }
             return Some(true);
         }

@@ -32,6 +32,8 @@ pub(super) struct FormalMetaParts {
     pub(super) packed_dimensions: Option<Vec<(i64, i64)>>,
     pub(super) class_type: Option<String>,
     pub(super) typedef_type: Option<String>,
+    #[serde(default)]
+    pub(super) mixed_packed: bool,
 }
 
 /// Per-frame virtual-interface formal and local aliases (`local_iface_aliases`).

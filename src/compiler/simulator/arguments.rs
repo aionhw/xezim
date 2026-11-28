@@ -2766,14 +2766,48 @@ impl Simulator {
             .or_else(|| self.p_elem_type(&param))
             .and_then(|dt| self.unpacked_struct_of(&dt));
         let w = self.module.arrays.get(&*caller).map(|t| t.2).unwrap_or(32);
+        let formal_len = (hi - lo + 1).max(0) as usize;
+        let caller_is_dyn = self.module.dynamic_arrays.contains(&*caller);
+        let caller_range = if caller_is_dyn {
+            let dyn_len = self.get_queue_size(&caller) as usize;
+            if dyn_len != formal_len {
+                self.emit_severity_text(
+                    "Error",
+                    &format!(
+                        "Dynamic array actual '{}' size ({}) does not match fixed array formal '{}' size ({})",
+                        caller, dyn_len, port.name.name, formal_len
+                    ),
+                );
+                return None;
+            }
+            (0i64, (dyn_len as i64) - 1, false)
+        } else {
+            let (clo, chi, _) = self.module.arrays[&*caller];
+            (clo, chi, self.module.descending_arrays.contains(&*caller))
+        };
         let out_default = if param == caller {
             None
         } else {
             self.output_formal_elem_default(port, w)
         };
-        for idx in lo..=hi {
+        let copy_len = if caller_is_dyn {
+            formal_len
+        } else {
+            formal_len.min((caller_range.1 - caller_range.0 + 1).max(0) as usize)
+        };
+        for pos in 0..copy_len {
+            let f_idx = if descending {
+                hi - pos as i64
+            } else {
+                lo + pos as i64
+            };
+            let c_idx = if caller_range.2 {
+                caller_range.1 - pos as i64
+            } else {
+                caller_range.0 + pos as i64
+            };
             if let Some(su) = &elem_su {
-                let d = format!("{}[{}]", param, idx);
+                let d = format!("{}[{}]", param, f_idx);
                 if out_default.is_some() {
                     let mut leaves = Vec::new();
                     self.unpacked_struct_leaf_defaults(&d, su, 0, &mut leaves);
@@ -2782,16 +2816,16 @@ impl Simulator {
                     }
                     continue;
                 }
-                let s = format!("{}[{}]", caller, idx);
+                let s = format!("{}[{}]", caller, c_idx);
                 self.copy_unpacked_struct(&d, &s, &su.clone());
                 continue;
             }
             let v = match &out_default {
                 Some(d) => Some(d.clone()),
-                None => self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)),
+                None => self.get_signal_value_by_name(&format!("{}[{}]", caller, c_idx)),
             };
             if let Some(v) = v {
-                self.signals.insert(format!("{}[{}]", param, idx), v);
+                self.signals.insert(format!("{}[{}]", param, f_idx), v);
             }
         }
         self.module.arrays.insert(param.clone(), (lo, hi, w));
@@ -3286,6 +3320,9 @@ impl Simulator {
             if self.multi_dim_array_names.contains(param) {
                 self.multi_dim_array_names.insert(tmp.clone());
             }
+            if self.module.descending_arrays.contains(param) {
+                self.module.descending_arrays.insert(tmp.clone());
+            }
             staged.push((tmp, caller.clone(), *lo, *hi));
         }
         staged
@@ -3327,17 +3364,41 @@ impl Simulator {
                 .p_elem_type(param)
                 .or_else(|| self.p_elem_type(caller))
                 .and_then(|dt| self.unpacked_struct_of(&dt));
-            for idx in *lo..=*hi {
+            let formal_len = (*hi - *lo + 1).max(0) as usize;
+            let p_desc = self.module.descending_arrays.contains(param);
+            let caller_is_dyn = self.module.dynamic_arrays.contains(caller.as_str());
+            let (clo, chi, c_desc) = if caller_is_dyn {
+                let dyn_len = self.get_queue_size(caller) as usize;
+                if dyn_len != formal_len {
+                    self.emit_severity_text(
+                        "Error",
+                        &format!(
+                            "Fixed array formal '{}' size ({}) does not match dynamic array actual '{}' size ({})",
+                            param, formal_len, caller, dyn_len
+                        ),
+                    );
+                    continue;
+                }
+                (0i64, (dyn_len as i64) - 1, false)
+            } else if let Some(&(c_lo, c_hi, _)) = self.module.arrays.get(caller.as_str()) {
+                (c_lo, c_hi, self.module.descending_arrays.contains(caller.as_str()))
+            } else {
+                (*lo, *hi, p_desc)
+            };
+            let copy_len = formal_len.min((chi - clo + 1).max(0) as usize);
+            for pos in 0..copy_len {
+                let f_idx = if p_desc { *hi - pos as i64 } else { *lo + pos as i64 };
+                let c_idx = if c_desc { chi - pos as i64 } else { clo + pos as i64 };
                 if let Some(su) = &elem_su {
                     let (d, s) = (
-                        format!("{}[{}]", caller, idx),
-                        format!("{}[{}]", param, idx),
+                        format!("{}[{}]", caller, c_idx),
+                        format!("{}[{}]", param, f_idx),
                     );
                     self.copy_unpacked_struct(&d, &s, &su.clone());
                     continue;
                 }
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", param, idx)) {
-                    self.set_signal_value_by_name(&format!("{}[{}]", caller, idx), v);
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", param, f_idx)) {
+                    self.set_signal_value_by_name(&format!("{}[{}]", caller, c_idx), v);
                 }
             }
         }

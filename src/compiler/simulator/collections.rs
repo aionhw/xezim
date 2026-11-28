@@ -3132,7 +3132,9 @@ impl Simulator {
         // Array-element fallback: <base>[<idx>] resolves via the compact
         // 1D-array resolver (signal_name_to_id no longer has per-element
         // entries for 1D arrays).
-        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
+        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id)
+            .or_else(|| resolve_nd_array_elem_id(name, &self.array_nd_first_id))
+        {
             if is_packed_id(id) {
                 return Some(self.packed.read(id));
             }
@@ -3279,8 +3281,10 @@ impl Simulator {
             }
             return;
         }
-        // Array-element fallback (1D compact resolver).
-        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
+        // Array-element fallback (1D & multi-D compact resolver).
+        if let Some(id) = resolve_array_elem_id(name, &self.array_first_id)
+            .or_else(|| resolve_nd_array_elem_id(name, &self.array_nd_first_id))
+        {
             if is_packed_id(id) {
                 self.packed_store_value(id, &val);
                 return;

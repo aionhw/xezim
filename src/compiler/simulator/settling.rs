@@ -197,6 +197,48 @@ impl Simulator {
             .unwrap_or_default()
     }
 
+    pub(super) fn exec_bulk_array_copy(&mut self, runs: &[super::comb_network::BulkCopyRun]) {
+        let warn_x_on = self.warn_x;
+        let has_forces = !self.forced_signals.is_empty();
+        for run in runs {
+            let mut dst_id = run.dst_first as isize;
+            let mut src_id = run.src_first as isize;
+            for _ in 0..run.len {
+                let d = dst_id as usize;
+                let s = src_id as usize;
+                dst_id += run.dst_step;
+                src_id += run.src_step;
+                if d == s {
+                    continue;
+                }
+                if is_packed_id(d) {
+                    let val = self.cell_read(s);
+                    let changed = self.packed.write(d, &val);
+                    if changed {
+                        self.table_modified = true;
+                        self.note_packed_seg_dirty(d);
+                    }
+                } else {
+                    if has_forces && self.forced_signals.contains_key(&d) {
+                        continue;
+                    }
+                    let src_val = self.cell_read(s);
+                    let resized = self.fit_value_to_signal(d, &src_val);
+                    if self.signal_table[d] != resized {
+                        if warn_x_on {
+                            let (sv, sx) = resized.raw_bits();
+                            let (dv, dx) = self.signal_table[d].raw_bits();
+                            self.warn_x_note_bits(d, dv, dx, sv, sx);
+                        }
+                        self.mark_dirty_id(d);
+                        write_sig!(self, d, resized);
+                        self.table_modified = true;
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
         let mut constant_drivers: Vec<CombEntry> = Vec::new();
@@ -307,6 +349,24 @@ impl Simulator {
         }
         self.dirty_list.clear();
         self.dirty_any = false;
+        let dirty_segs = std::mem::take(&mut self.dirty_packed_segs);
+        for seg in dirty_segs {
+            if seg < self.packed_seg_dirty.len() {
+                self.packed_seg_dirty[seg] = false;
+            }
+            if let Some(deps) = self.packed_seg_deps.get(seg) {
+                for &eidx_u32 in deps {
+                    let eidx = eidx_u32 as usize;
+                    if skip_deferred_at_t0 && self.comb_entries[eidx].defer_at_time0 {
+                        continue;
+                    }
+                    if !self.settle_triggered[eidx] {
+                        self.settle_triggered[eidx] = true;
+                        self.settle_triggered_list.push(eidx);
+                    }
+                }
+            }
+        }
         for ui in 0..self.comb_unresolved_idx.len() {
             let eidx = self.comb_unresolved_idx[ui];
             if eidx < num_entries && !self.settle_triggered[eidx] {
@@ -643,6 +703,32 @@ impl Simulator {
                             }
                         }
                     }
+                    // Propagate changed packed-arena segments to their comb dependents.
+                    if !self.dirty_packed_segs.is_empty() {
+                        let dirty_segs = std::mem::take(&mut self.dirty_packed_segs);
+                        for seg in dirty_segs {
+                            if seg < self.packed_seg_dirty.len() {
+                                self.packed_seg_dirty[seg] = false;
+                            }
+                            if let Some(deps) = self.packed_seg_deps.get(seg) {
+                                for &dep_u32 in deps {
+                                    let dep = dep_u32 as usize;
+                                    if dep == eidx && self.comb_self_exempt[eidx] {
+                                        continue;
+                                    }
+                                    if !self.settle_triggered[dep] {
+                                        self.settle_triggered[dep] = true;
+                                        let dl = self.comb_level[dep] as usize;
+                                        if dl > l {
+                                            buckets[dl].push(dep);
+                                        } else {
+                                            next_seed.push(dep);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 buckets[l].clear();
             }
@@ -828,6 +914,37 @@ impl Simulator {
                         .unwrap_or_default()
                         .to_owned(),
                 );
+                // Coalesced whole-unpacked-struct continuous call (`assign s = f(args);`):
+                // evaluate `f(args)` ONCE and scatter its result across every leaf signal,
+                // rather than re-running `f` N times inside per-member drivers.
+                if *explicit_delay == 0
+                    && delay_exprs.is_none()
+                    && matches!(rhs.kind, ExprKind::Call { .. })
+                    && entry.cold.write_signal_ids.len() >= 2
+                    && let Some(flat) = self.flat_member_name(lhs)
+                {
+                    let (dst, spread_su) = self.struct_copy_target(flat);
+                    if let Some(su) = spread_su
+                        && !self.module.dynamic_arrays.contains(&dst)
+                        && !self.module.arrays.contains_key(&dst)
+                        && !self.names_nd_subarray(&dst)
+                        && !self.module.associative_arrays.contains_key(&dst)
+                    {
+                        self.pending_ret_struct = None;
+                        let v = self.eval_expr(rhs);
+                        let spread = self.spread_into_unpacked_struct(&dst, &su, &v);
+                        if spread {
+                            if self.pending_ret_struct.is_some() {
+                                self.copy_ret_struct_colls(&dst, &su);
+                            }
+                            self.timescale_scope_override = saved_ts;
+                            *self.name_resolve_hint.borrow_mut() = saved_hint;
+                            self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
+                            self.prof_settle_ca_count += 1;
+                            return;
+                        }
+                    }
+                }
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
@@ -1123,6 +1240,9 @@ impl Simulator {
                     self.mark_dirty_id(*dst_id);
                     write_sig!(self, *dst_id, v);
                 }
+            }
+            CombItem::BulkArrayCopy { runs } => {
+                self.exec_bulk_array_copy(runs);
             }
             CombItem::Noop => {}
         }
@@ -1608,7 +1728,10 @@ impl Simulator {
         // #35: deferred cont-assign entries make a full settle necessary even
         // when nothing is freshly dirty — the deferral consumed the source
         // dirt when it recorded the entries.
-        if !self.dirty_any && (self.proc_settle_defer || self.deferred_proc_entries.is_empty()) {
+        if !self.dirty_any
+            && (self.proc_settle_defer
+                || (self.deferred_proc_entries.is_empty() && self.dirty_packed_segs.is_empty()))
+        {
             return;
         }
         self.settling = true;
@@ -1814,6 +1937,26 @@ impl Simulator {
         }
         self.dirty_list.clear();
         self.dirty_any = false;
+        if !defer_mode && !self.dirty_packed_segs.is_empty() {
+            let dirty_segs = std::mem::take(&mut self.dirty_packed_segs);
+            for seg in dirty_segs {
+                if seg < self.packed_seg_dirty.len() {
+                    self.packed_seg_dirty[seg] = false;
+                }
+                if let Some(deps) = self.packed_seg_deps.get(seg) {
+                    for &eidx_u32 in deps {
+                        let eidx = eidx_u32 as usize;
+                        if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                            continue;
+                        }
+                        if !triggered[eidx] {
+                            triggered[eidx] = true;
+                            next_list.push(eidx);
+                        }
+                    }
+                }
+            }
+        }
 
         // Unresolved entries always re-eval. Iterate the precomputed
         // index list instead of scanning `0..num_entries` (can be ~500K
@@ -2389,6 +2532,7 @@ impl Simulator {
                                 | CombItem::DirectCopy { .. }
                                 | CombItem::FastDirectCopy { .. }
                                 | CombItem::FastDirectFanout { .. }
+                                | CombItem::BulkArrayCopy { .. }
                                 | CombItem::FusedBufFanout { .. }
                                 | CombItem::FusedAndFanout { .. }
                                 | CombItem::AlwaysBlock { .. }
@@ -2406,6 +2550,13 @@ impl Simulator {
                                 defer_listed = defer_changed.len();
                             }
                             continue;
+                        }
+                        if let CombItem::BulkArrayCopy { runs } = &entries[eidx].item {
+                            for run in runs.iter() {
+                                if is_packed_id(run.src_first) {
+                                    self.note_packed_seg_dirty(run.src_first);
+                                }
+                            }
                         }
                         let reads = &entries[eidx].cold.read_signal_ids;
                         self.defer_proc_reads(
@@ -3148,6 +3299,10 @@ impl Simulator {
                             self.eval_timing_watch(idx);
                             n_dc += 1;
                         }
+                        CombItem::BulkArrayCopy { runs } => {
+                            self.exec_bulk_array_copy(runs);
+                            n_dc += 1;
+                        }
                     }
                 }
 
@@ -3196,6 +3351,56 @@ impl Simulator {
                             self.dirty_signals[sig_id] = false;
                         }
                         trigger_deps!(sig_id, eidx, u64::MAX);
+                    }
+                }
+                if !defer_mode && !self.dirty_packed_segs.is_empty() {
+                    let dirty_segs = std::mem::take(&mut self.dirty_packed_segs);
+                    for seg in dirty_segs {
+                        if seg < self.packed_seg_dirty.len() {
+                            self.packed_seg_dirty[seg] = false;
+                        }
+                        if let Some(deps) = self.packed_seg_deps.get(seg) {
+                            for &dep_u32 in deps {
+                                let dep = dep_u32 as usize;
+                                if dep == eidx {
+                                    continue;
+                                }
+                                if !triggered[dep] {
+                                    triggered[dep] = true;
+                                    if dep > eidx {
+                                        unsafe {
+                                            *inject_bits.get_unchecked_mut(dep >> 6) |=
+                                                1u64 << (dep & 63);
+                                            *inject_sum.get_unchecked_mut(dep >> 12) |=
+                                                1u64 << ((dep >> 6) & 63);
+                                        }
+                                        if dep < next_inject {
+                                            next_inject = dep;
+                                        }
+                                    } else {
+                                        next_list.push(dep);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for &dep in self.comb_unresolved_idx.iter() {
+                        if dep != eidx && dep < num_entries && !triggered[dep] {
+                            triggered[dep] = true;
+                            if dep > eidx {
+                                unsafe {
+                                    *inject_bits.get_unchecked_mut(dep >> 6) |=
+                                        1u64 << (dep & 63);
+                                    *inject_sum.get_unchecked_mut(dep >> 12) |=
+                                        1u64 << ((dep >> 6) & 63);
+                                }
+                                if dep < next_inject {
+                                    next_inject = dep;
+                                }
+                            } else {
+                                next_list.push(dep);
+                            }
+                        }
                     }
                 }
             }
