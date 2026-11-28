@@ -828,6 +828,37 @@ impl Simulator {
                         .unwrap_or_default()
                         .to_owned(),
                 );
+                // Coalesced whole-unpacked-struct continuous call (`assign s = f(args);`):
+                // evaluate `f(args)` ONCE and scatter its result across every leaf signal,
+                // rather than re-running `f` N times inside per-member drivers.
+                if *explicit_delay == 0
+                    && delay_exprs.is_none()
+                    && matches!(rhs.kind, ExprKind::Call { .. })
+                    && entry.cold.write_signal_ids.len() >= 2
+                    && let Some(flat) = self.flat_member_name(lhs)
+                {
+                    let (dst, spread_su) = self.struct_copy_target(flat);
+                    if let Some(su) = spread_su
+                        && !self.module.dynamic_arrays.contains(&dst)
+                        && !self.module.arrays.contains_key(&dst)
+                        && !self.names_nd_subarray(&dst)
+                        && !self.module.associative_arrays.contains_key(&dst)
+                    {
+                        self.pending_ret_struct = None;
+                        let v = self.eval_expr(rhs);
+                        let spread = self.spread_into_unpacked_struct(&dst, &su, &v);
+                        if spread {
+                            if self.pending_ret_struct.is_some() {
+                                self.copy_ret_struct_colls(&dst, &su);
+                            }
+                            self.timescale_scope_override = saved_ts;
+                            *self.name_resolve_hint.borrow_mut() = saved_hint;
+                            self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
+                            self.prof_settle_ca_count += 1;
+                            return;
+                        }
+                    }
+                }
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),

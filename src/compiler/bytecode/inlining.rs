@@ -271,6 +271,96 @@ impl<'a> BytecodeCompiler<'a> {
         functions.contains_key(&key).then_some(key)
     }
 
+    fn resolve_sra_callee(&self, func: &Expression) -> Option<String> {
+        let name = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.clone())
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                self.package_callee_name(&h.path[0].name.name, &h.path[1].name.name)
+            }
+            _ => None,
+        }?;
+        self.scoped_callee_name(name)
+    }
+
+    fn unpacked_struct_scalar_members(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+        prefix: &str,
+        depth: u32,
+        out: &mut super::struct_sra::Members,
+    ) -> Option<()> {
+        use crate::ast::types::{DataType, StructUnionKind};
+        if depth >= 8 {
+            return None;
+        }
+        let DataType::Struct(su) = self.resolved_decl_type(dt, scope) else {
+            return None;
+        };
+        if su.packed || !matches!(su.kind, StructUnionKind::Struct) {
+            return None;
+        }
+        for m in &su.members {
+            let member_resolved = self.resolved_decl_type(&m.data_type, scope);
+            let is_nested_unpacked = matches!(
+                &member_resolved,
+                DataType::Struct(inner)
+                    if !inner.packed && matches!(inner.kind, StructUnionKind::Struct)
+            );
+            let scalar = !matches!(&member_resolved, DataType::Struct(_))
+                && (self.decl_is_real(&m.data_type, scope)
+                    || (1..=64).contains(&self.decl_width_in(&m.data_type, scope)));
+            for d in &m.declarators {
+                // §7.2.2: member default initializers keep the AST path.
+                if !d.dimensions.is_empty() || d.init.is_some() {
+                    return None;
+                }
+                let path = if prefix.is_empty() {
+                    d.name.name.clone()
+                } else {
+                    format!("{prefix}.{}", d.name.name)
+                };
+                if is_nested_unpacked {
+                    self.unpacked_struct_scalar_members(&m.data_type, scope, &path, depth + 1, out)?;
+                } else if scalar {
+                    out.push((path, m.data_type.clone()));
+                } else {
+                    return None;
+                }
+            }
+        }
+        (!out.is_empty()).then_some(())
+    }
+
+    fn sra_struct_members_of(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<super::struct_sra::Members> {
+        let mut out = Vec::new();
+        self.unpacked_struct_scalar_members(dt, scope, "", 0, &mut out)?;
+        Some(out)
+    }
+
+    fn sra_replication_allowed(&self, ms: &super::struct_sra::Members, scope: Option<&str>) -> bool {
+        use crate::ast::types::DataType;
+        !ms.iter().any(|(_, dt)| {
+            let DataType::TypeReference { name, .. } = dt else {
+                return false;
+            };
+            self.typedef_unpacked_dims.is_some_and(|dims| {
+                self.typedef_entry(dims, name, scope)
+                    .is_some_and(|(_, d)| !d.is_empty())
+            })
+        })
+    }
+
     /// `f(args).m` for a pure `f` returning an unpacked struct of scalars:
     /// inline the scalarized function for member `m` (`struct_sra`). None
     /// leaves the emitted code and the bail reason as they were.
@@ -280,14 +370,7 @@ impl<'a> BytecodeCompiler<'a> {
         args: &[Expression],
         member: &str,
     ) -> Option<RegId> {
-        use crate::ast::types::{DataType, StructUnionKind};
-        let ExprKind::Ident(h) = &func.kind else {
-            return None;
-        };
-        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
-            return None;
-        }
-        let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
+        let name = self.resolve_sra_callee(func)?;
         let fd_ref = self.functions?.get(&name)?;
         let mut owned_fd;
         let fd = if let Some(items) = self.materialize_deferred_fn(&name, fd_ref) {
@@ -298,50 +381,12 @@ impl<'a> BytecodeCompiler<'a> {
             fd_ref
         };
         let scope = Some(name.as_str());
-        let members = |dt: &DataType| -> Option<super::struct_sra::Members> {
-            let DataType::Struct(su) = self.resolved_decl_type(dt, scope) else {
-                return None;
-            };
-            if su.packed || !matches!(su.kind, StructUnionKind::Struct) {
-                return None;
-            }
-            let mut out = Vec::new();
-            for m in &su.members {
-                let scalar = !matches!(
-                    self.resolved_decl_type(&m.data_type, scope),
-                    DataType::Struct(_)
-                ) && (self.decl_is_real(&m.data_type, scope)
-                    || (1..=64).contains(&self.decl_width_in(&m.data_type, scope)));
-                for d in &m.declarators {
-                    // §7.2.2: a member default initializes the scalarized
-                    // locals too; they are declared without one.
-                    if !scalar || !d.dimensions.is_empty() || d.init.is_some() {
-                        return None;
-                    }
-                    out.push((d.name.name.clone(), m.data_type.clone()));
-                }
-            }
-            (!out.is_empty()).then_some(out)
-        };
-        // §7.4.2/§10.9.2: typedef array members keep the existing scalarizer
-        // handling; only the new replication expansion is disabled for them.
-        let replication_allowed = |ms: &super::struct_sra::Members| {
-            !ms.iter().any(|(_, dt)| {
-                let DataType::TypeReference { name, .. } = dt else {
-                    return false;
-                };
-                self.typedef_unpacked_dims.is_some_and(|dims| {
-                    self.typedef_entry(dims, name, scope)
-                        .is_some_and(|(_, d)| !d.is_empty())
-                })
-            })
-        };
         let (sfd, sargs) = super::struct_sra::scalarize_member_call(
             fd,
             args,
             member,
-            &members,
-            &replication_allowed,
+            &|dt| self.sra_struct_members_of(dt, scope),
+            &|ms| self.sra_replication_allowed(ms, scope),
         )?;
         let start = self.insns.len();
         let next = self.next_reg;
@@ -355,6 +400,347 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail_reason = saved_reason;
         }
         r
+    }
+
+    /// Inline `f(args)` ONCE when `f` returns an unpacked struct (possibly with
+    /// nested unpacked structs, `if`/`case`/`while`/`repeat`/helper locals/
+    /// `return '{...}`), returning `(dotted_member_path, reg_id, is_real, width)`
+    /// for every leaf output.
+    pub(crate) fn compile_struct_call_multi(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+    ) -> Option<Vec<(String, RegId, bool, u32)>> {
+        let name = self.resolve_sra_callee(func)?;
+        if self.inlining_stack.len() >= MAX_INLINE_DEPTH
+            || self.inlining_stack.iter().any(|n| *n == name)
+        {
+            return None;
+        }
+        let fd_ref = self.functions?.get(&name)?.clone();
+        let mut fd = fd_ref;
+        if let Some(items) = self.materialize_deferred_fn(&name, &fd) {
+            fd.items = items;
+        }
+        let owned_args;
+        let norm_args: &[Expression] = if args
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+        {
+            owned_args = crate::compiler::simulator::Simulator::normalize_call_args(&fd.ports, args)?;
+            &owned_args
+        } else if args.len() < fd.ports.len()
+            && fd.ports[args.len()..].iter().all(|p| {
+                matches!(p.direction, PortDirection::Input)
+                    && p.default
+                        .as_ref()
+                        .is_some_and(|d| matches!(d.kind, ExprKind::Number(_)))
+            })
+        {
+            let mut full = args.to_vec();
+            full.extend(
+                fd.ports[args.len()..]
+                    .iter()
+                    .filter_map(|p| p.default.as_deref().cloned()),
+            );
+            owned_args = full;
+            &owned_args
+        } else {
+            args
+        };
+        let scope = Some(name.as_str());
+        let multi = super::struct_sra::scalarize_multi_call(
+            &fd,
+            norm_args,
+            &|dt| self.sra_struct_members_of(dt, scope),
+            &|ms| self.sra_replication_allowed(ms, scope),
+        )?;
+        let sfd = multi.fd;
+        let sargs = multi.args;
+        let outputs_meta = multi.outputs;
+        if sfd
+            .ports
+            .iter()
+            .any(|p| self.decl_is_shortreal(&p.data_type, scope))
+            || outputs_meta
+                .iter()
+                .any(|(_, _, dt)| self.decl_is_shortreal(dt, scope))
+        {
+            return None;
+        }
+        let is_unsized_dim = |p: &crate::ast::decl::FunctionPort| {
+            matches!(
+                p.dimensions.as_slice(),
+                [crate::ast::types::UnpackedDimension::Unsized(_)]
+            ) && matches!(p.direction, PortDirection::Input)
+        };
+        let dyn_array_formal = |p: &_, a: &Expression| -> bool {
+            matches!(p, &crate::ast::decl::FunctionPort { .. })
+                && matches!(
+                    &a.kind,
+                    ExprKind::AssignmentPattern(items)
+                        if (1..=32).contains(&items.len())
+                            && items.iter().all(|it| matches!(
+                                it,
+                                crate::ast::expr::AssignmentPatternItem::Ordered(_)
+                            ))
+                )
+        };
+        if sfd.ports.len() != sargs.len()
+            || sfd.ports.iter().zip(&sargs).any(|(p, a)| {
+                !matches!(p.direction, PortDirection::Input)
+                    || (!p.dimensions.is_empty() && !(is_unsized_dim(p) && dyn_array_formal(p, a)))
+            })
+        {
+            return None;
+        }
+        let qpfx = name.rsplit_once('.').map(|(p, _)| p.to_string());
+        let ext = self.callee_ext_reads_ok(&name);
+        if !self.fn_is_pure_in_ext(&sfd, qpfx.as_deref(), ext) {
+            return None;
+        }
+        let items: Vec<Statement> = match sfd.items.as_slice() {
+            [one] => match &one.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts.to_vec(),
+                _ => vec![one.clone()],
+            },
+            other => other.to_vec(),
+        };
+        if items.iter().any(Self::stmt_is_blocking)
+            || self.selects_offset_range_var(&sfd.ports, None, &items)
+        {
+            return None;
+        }
+
+        let start = self.insns.len();
+        let next = self.next_reg;
+        let saved_reason = self.bail_reason;
+
+        let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(sargs.len());
+        let mut string_formal_names: Vec<String> = Vec::new();
+        let mut real_formal_names: Vec<String> = Vec::new();
+        let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
+        for (i, (p, a)) in sfd.ports.iter().zip(&sargs).enumerate() {
+            if is_unsized_dim(p) {
+                let ExprKind::AssignmentPattern(pat_items) = &a.kind else {
+                    self.truncate_insns(start);
+                    self.next_reg = next;
+                    self.bail_reason = saved_reason;
+                    return None;
+                };
+                let is_real = self.decl_is_real(&p.data_type, scope);
+                let elem_w = if is_real {
+                    64
+                } else {
+                    self.decl_width_in(&p.data_type, scope)
+                };
+                if elem_w == 0 || elem_w > 64 {
+                    self.truncate_insns(start);
+                    self.next_reg = next;
+                    self.bail_reason = saved_reason;
+                    return None;
+                }
+                let elem_kind = self.local_kind_of(&p.data_type, scope);
+                let mut regs = Vec::with_capacity(pat_items.len());
+                for it in pat_items {
+                    let crate::ast::expr::AssignmentPatternItem::Ordered(e) = it else {
+                        self.truncate_insns(start);
+                        self.next_reg = next;
+                        self.bail_reason = saved_reason;
+                        return None;
+                    };
+                    let slot = self.alloc_reg();
+                    let Some(v) = self.compile_expr(e, if is_real { 0 } else { elem_w }) else {
+                        self.truncate_insns(start);
+                        self.next_reg = next;
+                        self.bail_reason = saved_reason;
+                        return None;
+                    };
+                    self.emit(Insn::Move(slot, v));
+                    if is_real {
+                        self.emit_to_real(slot);
+                    } else {
+                        self.emit(Insn::Resize(slot, elem_w));
+                        if let Some(k) = elem_kind {
+                            self.local_kinds.insert(slot, k);
+                            self.emit_local_fit(slot);
+                        }
+                    }
+                    regs.push(slot);
+                }
+                array_binds.push((
+                    p.name.name.clone(),
+                    LocalArrayBind {
+                        regs,
+                        lo: 0,
+                        elem_w,
+                        is_real,
+                        elem_signed: match elem_kind {
+                            Some(LocalKind::Int { signed, .. }) if !is_real => Some(signed),
+                            _ => None,
+                        },
+                    },
+                ));
+                continue;
+            }
+            let formal_is_string = self.decl_is_string(&p.data_type, scope);
+            let formal_is_real = self.decl_is_real(&p.data_type, scope);
+            let w = if formal_is_string {
+                0
+            } else {
+                self.port_effective_width(&sfd.ports, i, scope)
+            };
+            let slot = self.alloc_reg();
+            if p.dimensions.is_empty() {
+                self.pattern_ctx = Some(p.data_type.clone());
+            }
+            let Some(v) = self.compile_expr(a, w) else {
+                self.truncate_insns(start);
+                self.next_reg = next;
+                self.bail_reason = saved_reason;
+                return None;
+            };
+            self.emit(Insn::Move(slot, v));
+            if !formal_is_real && !formal_is_string {
+                self.emit_real_to_int_fit(slot, a, w);
+            }
+            if w > 0 && !formal_is_real {
+                self.emit(Insn::Resize(slot, w));
+            }
+            if formal_is_real {
+                self.emit_to_real(slot);
+            }
+            if formal_is_string {
+                string_formal_names.push(p.name.name.clone());
+            }
+            if formal_is_real {
+                real_formal_names.push(p.name.name.clone());
+            }
+            if let Some(k) =
+                self.local_kind_of(Self::port_effective_type(&sfd.ports, i), scope)
+            {
+                self.local_kinds.insert(slot, k);
+                self.emit_local_fit(slot);
+            }
+            binds.push((p.name.name.clone(), (slot, w)));
+        }
+
+        let mut out_meta: Vec<(String, String, bool, u32)> =
+            Vec::with_capacity(outputs_meta.len());
+        for (member_path, scalar_var, member_dt) in &outputs_meta {
+            let is_real = self.decl_is_real(member_dt, scope);
+            let is_str = self.decl_is_string(member_dt, scope);
+            if is_str {
+                self.truncate_insns(start);
+                self.next_reg = next;
+                self.bail_reason = saved_reason;
+                return None;
+            }
+            let w = if is_real {
+                64
+            } else {
+                self.decl_width_in(member_dt, scope)
+            };
+            out_meta.push((member_path.clone(), scalar_var.clone(), is_real, w));
+        }
+
+        let saved_locals = std::mem::take(&mut self.local_var_regs);
+        let saved_local_strings = std::mem::take(&mut self.local_var_is_string);
+        let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
+        let saved_local_arrays = std::mem::take(&mut self.local_var_array);
+        let saved_local_elems = std::mem::take(&mut self.local_var_elem);
+        let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        let saved_banks = std::mem::take(&mut self.local_array_regs);
+        let saved_consts = std::mem::take(&mut self.local_const_vars);
+        let saved_const_kinds = std::mem::take(&mut self.local_const_kinds);
+        let saved_const_binds = std::mem::take(&mut self.const_var_binds);
+        let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
+
+        for (n, ab) in array_binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_array.insert(format!("{pfx}.{n}"), ab.clone());
+            }
+            self.local_var_array.insert(n, ab);
+        }
+        for (n, b) in binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_regs.insert(format!("{pfx}.{n}"), b);
+            }
+            self.local_var_regs.insert(n, b);
+        }
+        for n in &string_formal_names {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_string.insert(format!("{pfx}.{n}"));
+            }
+            self.local_var_is_string.insert(n.clone());
+        }
+        for n in &real_formal_names {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_real.insert(format!("{pfx}.{n}"));
+            }
+            self.local_var_is_real.insert(n.clone());
+        }
+
+        let callee_pkg = self.inlined_callee_pkg(&name, sfd.span, false);
+        self.inline_pkg_stack.push(callee_pkg);
+        self.inlining_stack.push(name);
+        let saved_fallback = self.allow_ast_fallback;
+        self.allow_ast_fallback = false;
+        let saved_ret = self.inline_ret;
+        let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+        let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
+        let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
+        let saved_named_block_patches = std::mem::take(&mut self.named_block_patches);
+        self.inline_ret = Some((None, 0));
+        let ok = self.compile_pure_body(&items);
+        let body_end = self.insns.len() as u32;
+        for j in std::mem::take(&mut self.inline_ret_jumps) {
+            self.insns[j] = Insn::Jump(body_end);
+        }
+        let collected_regs: Option<Vec<(String, RegId, bool, u32)>> = if ok {
+            out_meta
+                .into_iter()
+                .map(|(member_path, scalar_var, is_real, w)| {
+                    let (reg, _) = self.local_var_regs.get(&scalar_var).copied()?;
+                    Some((member_path, reg, is_real, w))
+                })
+                .collect()
+        } else {
+            None
+        };
+        self.inline_ret = saved_ret;
+        self.inline_ret_jumps = saved_ret_jumps;
+        self.loop_break_patches = saved_break_patches;
+        self.loop_continue_patches = saved_continue_patches;
+        self.named_block_patches = saved_named_block_patches;
+        self.allow_ast_fallback = saved_fallback;
+        self.inlining_stack.pop();
+        self.inline_pkg_stack.pop();
+        self.local_var_regs = saved_locals;
+        self.local_var_is_string = saved_local_strings;
+        self.local_var_is_real = saved_local_reals;
+        self.local_var_array = saved_local_arrays;
+        self.local_var_elem = saved_local_elems;
+        self.local_var_struct = saved_local_structs;
+        self.local_array_regs = saved_banks;
+        self.local_const_vars = saved_consts;
+        self.local_const_kinds = saved_const_kinds;
+        self.const_var_binds = saved_const_binds;
+        self.decl_local_regs = saved_decl_locals;
+
+        let Some(results) = collected_regs else {
+            self.truncate_insns(start);
+            self.next_reg = next;
+            self.bail_reason = saved_reason;
+            return None;
+        };
+        for &(_, out_slot, is_real, w) in &results {
+            if w > 0 && !is_real {
+                self.emit(Insn::Resize(out_slot, w));
+                self.emit_local_fit(out_slot);
+            }
+        }
+        Some(results)
     }
 
     /// Try to inline a zero-arg, non-blocking user task's body at this

@@ -1234,6 +1234,7 @@ checkpoint_state!(
     active_force_skips,
     active_task_pids,
     active_union_tag,
+    tagged_union_strings,
     adopted_pids,
     annex_n_seed,
     any_struct_formal_markers,

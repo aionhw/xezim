@@ -2944,12 +2944,16 @@ impl Simulator {
                                     result.push_str(&format!("'{{{}}}", parts.join(", ")));
                                     continue;
                                 }
+                                if let Some(s) = self.render_p_tagged_union_expr(arg) {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 if let ExprKind::Ident(h) = &arg.kind {
                                     let name = self.resolve_hier_name(h);
                                     if let Some(tag) = self.active_union_tag.get(&*name).cloned() {
                                         let v = self.eval_expr(arg);
                                         result.push_str(&format!(
-                                            "'{{{}:{}}}",
+                                            "'{{tagged {}:{}}}",
                                             tag,
                                             v.to_dec_string()
                                         ));

@@ -1776,6 +1776,7 @@ impl Simulator {
             packed_dimensions: self.module.packed_full_dims.get(name).map(|d| d.to_vec()),
             class_type: self.var_class_types.get(name).cloned(),
             typedef_type: self.var_typedef_types.get(name).cloned(),
+            mixed_packed: self.mixed_packed_vars.contains(name),
         }
     }
 
@@ -1787,6 +1788,8 @@ impl Simulator {
         self.module.packed_full_dims.remove(name);
         self.var_class_types.remove(name);
         self.var_typedef_types.remove(name);
+        self.mixed_packed_vars.remove(name);
+        self.mixed_local_two_state.remove(name);
     }
 
     /// The `packed_signal_elem_widths` part of `clear_formal_metadata`.
@@ -1971,6 +1974,7 @@ impl Simulator {
                 packed_dimensions: self.module.packed_full_dims.remove(name).map(|d| d.to_vec()),
                 class_type: self.var_class_types.remove(name),
                 typedef_type: self.var_typedef_types.remove(name),
+                mixed_packed: self.mixed_packed_vars.remove(name),
             },
         }
     }
@@ -2034,6 +2038,8 @@ impl Simulator {
         self.signed_signals.remove(name);
         self.real_signals.remove(name);
         self.string_signals.remove(name);
+        self.mixed_packed_vars.remove(name);
+        self.mixed_local_two_state.remove(name);
     }
 
     /// A declared type whose registration is only its width and signedness:
@@ -2162,6 +2168,13 @@ impl Simulator {
         );
         put(&mut self.var_class_types, name, saved.class_type);
         put(&mut self.var_typedef_types, name, saved.typedef_type);
+        if saved.mixed_packed {
+            self.mixed_packed_vars.insert(name.to_string());
+            self.refresh_mixed_local_two_state(name);
+        } else {
+            self.mixed_packed_vars.remove(name);
+            self.mixed_local_two_state.remove(name);
+        }
     }
 
     /// §7.4.1/§13.5: a plain vector formal or return variable of a class
@@ -2317,6 +2330,12 @@ impl Simulator {
             self.module
                 .packed_struct_fields
                 .insert(name.to_string(), fields);
+        }
+        if self.packed_type_is_mixed(dt) {
+            self.mixed_packed_vars.insert(name.to_string());
+            self.set_mixed_local_two_state(name, dt);
+        } else {
+            self.mixed_local_two_state.remove(name);
         }
     }
 
@@ -2649,28 +2668,7 @@ impl Simulator {
         if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
             return None;
         }
-        let mut out = Vec::new();
-        for member in &su.members {
-            let w = super::elaborate::resolve_type_width(
-                &member.data_type,
-                Some(&m.parameters),
-                Some(&m.typedefs),
-            );
-            let subs = super::elaborate::packed_struct_field_layout(
-                &member.data_type,
-                &m.parameters,
-                &m.typedefs,
-                &m.typedef_types,
-            )
-            .unwrap_or_default();
-            for d in &member.declarators {
-                out.push((d.name.name.clone(), 0, w));
-                for (sn, so, sw) in &subs {
-                    out.push((format!("{}.{}", d.name.name, sn), *so, *sw));
-                }
-            }
-        }
-        Some(out)
+        super::elaborate::flatten_struct_fields(dt, &m.parameters, &m.typedefs, &m.typedef_types)
     }
 
     fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {

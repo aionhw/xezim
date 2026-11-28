@@ -677,13 +677,19 @@ impl Simulator {
                         return v;
                     }
                 }
-                // §7.3.2 tagged-union member read (`t.Valid`).
-                if hier.path.len() == 2 {
-                    let base = hier.path[0].name.name.as_str();
-                    if self.active_union_tag.contains_key(base) {
-                        let (base, member) = (base.to_string(), hier.path[1].name.name.clone());
-                        if let Some(v) = self.tagged_union_member(&base, &member) {
-                            return v;
+                // §7.3.2 tagged-union member read (`t.Valid`, `ip.Jmp.JmpC.addr`).
+                if hier.path.len() >= 2 {
+                    if let Some(v) = self.read_tagged_union_member_chain(expr) {
+                        return v;
+                    }
+                    if hier.path.len() == 2 {
+                        let base = hier.path[0].name.name.as_str();
+                        if self.active_union_tag.contains_key(base) {
+                            let (base, member) =
+                                (base.to_string(), hier.path[1].name.name.clone());
+                            if let Some(v) = self.tagged_union_member(&base, &member) {
+                                return v;
+                            }
                         }
                     }
                 }
@@ -1481,7 +1487,7 @@ impl Simulator {
                                     .map(|&(_, o, w)| (o, w))
                             })
                         {
-                            if let Some(sig) = self.get_signal_value_by_name(obj_name) {
+                            if let Some(sig) = self.get_local_or_signal(obj_name) {
                                 let mut v =
                                     sig.range_select((off + w - 1) as usize, off as usize);
                                 // §7.2.1: the member's DECLARED signedness
@@ -4769,6 +4775,7 @@ impl Simulator {
             }
             // §10.9: a typed pattern has its type's value.
             ExprKind::TypedPattern { .. } => self.eval_typed_pattern(expr),
+            ExprKind::Tagged { tag, inner } => self.eval_tagged_expr_untyped(tag, inner),
             _ => Value::zero(32),
         }
     }

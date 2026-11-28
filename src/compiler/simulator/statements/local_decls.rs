@@ -227,8 +227,22 @@ impl Simulator {
         // defaults to `null`, also when its type is a typedef alias
         // (`vif_t v;`) or an explicit `virtual bus_if v` declaration.
         let is_vif_handle = !is_class_handle && self.decl_is_virtual_iface(data_type);
+        let is_untagged_unpacked_union = matches!(
+            &*resolved_dt,
+            crate::ast::types::DataType::Struct(su)
+                if matches!(su.kind, crate::ast::types::StructUnionKind::Union)
+                    && !su.packed
+                    && !su.soft
+                    && !su.tagged
+        );
         let mut default_v = if is_real_type {
             Value::from_f64(0.0)
+        } else if is_untagged_unpacked_union {
+            super::elaborate::default_value_for_type_resolved(
+                &resolved_dt,
+                w,
+                &self.module.typedef_types,
+            )
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
         {
             Value::zero(w)
@@ -488,10 +502,11 @@ impl Simulator {
             self.note_struct_root(&d.name.name);
             self.note_struct_type(data_type);
             // §6.21: each entry gets FRESH (empty) dynamic members.
-            if self.struct_colls_possible()
-                && let Some(su) = self.unpacked_struct_of(data_type)
-            {
-                self.fresh_struct_colls(&d.name.name, &su);
+            if let Some(su) = self.unpacked_struct_of(data_type) {
+                if self.struct_colls_possible() {
+                    self.fresh_struct_colls(&d.name.name, &su);
+                }
+                self.apply_struct_member_defaults(&d.name.name, &su, 0);
             }
             // A decl-init whose SOURCE is an unpacked-struct
             // CLASS property (`pair_t p = o.orig;`, incl. the
@@ -536,6 +551,7 @@ impl Simulator {
                         if self.struct_colls_possible() {
                             self.fresh_struct_colls(&d.name.name, &su);
                         }
+                        self.apply_struct_member_defaults(&d.name.name, &su, 0);
                         if let Some(init_expr) = d.init.clone() {
                             self.init_unpacked_struct_local(d, data_type, &init_expr);
                         }
@@ -731,6 +747,11 @@ impl Simulator {
                         .insert(d.name.name.clone(), data_type.clone());
                 }
             }
+            // Reset any prior call's tagged-union tracking for an uninitialized local.
+            if d.init.is_none() {
+                self.active_union_tag.remove(&d.name.name);
+                self.tagged_union_strings.remove(&d.name.name);
+            }
             // §7.4.1: a packed-of-packed local (`u8_vec16_t y;`)
             // needs its ELEMENT width registered, or `y[i]` reads
             // and writes degrade to single-BIT selects. This was the
@@ -901,6 +922,13 @@ impl Simulator {
                             .insert(d.name.name.clone(), fields);
                     }
                 }
+                if self.packed_type_is_mixed(data_type) {
+                    self.mixed_packed_vars.insert(d.name.name.clone());
+                    self.set_mixed_local_two_state(&d.name.name, data_type);
+                } else {
+                    self.mixed_packed_vars.remove(&d.name.name);
+                    self.mixed_local_two_state.remove(&d.name.name);
+                }
                 // Declaration-order member names for `%p` (§21.2.1.7).
                 if let Some(names) =
                     super::elaborate::struct_member_names(data_type, &self.module.typedef_types)
@@ -930,6 +958,13 @@ impl Simulator {
                     // An array local to an automatic task lives under a
                     // per-call key (`declare_local_dyn`).
                     self.local_elem_layout = Some((fields, d.name.name.clone(), prev));
+                }
+                if self.packed_type_is_mixed(data_type) {
+                    self.mixed_packed_vars.insert(d.name.name.clone());
+                    self.set_mixed_local_two_state(&d.name.name, data_type);
+                } else {
+                    self.mixed_packed_vars.remove(&d.name.name);
+                    self.mixed_local_two_state.remove(&d.name.name);
                 }
                 // §7.4/§20.7: an ARRAY local of a packed multi-dimensional
                 // element (`logic [7:0][3:0] pk [2][3];`) keeps its packed

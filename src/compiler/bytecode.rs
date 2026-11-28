@@ -1276,15 +1276,11 @@ pub struct BytecodeCompiler<'a> {
     /// `collection_store_denied`); their READS are unaffected.
     dynamic_arrays: Option<&'a HashSet<String>>,
     queue_vars: Option<&'a HashSet<String>>,
-    /// Packed-struct field layout: container name → ordered
-    /// `(member, lsb_offset, width)`. Lets a member-write LHS like
-    /// `s.m0` (parsed as a 2-segment `Ident(["<scope>.s", "m0"])` after
-    /// submodule inlining) compile to a constant bit-range write into the
-    /// container signal, instead of bailing to the AST interpreter — where
-    /// its read dependency would resolve bare-first to the wrong (top-scope)
-    /// input and never re-trigger when the real scoped input changes. Set via
-    /// `set_packed_struct_fields`.
-    packed_struct_fields: Option<&'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
+    /// Interned packed-struct field layouts: container name → `Arc<StructLayout>`.
+    /// Lets a member-write LHS like `s.m0` (or `s.e[1].dw[0].value`) compile
+    /// to a constant bit-range write in O(1) without scanning `Vec` entries,
+    /// while skipping `is_mixed` layouts cleanly. Set via `set_packed_struct_layouts`.
+    packed_struct_layouts: Option<&'a HashMap<String, Arc<super::struct_layout::StructLayout>>>,
 }
 
 /// Where `packed_path_dyn_range` places a store in its root signal.
@@ -1464,7 +1460,7 @@ impl<'a> BytecodeCompiler<'a> {
             arrays_2d: None,
             dynamic_arrays: None,
             queue_vars: None,
-            packed_struct_fields: None,
+            packed_struct_layouts: None,
         }
     }
 
@@ -1480,11 +1476,11 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn set_packed_struct_fields(
+    pub(crate) fn set_packed_struct_layouts(
         &mut self,
-        f: &'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>,
+        f: &'a HashMap<String, Arc<super::struct_layout::StructLayout>>,
     ) {
-        self.packed_struct_fields = Some(f);
+        self.packed_struct_layouts = Some(f);
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
@@ -1732,7 +1728,7 @@ impl<'a> BytecodeCompiler<'a> {
         r
     }
 
-    fn emit(&mut self, insn: Insn) {
+    pub(crate) fn emit(&mut self, insn: Insn) {
         self.insns.push(insn);
     }
 

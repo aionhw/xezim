@@ -1282,15 +1282,442 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2023 §7.3.2/§11.9: resolve `dt` to a tagged union if it is one.
+    pub(super) fn resolve_tagged_su(
+        &self,
+        dt: &DataType,
+    ) -> Option<crate::ast::types::StructUnionType> {
+        let mut cur = dt.clone();
+        for _ in 0..64 {
+            match cur {
+                DataType::TypeReference {
+                    ref name,
+                    ref dimensions,
+                    ..
+                } => {
+                    if !dimensions.is_empty() {
+                        cur = self.lookup_typedef_dt(name)?;
+                        continue;
+                    }
+                    cur = self.lookup_typedef_dt(name)?;
+                }
+                DataType::Struct(su)
+                    if su.tagged
+                        && matches!(su.kind, crate::ast::types::StructUnionKind::Union) =>
+                {
+                    return Some(su);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn lookup_typedef_dt(&self, name: &crate::ast::types::TypeName) -> Option<DataType> {
+        if name.has_scope() {
+            return super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)
+                .cloned();
+        }
+        self.module
+            .typedef_types
+            .get(&name.name.name)
+            .cloned()
+            .or_else(|| {
+                self.lookup_hint_scoped_typedef(&name.name.name)
+                    .map(|(_, dt)| dt)
+            })
+    }
+
+    /// Tagged union `StructUnionType` for a storage name (plain var, `arr[i]`, or `s.u`).
+    pub(super) fn tagged_union_dt_of_name(
+        &self,
+        name: &str,
+    ) -> Option<(DataType, crate::ast::types::StructUnionType)> {
+        let bare = name.split('[').next().unwrap_or(name);
+        if let Some(dt) = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(bare))
+            .cloned()
+        {
+            if let Some(su) = self.resolve_tagged_su(&dt) {
+                return Some((dt, su));
+            }
+        }
+        if name.contains('.') {
+            if let Some((dt, None)) = self.flat_path_type(name) {
+                if let Some(su) = self.resolve_tagged_su(&dt) {
+                    return Some((dt, su));
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a tagged-union expression (`u`, `arr[i]`, `s.u`, function return var)
+    /// to `(optional_storage_name, declared_dt, su)`.
+    pub(super) fn tagged_union_dt_of_expr(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(Option<String>, DataType, crate::ast::types::StructUnionType)> {
+        let expr = Self::unparen(expr);
+        match &expr.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    if self
+                        .func_call_stack
+                        .last()
+                        .is_some_and(|f| *f == h.path[0].name.name)
+                        && let Some(ret_dt) = self.return_frame_type()
+                        && let Some(su) = self.resolve_tagged_su(&ret_dt)
+                    {
+                        return Some((Some(h.path[0].name.name.clone()), ret_dt, su));
+                    }
+                    let n = self
+                        .frame_bound_bare_name(h)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+                    let (dt, su) = self.tagged_union_dt_of_name(&n)?;
+                    return Some((Some(n), dt, su));
+                }
+                if let Some(flat) = self.flat_member_name(expr)
+                    && let Some((dt, su)) = self.tagged_union_dt_of_name(&flat)
+                {
+                    return Some((Some(flat), dt, su));
+                }
+                None
+            }
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {
+                if !Self::cond_expr_is_effect_free(expr, false) {
+                    return None;
+                }
+                if let Some(flat) = self.flat_member_name(expr)
+                    && let Some((dt, su)) = self.tagged_union_dt_of_name(&flat)
+                {
+                    return Some((Some(flat), dt, su));
+                }
+                if !self.no_class_objects()
+                    && let Some((handle, prop)) = self.class_prop_receiver(expr)
+                    && let Some(cn) = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                    && let Some((dt, unpacked)) = self.class_property_decl_type(&cn, &prop)
+                    && unpacked.is_empty()
+                    && let Some(su) = self.resolve_tagged_su(&dt)
+                {
+                    return Some((None, dt, su));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract `(tag_name, inner_expr)` from `ExprKind::Tagged` (including `tagged '{ m: v }`).
+    pub(super) fn extract_tag_and_inner<'a>(
+        tag: &crate::ast::Identifier,
+        inner: &'a Option<Box<Expression>>,
+    ) -> (String, Option<&'a Expression>) {
+        if !tag.name.is_empty() {
+            return (tag.name.clone(), inner.as_deref());
+        }
+        if let Some(ie) = inner.as_deref()
+            && let ExprKind::AssignmentPattern(items) = &Self::unparen(ie).kind
+        {
+            for it in items {
+                if let AssignmentPatternItem::Named(id, e) = it {
+                    return (id.name.clone(), Some(e));
+                }
+            }
+        }
+        (String::new(), inner.as_deref())
+    }
+
+    pub(super) fn tagged_layout(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+    ) -> (u32, u32, Vec<(String, u32, DataType)>) {
+        super::elaborate::tagged_union_layout(
+            su,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            Some(&self.module.typedef_types),
+            Some(&self.module.typedef_unpacked_dims),
+        )
+    }
+
+    /// Encode a `tagged Tag (inner)` expression into a tagged-union `Value`
+    /// with tag bits in the MSBs `[max_w .. max_w + tag_w]` and payload LSB-aligned.
+    pub(super) fn encode_tagged_union_expr(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        tag: &crate::ast::Identifier,
+        inner: &Option<Box<Expression>>,
+    ) -> Option<(String, Value, Option<String>)> {
+        let (tag_name, inner_expr) = Self::extract_tag_and_inner(tag, inner);
+        let (tag_w, max_w, members) = self.tagged_layout(su);
+        let (tag_idx, (_, mw, mdt)) = members
+            .iter()
+            .enumerate()
+            .find(|(_, (n, _, _))| *n == tag_name)?;
+        let mw = *mw;
+        let mdt = mdt.clone();
+        let total_w = (tag_w + max_w).max(1);
+        let mut out = Value::zero(total_w);
+        for b in 0..tag_w {
+            let bit = if ((tag_idx >> b) & 1) != 0 {
+                LogicBit::One
+            } else {
+                LogicBit::Zero
+            };
+            out.set_bit((max_w + b) as usize, bit);
+        }
+        let mut str_payload: Option<String> = None;
+        if let Some(ie) = inner_expr
+            && mw > 0
+        {
+            let resolved_mdt = self.resolve_dt(&mdt);
+            let ie_u = Self::unparen(ie);
+            if let Some(inner_su) = self.resolve_tagged_su(&mdt)
+                && let ExprKind::Tagged { tag: st, inner: si } = &ie_u.kind
+                && let Some((_, sub_val, sub_str)) =
+                    self.encode_tagged_union_expr(&inner_su, st, si)
+            {
+                let copy_w = mw.min(sub_val.width) as usize;
+                out.copy_bits_from(0, &sub_val, 0, copy_w);
+                str_payload = sub_str;
+            } else if matches!(
+                resolved_mdt,
+                DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    ..
+                }
+            ) {
+                let sv = self.eval_expr(ie);
+                let s = sv.to_sv_string();
+                str_payload = Some(s.clone());
+                let packed_s = Value::from_string(&s).resize(mw);
+                out.copy_bits_from(0, &packed_s, 0, mw as usize);
+            } else {
+                let mut mv = if matches!(
+                    &ie_u.kind,
+                    ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. }
+                ) {
+                    let pat = self.unpacked_pattern(ie_u);
+                    self.eval_in_packed_type(pat, &mdt)
+                        .or_else(|| self.unpacked_struct_pattern_value(pat, &mdt))
+                        .unwrap_or_else(|| self.eval_expr_ctx(ie, mw))
+                } else {
+                    self.eval_expr_ctx(ie, mw)
+                };
+                if mv.is_real {
+                    mv = Value::from_u64(mv.to_f64().to_bits(), 64);
+                }
+                let fitted = if mv.width == mw {
+                    mv
+                } else {
+                    mv.resize_for_assign(mw)
+                };
+                out.copy_bits_from(0, &fitted, 0, mw as usize);
+            }
+        }
+        Some((tag_name, out, str_payload))
+    }
+
+    /// Evaluate `rhs` in the context of target tagged union `su` (including `cond ? a : b`).
+    pub(super) fn eval_tagged_rhs(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        rhs: &Expression,
+    ) -> Option<(String, Value, Option<String>)> {
+        let u = Self::unparen(rhs);
+        match &u.kind {
+            ExprKind::Tagged { tag, inner } => self.encode_tagged_union_expr(su, tag, inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                let cv = self.eval_expr(condition);
+                if cv.is_true() {
+                    self.eval_tagged_rhs(su, then_expr)
+                } else if !cv.has_xz() {
+                    self.eval_tagged_rhs(su, else_expr)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Fallback evaluation for an untyped `ExprKind::Tagged` (e.g. comparison or call arg)
+    /// when no target type was propagated down.
+    pub(super) fn eval_tagged_expr_untyped(
+        &mut self,
+        tag: &crate::ast::Identifier,
+        inner: &Option<Box<Expression>>,
+    ) -> Value {
+        let (tag_name, inner_expr) = Self::extract_tag_and_inner(tag, inner);
+        if !tag_name.is_empty() {
+            let candidates: Vec<crate::ast::types::StructUnionType> = self
+                .module
+                .typedef_types
+                .values()
+                .filter_map(|dt| {
+                    let su = self.resolve_tagged_su(dt)?;
+                    let has_tag = su
+                        .members
+                        .iter()
+                        .any(|m| m.declarators.iter().any(|d| d.name.name == tag_name));
+                    has_tag.then_some(su)
+                })
+                .collect();
+            if let Some(su) = candidates.into_iter().next()
+                && let Some((_, v, _)) = self.encode_tagged_union_expr(&su, tag, inner)
+            {
+                return v;
+            }
+        }
+        match inner_expr {
+            Some(ie) => self.eval_expr(ie),
+            None => Value::zero(1),
+        }
+    }
+
+    /// Decode the active tag `(idx, name, member_width, member_dt)` from `v`'s MSB bits
+    /// (preferring MSB bits over `active_union_tag` so NBA/returns/array copies stay in sync).
+    pub(super) fn decode_tagged_union_val(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+        name_hint: Option<&str>,
+    ) -> Option<(usize, String, u32, DataType)> {
+        let (tag_w, max_w, members) = self.tagged_layout(su);
+        if v.width >= max_w + tag_w {
+            let mut idx = 0usize;
+            let mut valid = true;
+            for b in 0..tag_w {
+                match v.get_bit((max_w + b) as usize) {
+                    LogicBit::Zero => {}
+                    LogicBit::One => idx |= 1usize << b,
+                    LogicBit::X | LogicBit::Z => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && let Some((n, mw, mdt)) = members.get(idx) {
+                return Some((idx, n.clone(), *mw, mdt.clone()));
+            }
+        }
+        if let Some(hint) = name_hint
+            && let Some(tag_name) = self.active_union_tag.get(hint)
+            && let Some((idx, (n, mw, mdt))) = members
+                .iter()
+                .enumerate()
+                .find(|(_, (n, _, _))| n == tag_name)
+        {
+            return Some((idx, n.clone(), *mw, mdt.clone()));
+        }
+        None
+    }
+
+    /// Extract a tagged union's active member payload as a `Value` of the member's
+    /// declared width, signedness, real-ness, or string payload.
+    pub(super) fn extract_tagged_member_value(
+        &self,
+        v: &Value,
+        mw: u32,
+        mdt: &DataType,
+        storage_hint: Option<&str>,
+    ) -> Value {
+        let resolved_mdt = self.resolve_dt(mdt);
+        if matches!(
+            resolved_mdt,
+            DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        ) {
+            if let Some(s) = storage_hint.and_then(|n| self.tagged_union_strings.get(n)) {
+                return Value::from_string(s);
+            }
+            let slice = if mw > 0 && v.width >= mw {
+                v.range_select((mw - 1) as usize, 0)
+            } else {
+                v.clone()
+            };
+            return Value::from_string(&slice.to_sv_string());
+        }
+        if mw == 0 {
+            return Value::zero(1);
+        }
+        let mut sub = v.range_select((mw - 1) as usize, 0);
+        if matches!(resolved_mdt, DataType::Real { .. }) {
+            return Value::from_f64(f64::from_bits(sub.to_u64().unwrap_or(0)));
+        }
+        sub.is_signed = super::elaborate::is_type_signed_resolved(mdt, &self.module.typedef_types);
+        sub
+    }
+
+    /// Checked member read on a tagged union value.
+    pub(super) fn tagged_union_member_read(
+        &mut self,
+        base: Option<&str>,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+        member: &str,
+    ) -> Value {
+        let decoded = self.decode_tagged_union_val(su, v, base);
+        if let Some((_, active_tag, mw, mdt)) = decoded {
+            if active_tag == member {
+                return self.extract_tagged_member_value(v, mw, &mdt, base);
+            }
+            let body = format!(
+                "Read of inactive tagged union member '{}.{}' (active member is '{}')",
+                base.unwrap_or("<union>"),
+                member,
+                active_tag
+            );
+            self.emit_severity_text("Error", &body);
+            self.saw_fatal = true;
+        } else {
+            let body = format!(
+                "Read of inactive tagged union member '{}.{}' (active member is '<uninitialized>')",
+                base.unwrap_or("<union>"),
+                member
+            );
+            self.emit_severity_text("Error", &body);
+            self.saw_fatal = true;
+        }
+        let (_, _, members) = self.tagged_layout(su);
+        let mw = members
+            .iter()
+            .find(|(n, _, _)| n == member)
+            .map(|(_, w, _)| *w)
+            .unwrap_or(v.width);
+        Value::new(mw.max(1))
+    }
+
     /// IEEE 1800-2023 §7.3.2/§11.9: a tagged union stores ONE member at a
     /// time. Reading the active member yields the stored value; reading any
     /// other member is a run-time error.
     pub(super) fn tagged_union_member(&mut self, base: &str, member: &str) -> Option<Value> {
+        if let Some((_, su)) = self.tagged_union_dt_of_name(base) {
+            let v = self
+                .get_local_or_signal(base)
+                .unwrap_or_else(|| Value::new(self.lookup_signal_width(base).unwrap_or(1)));
+            return Some(self.tagged_union_member_read(Some(base), &su, &v, member));
+        }
         let tag = self.active_union_tag.get(base)?.clone();
         let w = self.lookup_signal_width(base).unwrap_or(32);
         if tag == member {
             Some(
-                self.get_signal_value_by_name(base)
+                self.get_local_or_signal(base)
                     .unwrap_or_else(|| Value::new(w)),
             )
         } else {
@@ -1299,8 +1726,224 @@ impl Simulator {
                 base, member, tag
             );
             self.emit_severity_text("Error", &body);
+            self.saw_fatal = true;
             Some(Value::new(w))
         }
+    }
+
+    /// Checked member-chain read rooted at a tagged union (`u.Val`, `arr[i].Val`,
+    /// `ip.Jmp.JmpC.addr`, `u.Pair.a`).
+    pub(super) fn read_tagged_union_member_chain(&mut self, expr: &Expression) -> Option<Value> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut root_match: Option<(Option<String>, DataType, crate::ast::types::StructUnionType, Expression)> = None;
+        let mut cur = Self::unparen(expr);
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr: base, member } => {
+                    chain.push(member.name.clone());
+                    let b = Self::unparen(base);
+                    if let Some((name_opt, dt, su)) = self.tagged_union_dt_of_expr(b) {
+                        root_match = Some((name_opt, dt, su, b.clone()));
+                        break;
+                    }
+                    cur = b;
+                }
+                ExprKind::Ident(h) if h.path.len() >= 2 => {
+                    for cut in (1..h.path.len()).rev() {
+                        let prefix = Expression::new(
+                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                root: h.root,
+                                path: h.path[..cut].to_vec(),
+                                span: h.span,
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
+                            }),
+                            expr.span,
+                        );
+                        if let Some((name_opt, dt, su)) = self.tagged_union_dt_of_expr(&prefix) {
+                            // Ensure intermediate segments have no index selects that we skipped
+                            if h.path[cut..].iter().all(|s| s.selects.is_empty()) {
+                                for s in h.path[cut..].iter().rev() {
+                                    chain.push(s.name.name.clone());
+                                }
+                                root_match = Some((name_opt, dt, su, prefix));
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let (base_opt, _root_dt, root_su, root_expr) = root_match?;
+        chain.reverse();
+        let first_m = chain.first()?.clone();
+        let root_val = if let Some(ref b) = base_opt {
+            self.get_local_or_signal(b)
+                .unwrap_or_else(|| self.eval_expr(&root_expr))
+        } else {
+            self.eval_expr(&root_expr)
+        };
+        let mut cur_val = self.tagged_union_member_read(base_opt.as_deref(), &root_su, &root_val, &first_m);
+        if self.saw_fatal && self.decode_tagged_union_val(&root_su, &root_val, base_opt.as_deref()).is_none_or(|d| d.1 != first_m) {
+            return Some(cur_val);
+        }
+        let (_, _, root_members) = self.tagged_layout(&root_su);
+        let mut cur_dt = root_members
+            .iter()
+            .find(|(n, _, _)| n == &first_m)
+            .map(|(_, _, dt)| dt.clone())?;
+        for seg in &chain[1..] {
+            if let Some(next_su) = self.resolve_tagged_su(&cur_dt) {
+                let next_val = self.tagged_union_member_read(None, &next_su, &cur_val, seg);
+                let (_, _, next_members) = self.tagged_layout(&next_su);
+                cur_dt = next_members
+                    .iter()
+                    .find(|(n, _, _)| n == seg)
+                    .map(|(_, _, dt)| dt.clone())?;
+                cur_val = next_val;
+            } else if let Some(fields) = super::elaborate::flatten_struct_fields(
+                &cur_dt,
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            ) && let Some((_, off, w)) = fields.iter().find(|(n, _, _)| n == seg)
+            {
+                let mut sub = cur_val.range_select((off + w - 1) as usize, *off as usize);
+                if let DataType::Struct(st) = self.resolve_dt(&cur_dt)
+                    && let Some(m) = st.members.iter().find(|m| m.declarators.iter().any(|d| d.name.name == *seg))
+                {
+                    sub.is_signed =
+                        super::elaborate::is_type_signed_resolved(&m.data_type, &self.module.typedef_types);
+                    cur_dt = m.data_type.clone();
+                }
+                cur_val = sub;
+            } else {
+                let DataType::Struct(st) = self.resolve_dt(&cur_dt) else {
+                    return None;
+                };
+                if !Self::spreads_member_wise(&st) {
+                    return None;
+                }
+                let leaves: HashMap<String, Value> =
+                    self.split_packed_struct("", &st, &cur_val).into_iter().collect();
+                cur_val = leaves.get(&format!(".{}", seg))?.clone();
+                if let Some(m) = st.members.iter().find(|m| m.declarators.iter().any(|d| d.name.name == *seg)) {
+                    cur_val.is_signed =
+                        super::elaborate::is_type_signed_resolved(&m.data_type, &self.module.typedef_types);
+                    cur_dt = m.data_type.clone();
+                }
+            }
+        }
+        Some(cur_val)
+    }
+
+    /// Declared bit width of a tagged union member expression (`$bits(u.Val)` -> 8, not 9).
+    pub(super) fn tagged_union_member_width_of_expr(&mut self, arg: &Expression) -> Option<u32> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur_dt: Option<DataType> = None;
+        let mut cur = Self::unparen(arg);
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr: base, member } => {
+                    chain.push(member.name.clone());
+                    let b = Self::unparen(base);
+                    if let Some((_, dt, _)) = self.tagged_union_dt_of_expr(b) {
+                        cur_dt = Some(dt);
+                        break;
+                    }
+                    cur = b;
+                }
+                ExprKind::Ident(h) if h.path.len() >= 2 => {
+                    for cut in (1..h.path.len()).rev() {
+                        let prefix = Expression::new(
+                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                root: h.root,
+                                path: h.path[..cut].to_vec(),
+                                span: h.span,
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
+                            }),
+                            arg.span,
+                        );
+                        if let Some((_, dt, _)) = self.tagged_union_dt_of_expr(&prefix)
+                            && h.path[cut..].iter().all(|s| s.selects.is_empty())
+                        {
+                            for s in h.path[cut..].iter().rev() {
+                                chain.push(s.name.name.clone());
+                            }
+                            cur_dt = Some(dt);
+                            break;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let mut dt = cur_dt?;
+        chain.reverse();
+        for seg in chain {
+            let DataType::Struct(st) = self.resolve_dt(&dt) else {
+                return None;
+            };
+            let (m, d) = st
+                .members
+                .iter()
+                .find_map(|m| m.declarators.iter().find(|d| d.name.name == seg).map(|d| (m, d)))?;
+            let dims = self.member_dims(&m.data_type, &d.dimensions);
+            let _ = dims;
+            dt = m.data_type.clone();
+        }
+        let w = super::elaborate::resolve_type_width_with_typedef_dims(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            &self.module.typedef_types,
+            &self.module.typedef_unpacked_dims,
+        );
+        Some(w)
+    }
+
+    /// Format a tagged union value for `%p` (`'{tagged <Tag>:<rendered>}` or `'{tagged <Tag>:void}`).
+    pub(super) fn render_p_tagged_union_val(
+        &mut self,
+        v: &Value,
+        su: &crate::ast::types::StructUnionType,
+        storage_hint: Option<&str>,
+    ) -> String {
+        if let Some((_, tag, mw, mdt)) = self.decode_tagged_union_val(su, v, storage_hint) {
+            if matches!(self.resolve_dt(&mdt), DataType::Void(_)) || mw == 0 {
+                return format!("'{{tagged {tag}:void}}");
+            }
+            let mv = self.extract_tagged_member_value(v, mw, &mdt, storage_hint);
+            let rendered = match self.resolve_dt(&mdt) {
+                DataType::Struct(inner_su) if inner_su.tagged => {
+                    self.render_p_tagged_union_val(&mv, &inner_su, storage_hint)
+                }
+                DataType::Struct(inner_su) if inner_su.packed => self.render_p_packed(&mv, &inner_su),
+                DataType::Struct(inner_su) => self
+                    .render_p_plain_struct_value(&inner_su, &mv)
+                    .unwrap_or_else(|| mv.to_dec_string()),
+                _ => self.render_p_value_typed(&mv, &mdt),
+            };
+            return format!("'{{tagged {tag}:{rendered}}}");
+        }
+        "'{}".to_string()
+    }
+
+    /// Format an arbitrary expression as `%p` if its declared type is a tagged union.
+    pub(super) fn render_p_tagged_union_expr(&mut self, arg: &Expression) -> Option<String> {
+        let (hint, _, su) = self.tagged_union_dt_of_expr(arg)?;
+        let v = if let Some(ref n) = hint {
+            self.get_local_or_signal(n).unwrap_or_else(|| self.eval_expr(arg))
+        } else {
+            self.eval_expr(arg)
+        };
+        Some(self.render_p_tagged_union_val(&v, &su, hint.as_deref()))
     }
 
     /// Whether `e` is shaped like a locator call (`q.find with (..)`,

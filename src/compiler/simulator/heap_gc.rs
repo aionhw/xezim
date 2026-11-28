@@ -545,6 +545,7 @@ impl Simulator {
             local_coll_shapes,
             local_coll_elems,
             active_union_tag,
+            mixed_local_two_state,
             static_struct_holders,
             rand_ranges,
             rand_elem_ranges

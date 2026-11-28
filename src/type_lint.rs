@@ -77,12 +77,14 @@ enum Ty {
     Enum {
         key: Rc<str>,
         name: Rc<str>,
+        bits: Option<u64>,
     },
     Real {
         short: bool,
     },
     Str,
     Event,
+    Chandle,
     Class(Rc<str>),
     Null,
     Void,
@@ -98,6 +100,10 @@ enum Ty {
 struct StructTy {
     key: String,
     packed: bool,
+    tagged: bool,
+    has_untagged_union: bool,
+    has_dynamic_or_handle: bool,
+    packed_bits: Option<u64>,
     members: Vec<(String, Ty)>,
 }
 
@@ -155,6 +161,7 @@ impl Ty {
             Ty::Real { short: false } => "real".into(),
             Ty::Str => "string".into(),
             Ty::Event => "event".into(),
+            Ty::Chandle => "chandle".into(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Null => "null".into(),
             Ty::Void => "void".into(),
@@ -527,13 +534,13 @@ impl<'a> Ck<'a> {
                 kind: SimpleType::Event,
                 ..
             } => Ty::Event,
-            DataType::Simple { .. } => Ty::Unknown,
+            DataType::Simple {
+                kind: SimpleType::Chandle,
+                ..
+            } => Ty::Chandle,
             DataType::Void(_) => Ty::Void,
             DataType::Enum(et) => self.resolve_enum(et, None),
             DataType::Struct(su) => {
-                if su.tagged || !su.dimensions.is_empty() {
-                    return Ty::Unknown;
-                }
                 let mut members = Vec::new();
                 for m in &su.members {
                     let t = self.resolve(&m.data_type);
@@ -541,12 +548,56 @@ impl<'a> Ck<'a> {
                         members.push((d.name.name.clone(), with_dims(t.clone(), &d.dimensions)));
                     }
                 }
-                if su.packed {
+                if su.packed || su.soft {
                     self.check_packed_members(su, &members);
+                }
+                let is_untagged_union = su.kind == StructUnionKind::Union && !su.tagged;
+                if is_untagged_union {
+                    self.check_untagged_union_members(su, &members);
+                }
+                let has_untagged_union = is_untagged_union
+                    || members.iter().any(|(_, t)| ty_has_untagged_union(t))
+                    || su.members.iter().any(|m| {
+                        matches!(&m.data_type, DataType::Struct(inner) if inner.kind == StructUnionKind::Union && !inner.tagged)
+                    });
+                let has_dynamic_or_handle =
+                    members.iter().any(|(_, t)| ty_has_dynamic_or_handle(t));
+                let packed_bits = if su.packed {
+                    if su.kind == StructUnionKind::Union {
+                        let max_w = members
+                            .iter()
+                            .map(|(_, t)| ty_packed_bits(t))
+                            .try_fold(0u64, |acc, b| b.map(|v| acc.max(v)));
+                        if su.tagged {
+                            let tag_w = if members.len() <= 1 {
+                                1u64
+                            } else {
+                                (members.len() as u64 - 1).ilog2() as u64 + 1
+                            };
+                            max_w.map(|m| m + tag_w)
+                        } else {
+                            max_w
+                        }
+                    } else {
+                        members
+                            .iter()
+                            .map(|(_, t)| ty_packed_bits(t))
+                            .try_fold(0u64, |acc, b| b.map(|v| acc + v))
+                    }
+                } else {
+                    None
+                };
+                self.check_struct_member_defaults(su, has_untagged_union);
+                if !su.dimensions.is_empty() {
+                    return Ty::Unknown;
                 }
                 Ty::Struct(Rc::new(StructTy {
                     key: format!("struct@{}", su.span.start),
                     packed: su.packed,
+                    tagged: su.tagged,
+                    has_untagged_union,
+                    has_dynamic_or_handle,
+                    packed_bits,
                     members,
                 }))
             }
@@ -584,10 +635,18 @@ impl<'a> Ck<'a> {
         if !et.dimensions.is_empty() || et.members.is_empty() {
             return Ty::Unknown;
         }
+        let bits = match et.base_type.as_deref() {
+            Some(bt) => {
+                let r = self.resolve(bt);
+                ty_packed_bits(&r)
+            }
+            None => Some(32),
+        };
         let key: Rc<str> = format!("{}@{}", et.members[0].name.name, et.span.start).into();
         let t = Ty::Enum {
             key,
             name: name.unwrap_or("<anonymous>").into(),
+            bits,
         };
         // §6.19: the members are constants of the enum type, declared in the
         // scope that declares the enum.
@@ -738,6 +797,9 @@ impl<'a> Ck<'a> {
                 Ty::Real { .. } => Some("a real"),
                 Ty::Str => Some("a string"),
                 Ty::Class(_) => Some("a class handle"),
+                Ty::Chandle => Some("a chandle"),
+                Ty::Event => Some("an event"),
+                Ty::Void if !su.tagged => Some("void"),
                 Ty::Struct(s) if !s.packed => Some("an unpacked struct"),
                 _ if simple => Some("an event or chandle"),
                 _ => None,
@@ -752,6 +814,100 @@ impl<'a> Ck<'a> {
                          (IEEE 1800-2017 §7.2.1)"
                     ),
                 );
+            }
+        }
+        // §7.3.1: every member of a hard (non-`soft`, non-`tagged`) packed
+        // union shall be the same bit size.
+        if su.kind == StructUnionKind::Union && su.packed && !su.soft && !su.tagged {
+            let mut expected: Option<u64> = None;
+            let mut span_it = su.members.iter().flat_map(|m| m.declarators.iter());
+            for (d, (name, t)) in span_it.by_ref().zip(members) {
+                let Some(w) = ty_packed_bits(t) else {
+                    continue;
+                };
+                if let Some(prev) = expected {
+                    if prev != w && self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "member '{name}' of hard packed union has width {w}, expected {prev} \
+                                 (all members must match; IEEE 1800-2023 §7.3.1)"
+                            ),
+                        );
+                    }
+                } else {
+                    expected = Some(w);
+                }
+            }
+        }
+    }
+
+    /// §7.3: dynamic types, handles, strings, chandles, and events are forbidden
+    /// in untagged unions.
+    fn check_untagged_union_members(&mut self, su: &StructUnionType, members: &[(String, Ty)]) {
+        let decls = su.members.iter().flat_map(|m| m.declarators.iter());
+        for (d, (name, t)) in decls.zip(members) {
+            if ty_has_dynamic_or_handle(t) && self.seen.insert(d.span.start as usize) {
+                self.report(
+                    d.span,
+                    format!(
+                        "member '{name}' of type {} is illegal in an untagged union \
+                         (IEEE 1800-2023 §7.3)",
+                        t.describe()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// §7.2.2: member default initializers must be constant, and are forbidden
+    /// in packed structs/unions, untagged unions, and structs containing an
+    /// untagged union.
+    fn check_struct_member_defaults(
+        &mut self,
+        su: &StructUnionType,
+        has_untagged_union: bool,
+    ) {
+        for m in &su.members {
+            for d in &m.declarators {
+                let Some(init) = &d.init else {
+                    continue;
+                };
+                if su.packed || su.soft {
+                    if self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "packed struct/union member '{}' cannot have a default value \
+                                 (IEEE 1800-2023 §7.2.2)",
+                                d.name.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                if has_untagged_union {
+                    if self.seen.insert(d.span.start as usize) {
+                        self.report(
+                            d.span,
+                            format!(
+                                "member '{}' cannot have a default value in an untagged union \
+                                 or a struct containing an untagged union (IEEE 1800-2023 §7.2.2)",
+                                d.name.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                let prev = self.errs.len();
+                self.report_nonconst(
+                    init,
+                    &|| format!("default value of struct member '{}'", d.name.name),
+                    "§7.2.2",
+                );
+                if self.errs.len() > prev {
+                    self.seen.insert(d.span.start as usize);
+                }
             }
         }
     }
@@ -1817,6 +1973,32 @@ impl<'a> Ck<'a> {
                 }
                 _ => None,
             },
+            Ty::Struct(ls) if !ls.packed => match rt {
+                Ty::Struct(rs) if !rs.packed && ls.key != rs.key => Some(
+                    "unpacked struct types are nominally distinct and not assignment-compatible \
+                     (IEEE 1800-2023 §6.22.1, §7.2.2)"
+                        .into(),
+                ),
+                t if t.is_packed_value()
+                    || matches!(
+                        t,
+                        Ty::Real { .. }
+                            | Ty::Str
+                            | Ty::Class(_)
+                            | Ty::Null
+                            | Ty::Event
+                            | Ty::Chandle
+                            | Ty::Unpacked { .. }
+                    ) =>
+                {
+                    Some(
+                        "an unpacked struct cannot be assigned a non-struct value \
+                         (IEEE 1800-2023 §7.2.2)"
+                            .into(),
+                    )
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1824,6 +2006,7 @@ impl<'a> Ck<'a> {
     fn check_assign(&mut self, lv: &Expression, rv: &Expression) {
         self.check_const_selects(lv);
         self.check_struct_members(lv);
+        self.check_tagged_union_member_write(lv);
         self.check_target_is_variable(lv);
         // `{r1, r2} = v` with a real `r1` is a concatenation too.
         self.check_operands(lv);
@@ -2576,6 +2759,83 @@ impl<'a> Ck<'a> {
         }
     }
 
+    /// §7.3.2: members of a tagged union cannot be assigned directly (`u.Val = 5`).
+    fn check_tagged_union_member_write(&mut self, lv: &Expression) {
+        match &lv.kind {
+            ExprKind::Concatenation(xs) => {
+                for x in xs {
+                    self.check_tagged_union_member_write(x);
+                }
+            }
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::Paren(expr) => {
+                self.check_tagged_union_member_write(expr);
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if let Ty::Struct(st) = self.ty_of(expr)
+                    && st.tagged
+                    && self.seen.insert(member.span.start as usize)
+                {
+                    self.report(
+                        member.span,
+                        format!(
+                            "cannot write directly to member '{}' of a tagged union; \
+                             assign a tagged union expression instead (IEEE 1800-2023 §7.3.2)",
+                            member.name
+                        ),
+                    );
+                    return;
+                }
+                self.check_tagged_union_member_write(expr);
+            }
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() >= 2 => {
+                let mut cur = match self.lookup_var(&h.path[0].name.name) {
+                    Some(t) => t,
+                    None => return,
+                };
+                for _ in &h.path[0].selects {
+                    cur = match cur {
+                        Ty::Unpacked { dims, elem } if dims.len() > 1 => Ty::Unpacked {
+                            dims: dims[1..].to_vec(),
+                            elem,
+                        },
+                        Ty::Unpacked { elem, .. } => *elem,
+                        _ => break,
+                    };
+                }
+                for seg in &h.path[1..] {
+                    if let Ty::Struct(st) = &cur
+                        && st.tagged
+                        && self.seen.insert(seg.name.span.start as usize)
+                    {
+                        self.report(
+                            seg.name.span,
+                            format!(
+                                "cannot write directly to member '{}' of a tagged union; \
+                                 assign a tagged union expression instead (IEEE 1800-2023 §7.3.2)",
+                                seg.name.name
+                            ),
+                        );
+                        return;
+                    }
+                    cur = self.member_ty(cur, &seg.name.name);
+                    for _ in &seg.selects {
+                        cur = match cur {
+                            Ty::Unpacked { dims, elem } if dims.len() > 1 => Ty::Unpacked {
+                                dims: dims[1..].to_vec(),
+                                elem,
+                            },
+                            Ty::Unpacked { elem, .. } => *elem,
+                            _ => break,
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// §10.3 (A.8.5): the selects of a continuous-assignment target are
     /// constant expressions (a variable target is held to this too by the
     /// reference simulator).
@@ -2951,6 +3211,9 @@ impl<'a> Ck<'a> {
                 }
                 ModuleItem::TaskDeclaration(t) if t.name.scopes.is_empty() => self.walk_task(t),
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
+                ModuleItem::TypedefDeclaration(td) if !td.forward => {
+                    self.resolve(&td.data_type);
+                }
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
                     let conds: Vec<Option<&Expression>> =
@@ -3087,6 +3350,38 @@ fn equivalent(a: &Ty, b: &Ty) -> Option<bool> {
         (Ty::Str, Ty::Int { .. } | Ty::Real { .. })
         | (Ty::Int { .. } | Ty::Real { .. }, Ty::Str) => Some(false),
         (Ty::Enum { key: x, .. }, Ty::Enum { key: y, .. }) => Some(x == y),
+        (Ty::Struct(x), Ty::Struct(y)) if !x.packed && !y.packed => Some(x.key == y.key),
+        _ => None,
+    }
+}
+
+fn ty_has_untagged_union(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(s) => s.has_untagged_union,
+        Ty::Unpacked { elem, .. } => ty_has_untagged_union(elem),
+        _ => false,
+    }
+}
+
+fn ty_has_dynamic_or_handle(t: &Ty) -> bool {
+    match t {
+        Ty::Str | Ty::Chandle | Ty::Event | Ty::Class(_) => true,
+        Ty::Struct(s) => s.has_dynamic_or_handle,
+        Ty::Unpacked { dims, elem } => {
+            dims.iter()
+                .any(|d| matches!(d, Dim::Dynamic | Dim::Queue | Dim::Assoc))
+                || ty_has_dynamic_or_handle(elem)
+        }
+        _ => false,
+    }
+}
+
+fn ty_packed_bits(t: &Ty) -> Option<u64> {
+    match t {
+        Ty::Int { bits, .. } => *bits,
+        Ty::Enum { bits, .. } => *bits,
+        Ty::Struct(s) if s.packed => s.packed_bits,
+        Ty::Void => Some(0),
         _ => None,
     }
 }

@@ -4,8 +4,330 @@
 use super::*;
 use crate::ast::types::{IntegerVectorType, PackedDimension, TypeName};
 use crate::compiler::packed_assignment_pattern_plan::{
-    self, PackedPlan, PatternTypeResolver, SliceSrc,
+    self, CachedPackedPlan, CachedSliceSrc, PackedPlan, PatternTypeResolver, SliceSrc,
 };
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct PackedPlanCacheKey {
+    span_start: u32,
+    span_end: u32,
+    expr_fp_lo: u64,
+    expr_fp_hi: u64,
+    dt_fp_lo: u64,
+    dt_fp_hi: u64,
+    scope_hint: Option<Box<str>>,
+    class_scope: Option<Box<str>>,
+}
+
+#[derive(Clone, Copy)]
+struct DualFp(u64, u64);
+
+impl std::hash::Hasher for DualFp {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.u64(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.u64(v);
+    }
+}
+
+impl DualFp {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325, 0x517c_c1b7_2722_0a95)
+    }
+    #[inline]
+    fn u64(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(0x1000_0000_01b3);
+        self.1 = (self.1.rotate_left(13) ^ v.wrapping_add(0x9e37_79b9_7f4a_7c15))
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    #[inline]
+    fn disc<T>(&mut self, v: &T) {
+        use std::hash::Hash;
+        std::mem::discriminant(v).hash(self);
+    }
+    #[inline]
+    fn str(&mut self, s: &str) {
+        self.u64(s.len() as u64);
+        for chunk in s.as_bytes().chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.u64(u64::from_le_bytes(buf));
+        }
+    }
+    fn expr(&mut self, e: &Expression) {
+        self.u64(((e.span.start as u64) << 32) | (e.span.end as u64));
+        self.disc(&e.kind);
+        match &e.kind {
+            ExprKind::AssignmentPattern(items) => {
+                self.u64(items.len() as u64);
+                for it in items {
+                    self.disc(it);
+                    match it {
+                        AssignmentPatternItem::Ordered(x)
+                        | AssignmentPatternItem::Default(x) => self.expr(x),
+                        AssignmentPatternItem::Named(id, x) => {
+                            self.str(&id.name);
+                            self.expr(x);
+                        }
+                        AssignmentPatternItem::Keyed(k, x) => {
+                            self.expr(k);
+                            self.expr(x);
+                        }
+                        AssignmentPatternItem::Typed(t, x) => {
+                            self.dt(t);
+                            self.expr(x);
+                        }
+                    }
+                }
+            }
+            ExprKind::TypedPattern { ty, pattern } => {
+                self.dt(ty);
+                self.expr(pattern);
+            }
+            ExprKind::Paren(inner) => self.expr(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr(condition);
+                self.expr(then_expr);
+                self.expr(else_expr);
+            }
+            ExprKind::Ident(h) => {
+                self.u64(h.root.is_some() as u64);
+                for s in &h.path {
+                    self.str(&s.name.name);
+                    self.u64(s.selects.len() as u64);
+                }
+            }
+            ExprKind::Number(n) => {
+                self.disc(n);
+                match n {
+                    NumberLiteral::Integer {
+                        size,
+                        signed,
+                        base,
+                        value,
+                        ..
+                    } => {
+                        self.u64(size.unwrap_or(0) as u64);
+                        self.u64(*signed as u64);
+                        self.disc(base);
+                        self.str(value);
+                    }
+                    NumberLiteral::Real(r) | NumberLiteral::Time(r) => self.u64(r.to_bits()),
+                    NumberLiteral::UnbasedUnsized(c) => self.u64(*c as u64),
+                }
+            }
+            ExprKind::StringLiteral(s) => self.str(s),
+            ExprKind::TypeLiteral(dt) => self.dt(dt),
+            ExprKind::Unary { op, operand } => {
+                self.disc(op);
+                self.expr(operand);
+            }
+            ExprKind::Binary { op, left, right } => {
+                self.disc(op);
+                self.expr(left);
+                self.expr(right);
+            }
+            ExprKind::Concatenation(xs) => {
+                self.u64(xs.len() as u64);
+                for x in xs {
+                    self.expr(x);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.expr(count);
+                self.u64(exprs.len() as u64);
+                for x in exprs {
+                    self.expr(x);
+                }
+            }
+            ExprKind::Call { func, args } => {
+                self.expr(func);
+                self.u64(args.len() as u64);
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            ExprKind::SystemCall { name, args } => {
+                self.str(name);
+                self.u64(args.len() as u64);
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.expr(expr);
+                self.expr(index);
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                self.disc(kind);
+                self.expr(expr);
+                self.expr(left);
+                self.expr(right);
+            }
+            ExprKind::NamedArg { name, expr } => {
+                self.str(&name.name);
+                if let Some(x) = expr {
+                    self.expr(x);
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                self.expr(expr);
+                self.str(&member.name);
+            }
+            _ => {}
+        }
+    }
+    fn dt(&mut self, dt: &DataType) {
+        self.disc(dt);
+        match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                ..
+            } => {
+                self.disc(kind);
+                if let Some(s) = signing {
+                    self.disc(s);
+                }
+                self.dims(dimensions);
+            }
+            DataType::Implicit {
+                signing,
+                dimensions,
+                ..
+            } => {
+                if let Some(s) = signing {
+                    self.disc(s);
+                }
+                self.dims(dimensions);
+            }
+            DataType::IntegerAtom { kind, signing, .. } => {
+                self.disc(kind);
+                if let Some(s) = signing {
+                    self.disc(s);
+                }
+            }
+            DataType::Struct(su) => {
+                self.disc(&su.kind);
+                self.u64(u64::from(su.packed) | (u64::from(su.tagged) << 1) | (u64::from(su.soft) << 2));
+                if let Some(s) = &su.signing {
+                    self.disc(s);
+                }
+                self.dims(&su.dimensions);
+                self.u64(su.members.len() as u64);
+                for m in &su.members {
+                    self.dt(&m.data_type);
+                    for d in &m.declarators {
+                        self.str(&d.name.name);
+                        self.u64(d.dimensions.len() as u64);
+                    }
+                }
+            }
+            DataType::Enum(e) => {
+                self.dims(&e.dimensions);
+                self.u64(e.members.len() as u64);
+                if let Some(bt) = &e.base_type {
+                    self.dt(bt);
+                }
+            }
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } => {
+                for s in &name.scopes {
+                    self.str(&s.name.name);
+                }
+                self.str(&name.name.name);
+                self.dims(dimensions);
+                self.u64(type_args.len() as u64);
+            }
+            DataType::Simple { kind, .. } => {
+                self.disc(kind);
+            }
+            _ => {}
+        }
+    }
+    fn dims(&mut self, dims: &[PackedDimension]) {
+        self.u64(dims.len() as u64);
+        for d in dims {
+            self.disc(d);
+            if let PackedDimension::Range { left, right, .. } = d {
+                self.expr(left);
+                self.expr(right);
+            }
+        }
+    }
+}
+
+struct PlanBuildResolver<'a> {
+    sim: &'a mut Simulator,
+    dynamic: bool,
+}
+
+impl PatternTypeResolver for PlanBuildResolver<'_> {
+    fn typedef_target(&mut self, name: &TypeName) -> Option<DataType> {
+        let (dt, used_param) = self.sim.pattern_typedef_target_tracked(name);
+        if used_param {
+            self.dynamic = true;
+        }
+        dt
+    }
+
+    fn const_i64(&mut self, e: &Expression) -> Option<i64> {
+        if let Some(v) =
+            super::elaborate::const_eval_i64_with_params(e, Some(&self.sim.module.parameters))
+        {
+            return Some(v);
+        }
+        self.dynamic = true;
+        self.sim.eval_expr(e).to_i64()
+    }
+
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
+        super::elaborate::const_eval_typed_pattern_index(
+            e,
+            Some(&self.sim.module.parameters),
+            bounds,
+        )
+        .or_else(|| self.const_i64(e))
+    }
+
+    fn is_type_name(&mut self, name: &str) -> bool {
+        self.sim.resolve_type_key_name(name).is_some()
+    }
+
+    fn specialized_type_key(&mut self, e: &Expression) -> Option<DataType> {
+        self.dynamic = true;
+        self.sim.resolve_specialized_class_typedef_expr(e)
+    }
+
+    fn expr_type(&mut self, e: &Expression) -> Option<DataType> {
+        self.sim.expr_type(e)
+    }
+}
 
 impl PatternTypeResolver for Simulator {
     fn typedef_target(&mut self, name: &TypeName) -> Option<DataType> {
@@ -113,17 +435,82 @@ impl Simulator {
         if !has_pattern(e) {
             return None;
         }
-        let plan = packed_assignment_pattern_plan::packed_plan(e, dt, self)?;
-        if plan.uncovered
-            && self
-                .warned_uncovered_patterns
-                .insert((e.span.start as usize, e.span.end as usize))
-        {
-            eprintln!(
-                "[xezim][warning] assignment pattern leaves an element or member uncovered; \
-                 it is set to 0 (IEEE 1800-2023 §10.9.1, §10.9.2)"
-            );
+        let warn_uncovered = |sim: &mut Simulator, e: &Expression, uncovered: bool| {
+            if uncovered
+                && sim
+                    .warned_uncovered_patterns
+                    .insert((e.span.start as usize, e.span.end as usize))
+            {
+                eprintln!(
+                    "[xezim][warning] assignment pattern leaves an element or member uncovered; \
+                     it is set to 0 (IEEE 1800-2023 §10.9.1, §10.9.2)"
+                );
+            }
+        };
+        if e.span.start < e.span.end {
+            if self.packed_plan_cache_gen != self.type_tables_gen {
+                self.packed_plan_cache.clear();
+                self.packed_plan_cache_gen = self.type_tables_gen;
+            }
+            let mut efp = DualFp::new();
+            efp.expr(e);
+            let mut dfp = DualFp::new();
+            dfp.dt(dt);
+            let scope_hint = self
+                .name_resolve_hint
+                .borrow()
+                .as_deref()
+                .map(Box::<str>::from);
+            let class_scope = self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_deref())
+                .map(Box::<str>::from);
+            let key = PackedPlanCacheKey {
+                span_start: e.span.start,
+                span_end: e.span.end,
+                expr_fp_lo: efp.0,
+                expr_fp_hi: efp.1,
+                dt_fp_lo: dfp.0,
+                dt_fp_hi: dfp.1,
+                scope_hint,
+                class_scope,
+            };
+            if let Some(hit) = self.packed_plan_cache.get(&key).cloned() {
+                let plan = hit?;
+                warn_uncovered(self, e, plan.uncovered);
+                return Some(self.exec_cached_packed_plan(&plan));
+            }
+            let mut resolver = PlanBuildResolver {
+                sim: self,
+                dynamic: false,
+            };
+            let built = packed_assignment_pattern_plan::packed_plan(e, dt, &mut resolver);
+            let is_dynamic = resolver.dynamic;
+            if let Some(plan) = built {
+                let uncovered = plan.uncovered;
+                let cached_arc = (!is_dynamic).then(|| std::sync::Arc::new(plan.to_owned_plan()));
+                let val = self.exec_packed_assignment_pattern_plan(&plan);
+                if let Some(arc) = cached_arc {
+                    if self.packed_plan_cache.len() >= 4096 {
+                        self.packed_plan_cache.clear();
+                    }
+                    self.packed_plan_cache.insert(key, Some(arc));
+                }
+                warn_uncovered(self, e, uncovered);
+                return Some(val);
+            }
+            if !is_dynamic {
+                if self.packed_plan_cache.len() >= 4096 {
+                    self.packed_plan_cache.clear();
+                }
+                self.packed_plan_cache.insert(key, None);
+            }
+            return None;
         }
+        let plan = packed_assignment_pattern_plan::packed_plan(e, dt, self)?;
+        let uncovered = plan.uncovered;
+        warn_uncovered(self, e, uncovered);
         Some(self.exec_packed_assignment_pattern_plan(&plan))
     }
 
@@ -155,31 +542,26 @@ impl Simulator {
         }
     }
 
+    fn exec_slice_expr(&mut self, e: &Expression, width: u32, two_state: bool) -> Value {
+        let raw = self.eval_expr_ctx(e, width);
+        let v = self.fit_pattern_item_value(raw, width);
+        if two_state && v.has_xz() {
+            v.to_two_state()
+        } else {
+            v
+        }
+    }
+
     /// Run a plan: each slice takes its item as an assignment to the
     /// slice's type (§10.7, §6.12.2), over zeros.
     pub(super) fn exec_packed_assignment_pattern_plan(&mut self, plan: &PackedPlan<'_>) -> Value {
         let mut acc = Value::zero(plan.width);
         for s in &plan.slices {
             let v = match &s.src {
-                SliceSrc::Expr(e) => {
-                    let raw = self.eval_expr_ctx(e, s.width);
-                    let v = self.fit_pattern_item_value(raw, s.width);
-                    if s.two_state && v.has_xz() {
-                        v.to_two_state()
-                    } else {
-                        v
-                    }
-                }
+                SliceSrc::Expr(e) => self.exec_slice_expr(e, s.width, s.two_state),
                 SliceSrc::Const(v) => v.clone(),
                 SliceSrc::Repeat { expr, elem, count } => {
-                    let raw = self.eval_expr_ctx(expr, *elem);
-                    let v = self.fit_pattern_item_value(raw, *elem);
-                    let v = if s.two_state && v.has_xz() {
-                        v.to_two_state()
-                    } else {
-                        v
-                    };
-                    v.replicate(*count as usize)
+                    self.exec_slice_expr(expr, *elem, s.two_state).replicate(*count as usize)
                 }
                 SliceSrc::Cond { cond, then, els } => {
                     let c = self.eval_expr(cond);
@@ -200,10 +582,35 @@ impl Simulator {
         acc
     }
 
-    /// The target of a named packed type: a class-scope typedef first, then
-    /// the design's tables, then a bound type parameter. None for a typedef
-    /// with unpacked dimensions (§7.4).
-    fn pattern_typedef_target(&self, name: &TypeName) -> Option<DataType> {
+    pub(super) fn exec_cached_packed_plan(&mut self, plan: &CachedPackedPlan) -> Value {
+        let mut acc = Value::zero(plan.width);
+        for s in plan.slices.iter() {
+            let v = match &s.src {
+                CachedSliceSrc::Expr(e) => self.exec_slice_expr(e, s.width, s.two_state),
+                CachedSliceSrc::Const(v) => v.clone(),
+                CachedSliceSrc::Repeat { expr, elem, count } => {
+                    self.exec_slice_expr(expr, *elem, s.two_state).replicate(*count as usize)
+                }
+                CachedSliceSrc::Cond { cond, then, els } => {
+                    let c = self.eval_expr(cond);
+                    if c.has_unknown() {
+                        let t = self.exec_cached_packed_plan(then);
+                        let e = self.exec_cached_packed_plan(els);
+                        t.merge_unknown(&e)
+                    } else if c.is_true() {
+                        self.exec_cached_packed_plan(then)
+                    } else {
+                        self.exec_cached_packed_plan(els)
+                    }
+                }
+            };
+            acc.copy_bits_from(s.offset as usize, &v, 0, s.width as usize);
+        }
+        acc.is_signed = plan.signed;
+        acc
+    }
+
+    fn pattern_typedef_target_tracked(&self, name: &TypeName) -> (Option<DataType>, bool) {
         let unpacked = |key: &str| {
             self.typedef_unpacked_dims_of(key)
                 .is_some_and(|d| !d.is_empty())
@@ -211,22 +618,32 @@ impl Simulator {
         if name.has_scope()
             && let Some(dt) = super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)
         {
-            return (!unpacked(&name.qualified())).then(|| dt.clone());
+            return ((!unpacked(&name.qualified())).then(|| dt.clone()), false);
         }
         if unpacked(&name.name.name) {
-            return None;
+            return (None, false);
         }
         if let Some((scoped_key, dt)) = self.lookup_hint_scoped_typedef(&name.name.name) {
-            return (!unpacked(&scoped_key)).then_some(dt);
+            return ((!unpacked(&scoped_key)).then_some(dt), false);
         }
-        self.lookup_typedef_target(&name.name.name).or_else(|| {
-            let bound = self.resolve_type_param_binding(&name.name.name)?;
+        if let Some(dt) = self.lookup_typedef_target(&name.name.name) {
+            return (Some(dt), false);
+        }
+        let dt = self.resolve_type_param_binding(&name.name.name).and_then(|bound| {
             let bound = bound.trim();
             if unpacked(bound) {
                 return None;
             }
             self.resolve_type_binding_dt(bound)
-        })
+        });
+        (dt, true)
+    }
+
+    /// The target of a named packed type: a class-scope typedef first, then
+    /// the design's tables, then a bound type parameter. None for a typedef
+    /// with unpacked dimensions (§7.4).
+    fn pattern_typedef_target(&self, name: &TypeName) -> Option<DataType> {
+        self.pattern_typedef_target_tracked(name).0
     }
 
     /// Whether a pattern can take the return type `dt`: a packed vector
@@ -236,7 +653,7 @@ impl Simulator {
             DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
                 !dimensions.is_empty()
             }
-            DataType::Struct(su) => su.packed,
+            DataType::Struct(su) => su.packed || su.tagged,
             DataType::Enum(e) => !e.dimensions.is_empty(),
             DataType::TypeReference { .. } => true,
             _ => false,

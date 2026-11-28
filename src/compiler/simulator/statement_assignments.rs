@@ -87,12 +87,115 @@ impl Simulator {
     }
 
     /// Active tag of a tagged-union subject (§7.3.2), if it is one.
-    pub(super) fn subject_union_tag(&self, subject: &Expression) -> Option<String> {
-        if let ExprKind::Ident(h) = &subject.kind {
+    pub(super) fn subject_union_tag(&mut self, subject: &Expression) -> Option<String> {
+        if let Some((hint, _, su)) = self.tagged_union_dt_of_expr(subject) {
+            let v = if let Some(ref n) = hint {
+                self.get_local_or_signal(n)
+                    .unwrap_or_else(|| self.eval_expr(subject))
+            } else {
+                self.eval_expr(subject)
+            };
+            if let Some((_, tag, _, _)) = self.decode_tagged_union_val(&su, &v, hint.as_deref()) {
+                return Some(tag);
+            }
+        }
+        if let ExprKind::Ident(h) = &Self::unparen(subject).kind {
             let n = self.resolve_hier_name(h);
             return self.active_union_tag.get(&*n).cloned();
         }
         None
+    }
+
+    fn match_pattern_val(
+        &mut self,
+        val: &Value,
+        dt: Option<&DataType>,
+        pat: &Pattern,
+        binds: &mut Vec<(String, Value)>,
+        storage_hint: Option<&str>,
+    ) -> bool {
+        match pat {
+            Pattern::Wildcard => true,
+            Pattern::Binding(id) => {
+                binds.push((id.name.clone(), val.clone()));
+                true
+            }
+            Pattern::Expr(e) => {
+                let rhs = self.eval_expr(e);
+                let tw = val.width.max(rhs.width).max(1);
+                let a = val.resize(tw);
+                let b = rhs.resize(tw);
+                a.case_eq(&b).is_true()
+            }
+            Pattern::Tagged { tag, inner } => {
+                let Some(su) = dt.and_then(|d| self.resolve_tagged_su(d)) else {
+                    return false;
+                };
+                let Some((_, active_tag, mw, mdt)) =
+                    self.decode_tagged_union_val(&su, val, storage_hint)
+                else {
+                    return false;
+                };
+                if active_tag != tag.name {
+                    return false;
+                }
+                match inner {
+                    None => true,
+                    Some(ip) => {
+                        let mv = self.extract_tagged_member_value(val, mw, &mdt, storage_hint);
+                        self.match_pattern_val(&mv, Some(&mdt), ip, binds, None)
+                    }
+                }
+            }
+            Pattern::Struct(members) => {
+                let Some(dt) = dt else {
+                    return false;
+                };
+                let DataType::Struct(su) = self.resolve_dt(dt) else {
+                    return false;
+                };
+                // Collect member (name, offset, width, dt) MSB-first matching how the
+                // struct payload was packed into `val`.
+                let mut raw: Vec<(String, u32, DataType)> = Vec::new();
+                for m in &su.members {
+                    let mw = super::elaborate::resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    for d in &m.declarators {
+                        raw.push((d.name.name.clone(), mw, m.data_type.clone()));
+                    }
+                }
+                let mut fields: Vec<(String, u32, u32, DataType)> = Vec::with_capacity(raw.len());
+                let mut off = 0u32;
+                for (mn, mw, mdt) in raw.into_iter().rev() {
+                    fields.push((mn, off, mw, mdt));
+                    off += mw;
+                }
+                fields.reverse();
+                for (i, (name, sub)) in members.iter().enumerate() {
+                    let target = match name {
+                        Some(id) => fields.iter().find(|(n, _, _, _)| *n == id.name),
+                        None => fields.get(i),
+                    };
+                    let Some((_, foff, fw, fdt)) = target else {
+                        return false;
+                    };
+                    let mut fv = if *fw > 0 {
+                        val.range_select((*foff + *fw - 1) as usize, *foff as usize)
+                    } else {
+                        Value::zero(1)
+                    };
+                    fv.is_signed =
+                        super::elaborate::is_type_signed_resolved(fdt, &self.module.typedef_types);
+                    if !self.match_pattern_val(&fv, Some(fdt), sub, binds, None) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Test a §12.6 pattern against `subject`, collecting `.v` bindings.
@@ -110,10 +213,32 @@ impl Simulator {
                 true
             }
             Pattern::Tagged { tag, inner } => {
-                // Subject must be a tagged union currently holding this member.
+                if let Some((hint, _, su)) = self.tagged_union_dt_of_expr(subject) {
+                    let v = if let Some(ref n) = hint {
+                        self.get_local_or_signal(n)
+                            .unwrap_or_else(|| self.eval_expr(subject))
+                    } else {
+                        self.eval_expr(subject)
+                    };
+                    let Some((_, active_tag, mw, mdt)) =
+                        self.decode_tagged_union_val(&su, &v, hint.as_deref())
+                    else {
+                        return false;
+                    };
+                    if active_tag != tag.name {
+                        return false;
+                    }
+                    return match inner {
+                        None => true,
+                        Some(ip) => {
+                            let mv =
+                                self.extract_tagged_member_value(&v, mw, &mdt, hint.as_deref());
+                            self.match_pattern_val(&mv, Some(&mdt), ip, binds, None)
+                        }
+                    };
+                }
                 match self.subject_union_tag(subject) {
                     Some(cur) if cur == tag.name => match inner {
-                        // The union's stored value IS the member payload.
                         Some(ip) => self.match_pattern(subject, ip, binds),
                         None => true,
                     },
@@ -123,7 +248,8 @@ impl Simulator {
             Pattern::Expr(e) => {
                 let a = self.eval_expr(subject);
                 let b = self.eval_expr(e);
-                a.case_eq(&b).is_true()
+                let tw = a.width.max(b.width).max(1);
+                a.resize(tw).case_eq(&b.resize(tw)).is_true()
             }
             // §12.6 structure pattern `'{a: .x, b: 3}`: members bind by name
             // when named, positionally otherwise.
@@ -1941,8 +2067,36 @@ impl Simulator {
         // stale `Invalid` and raised a spurious run-time error. Ahead of the
         // simple-assign fast path, which is where `b = a` stores and returns;
         // a design without tagged unions pays the one `is_empty` test.
-        if !self.active_union_tag.is_empty() && !matches!(rvalue.kind, ExprKind::Tagged { .. }) {
-            if let ExprKind::Ident(lh) = &lvalue.kind {
+        if (!self.active_union_tag.is_empty() || !self.tagged_union_strings.is_empty())
+            && !matches!(rvalue.kind, ExprKind::Tagged { .. })
+        {
+            if let Some((Some(lname), _, _)) = self.tagged_union_dt_of_expr(lvalue) {
+                let rname = self
+                    .tagged_union_dt_of_expr(rvalue)
+                    .and_then(|(n, _, _)| n);
+                let src_tag = rname
+                    .as_deref()
+                    .and_then(|rn| self.active_union_tag.get(rn).cloned());
+                match src_tag {
+                    Some(tag) => {
+                        self.active_union_tag.insert(lname.clone(), tag);
+                    }
+                    None => {
+                        self.active_union_tag.remove(&lname);
+                    }
+                }
+                let src_str = rname
+                    .as_deref()
+                    .and_then(|rn| self.tagged_union_strings.get(rn).cloned());
+                match src_str {
+                    Some(s) => {
+                        self.tagged_union_strings.insert(lname, s);
+                    }
+                    None => {
+                        self.tagged_union_strings.remove(&lname);
+                    }
+                }
+            } else if let ExprKind::Ident(lh) = &lvalue.kind {
                 if lh.path.len() == 1 && lh.path[0].selects.is_empty() {
                     let lname = self.resolve_hier_name(lh);
                     let src_tag = match &rvalue.kind {
@@ -3298,39 +3452,36 @@ impl Simulator {
                 }
             }
         }
-        // Tagged union assignment: un = tagged Name (inner);
+        // Tagged union assignment: `un = tagged Name (inner);` or `un = cond ? tagged ... : tagged ...;`
+        if let Some((lname_opt, _, su)) = self.tagged_union_dt_of_expr(lvalue)
+            && let Some((tag_name, v, str_payload)) = self.eval_tagged_rhs(&su, rvalue)
+        {
+            if let Some(lname) = lname_opt {
+                self.active_union_tag.insert(lname.clone(), tag_name);
+                match str_payload {
+                    Some(s) => {
+                        self.tagged_union_strings.insert(lname, s);
+                    }
+                    None => {
+                        self.tagged_union_strings.remove(&lname);
+                    }
+                }
+            }
+            self.assign_value(lvalue, &v);
+            self.settle_after_proc_write();
+            return;
+        }
         if let ExprKind::Tagged { tag, inner } = &rvalue.kind {
             if let ExprKind::Ident(lh) = &lvalue.kind {
                 let lname = self.resolve_hier_name(lh);
-                // §7.3.2: the pattern literal `tagged '{ member: value }`
-                // carries no member name between `tagged` and `'{` — the
-                // tag IS the first named item of the pattern. Without it
-                // `active_union_tag` stays empty and every later
-                // `u.member` read (tagged_union_member) returns x.
-                let tag_name = if tag.name.is_empty() {
-                    inner.as_ref().map_or(String::new(), |ie| {
-                        if let ExprKind::AssignmentPattern(items) = &ie.kind {
-                            items
-                                .iter()
-                                .find_map(|it| match it {
-                                    AssignmentPatternItem::Named(id, _) => Some(id.name.clone()),
-                                    _ => None,
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    })
-                } else {
-                    tag.name.clone()
-                };
+                let (tag_name, inner_expr) = Self::extract_tag_and_inner(tag, inner);
                 self.active_union_tag.insert(lname.to_string(), tag_name);
-                if let Some(inner_expr) = inner {
+                if let Some(inner_expr) = inner_expr {
                     let v = self.eval_expr(inner_expr);
-                    self.set_signal_value_by_name(&lname, v);
+                    self.set_local_or_signal(&lname, v);
                 } else {
                     let w = self.lookup_signal_width(&lname).unwrap_or(1);
-                    self.set_signal_value_by_name(&lname, Value::zero(w));
+                    self.set_local_or_signal(&lname, Value::zero(w));
                 }
                 self.settle_after_proc_write();
                 return;

@@ -415,7 +415,19 @@ impl Simulator {
         if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
             return v;
         }
-        // §7.3.2 tagged-union member read (`t.Valid`).
+        // §7.3.2 tagged-union member read (`t.Valid`, `arr[i].Val`, `ip.Jmp.JmpC.addr`).
+        {
+            let full = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: expr.clone(),
+                    member: member.clone(),
+                },
+                member.span,
+            );
+            if let Some(v) = self.read_tagged_union_member_chain(&full) {
+                return v;
+            }
+        }
         if let ExprKind::Ident(h) = &expr.kind {
             if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name) {
                 let (base, m) = (h.path[0].name.name.clone(), member.name.clone());
@@ -694,6 +706,18 @@ impl Simulator {
                             });
                             if mreal {
                                 v.is_real = true;
+                            }
+                            if v.has_xz()
+                                && !self.mixed_packed_vars.is_empty()
+                                && let Some(flat) = self.flat_member_name(expr)
+                                && let Some((root, prefix)) = flat.split_once('.')
+                            {
+                                let field = format!("{prefix}.{}", member.name);
+                                if self.packed_member_two_state(root, &field) {
+                                    let signed = v.is_signed;
+                                    v = v.to_two_state();
+                                    v.is_signed = signed;
+                                }
                             }
                             return v;
                         }
@@ -985,8 +1009,20 @@ impl Simulator {
                                         .map(|&(_, o, w)| (o, w))
                                 })
                             {
-                                return struct_val
+                                let mut out = struct_val
                                     .range_select((off + w - 1) as usize, off as usize);
+                                if self.struct_member_signed(base_name, &member.name) {
+                                    out.is_signed = true;
+                                }
+                                if out.has_xz()
+                                    && !self.mixed_packed_vars.is_empty()
+                                    && self.packed_member_two_state(base_name, &member.name)
+                                {
+                                    let signed = out.is_signed;
+                                    out = out.to_two_state();
+                                    out.is_signed = signed;
+                                }
+                                return out;
                             }
                         }
                     }

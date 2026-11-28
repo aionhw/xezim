@@ -77,9 +77,7 @@ impl Simulator {
                     return false;
                 };
                 let rhs = val.resize_for_assign(width as u32);
-                for bit in 0..width as usize {
-                    cur.set_bit(lo as usize + bit, rhs.get_bit(bit));
-                }
+                cur.copy_bits_from(lo as usize, &rhs, 0, width as usize);
                 return self.set_prop_if_changed(h, prop, cur);
             }
         }
@@ -220,11 +218,7 @@ impl Simulator {
                                     return false;
                                 };
                                 if lo + (elem_w as usize) <= cur.width as usize {
-                                    let prev = cur.clone();
-                                    for i in 0..(elem_w as usize) {
-                                        cur.set_bit(lo + i, piece.get_bit(i));
-                                    }
-                                    let changed = cur != prev;
+                                    let changed = cur.copy_bits_from(lo, &piece, 0, elem_w as usize);
                                     if changed {
                                         self.set_local_or_signal(&key, cur);
                                     }
@@ -1309,11 +1303,8 @@ impl Simulator {
                             Self::packed_chain_slice(cur.width as u64, &dims, &idx)
                         {
                             let piece = val.resize_for_assign(w as u32);
-                            let mut nv = cur.clone();
-                            for i in 0..(w as usize) {
-                                nv.set_bit(lsb as usize + i, piece.get_bit(i));
-                            }
-                            let changed = nv != cur;
+                            let mut nv = cur;
+                            let changed = nv.copy_bits_from(lsb as usize, &piece, 0, w as usize);
                             if changed {
                                 if let Some(Some(inst)) = self.heap.get_mut(h) {
                                     inst.properties.insert(prop, nv);
@@ -1567,11 +1558,14 @@ impl Simulator {
                         return false;
                     };
                     if lo + (elem_w as usize) <= total_w as usize {
-                        let prev = cur.clone();
-                        for i in 0..(elem_w as usize) {
-                            cur.set_bit(lo + i, piece.get_bit(i));
-                        }
-                        let changed = cur != prev;
+                        let changed = if let Some(c) = self.splice_signal_bits(id, lo, &piece) {
+                            if c {
+                                self.mark_dirty(&pkey);
+                            }
+                            return c;
+                        } else {
+                            cur.copy_bits_from(lo, &piece, 0, elem_w as usize)
+                        };
                         if changed {
                             self.signal_table[id] = cur;
                             self.sync_mirror(id);
@@ -1603,11 +1597,7 @@ impl Simulator {
                                 return false;
                             };
                             if lo + (elem_w as usize) <= cur.width as usize {
-                                let prev = cur.clone();
-                                for i in 0..(elem_w as usize) {
-                                    cur.set_bit(lo + i, piece.get_bit(i));
-                                }
-                                let changed = cur != prev;
+                                let changed = cur.copy_bits_from(lo, &piece, 0, elem_w as usize);
                                 if changed {
                                     self.set_signal_value_by_name(&key, cur);
                                 }
@@ -1640,11 +1630,16 @@ impl Simulator {
                                     let piece = val.resize_for_assign(elem_w);
                                     let lo = (field_off as usize) + idx * (elem_w as usize);
                                     if lo + (elem_w as usize) <= total_w as usize {
-                                        let prev = cur.clone();
-                                        for i in 0..(elem_w as usize) {
-                                            cur.set_bit(lo + i, piece.get_bit(i));
-                                        }
-                                        let changed = cur != prev;
+                                        let changed = if let Some(c) =
+                                            self.splice_signal_bits(sid, lo, &piece)
+                                        {
+                                            if c {
+                                                self.mark_dirty(struct_var);
+                                            }
+                                            return c;
+                                        } else {
+                                            cur.copy_bits_from(lo, &piece, 0, elem_w as usize)
+                                        };
                                         if changed {
                                             self.signal_table[sid] = cur;
                                             self.sync_mirror(sid);

@@ -152,12 +152,81 @@ pub(crate) struct PackedPlan<'a> {
     pub uncovered: bool,
 }
 
+/// Owned, cacheable form of [`SliceSrc`].
+#[derive(Clone)]
+pub(crate) enum CachedSliceSrc {
+    Expr(Expression),
+    Const(Value),
+    Repeat {
+        expr: Expression,
+        elem: u32,
+        count: u32,
+    },
+    Cond {
+        cond: Expression,
+        then: Box<CachedPackedPlan>,
+        els: Box<CachedPackedPlan>,
+    },
+}
+
+/// Owned, cacheable form of [`Slice`].
+#[derive(Clone)]
+pub(crate) struct CachedSlice {
+    pub offset: u32,
+    pub width: u32,
+    pub two_state: bool,
+    pub src: CachedSliceSrc,
+}
+
+/// Owned, cacheable form of [`PackedPlan`].
+#[derive(Clone)]
+pub(crate) struct CachedPackedPlan {
+    pub width: u32,
+    pub signed: bool,
+    pub slices: Box<[CachedSlice]>,
+    pub uncovered: bool,
+}
+
 impl PackedPlan<'_> {
     /// Whether no two slices overlap.
     pub fn disjoint(&self) -> bool {
         let mut spans: Vec<(u32, u32)> = self.slices.iter().map(|s| (s.offset, s.width)).collect();
         spans.sort_unstable();
         spans.windows(2).all(|p| p[0].0 + p[0].1 <= p[1].0)
+    }
+
+    /// Clone into a self-contained cached plan.
+    pub fn to_owned_plan(&self) -> CachedPackedPlan {
+        let slices = self
+            .slices
+            .iter()
+            .map(|s| CachedSlice {
+                offset: s.offset,
+                width: s.width,
+                two_state: s.two_state,
+                src: match &s.src {
+                    SliceSrc::Expr(e) => CachedSliceSrc::Expr((*e).clone()),
+                    SliceSrc::Const(v) => CachedSliceSrc::Const(v.clone()),
+                    SliceSrc::Repeat { expr, elem, count } => CachedSliceSrc::Repeat {
+                        expr: (*expr).clone(),
+                        elem: *elem,
+                        count: *count,
+                    },
+                    SliceSrc::Cond { cond, then, els } => CachedSliceSrc::Cond {
+                        cond: (*cond).clone(),
+                        then: Box::new(then.to_owned_plan()),
+                        els: Box::new(els.to_owned_plan()),
+                    },
+                },
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        CachedPackedPlan {
+            width: self.width,
+            signed: self.signed,
+            slices,
+            uncovered: self.uncovered,
+        }
     }
 }
 
@@ -467,8 +536,8 @@ pub(crate) fn packed_width(ty: &DataType, r: &mut dyn PatternTypeResolver) -> Op
 /// The packed struct at `prefix` of a flat `(path, offset, width)` layout.
 /// A leaf member is a `logic` vector with the packed dimensions `dims` gives
 /// for its path; overlapping members make a union.
-pub(crate) fn layout_struct_type(
-    layout: &[(String, u32, u32)],
+pub(crate) fn layout_struct_type<S: AsRef<str>>(
+    layout: &[(S, u32, u32)],
     prefix: &str,
     dims: &dyn Fn(&str) -> Option<Vec<(i64, i64)>>,
 ) -> Option<DataType> {
@@ -481,7 +550,7 @@ pub(crate) fn layout_struct_type(
     let mut kids: Vec<(&str, u32, u32)> = layout
         .iter()
         .filter_map(|(k, o, w)| {
-            let leaf = k.strip_prefix(&pfx)?;
+            let leaf = k.as_ref().strip_prefix(&pfx)?;
             (!leaf.is_empty() && !leaf.contains(['.', '['])).then_some((leaf, *o, *w))
         })
         .collect();

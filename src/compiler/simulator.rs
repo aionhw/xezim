@@ -1436,8 +1436,8 @@ pub struct Simulator {
     /// §7.2.1: variables of a 4-state packed struct type with 2-state
     /// members (`struct packed {bit [3:0] b; logic [3:0] l;}`). Such a
     /// member converts x/z to 0 on every read and write, which the compiled
-    /// member slices do not do, so their field layouts are withheld from the
-    /// bytecode compiler (`bc_packed_fields`) and the interpreter serves them.
+    /// member slices do not do, so their field layouts are marked `is_mixed`
+    /// in `packed_struct_layouts` and skipped by the bytecode compiler.
     mixed_packed_vars: HashSet<String>,
     /// §8.9: the storage object of each STATIC unpacked-struct property,
     /// keyed by its static key (`Cls::prop`): a heap object of the declaring
@@ -1447,9 +1447,15 @@ pub struct Simulator {
     /// Names of the static unpacked-struct properties any class declares
     /// (gates the `static_struct_holders` lookups).
     static_struct_names: HashSet<String>,
-    /// `module.packed_struct_fields` without the `mixed_packed_vars` entries;
-    /// `None` when there are none.
-    bc_packed_fields: Option<xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
+    /// Interned per-variable packed-struct layouts (O(1) field lookup +
+    /// precomputed 2-state bitmask for mixed structs), shared across
+    /// identical struct shapes without cloning `packed_struct_fields`.
+    #[serde(skip)]
+    packed_struct_layouts: HashMap<String, std::sync::Arc<super::struct_layout::StructLayout>>,
+    /// Precomputed 2-state field sets for dynamic/frame-local mixed packed
+    /// variables (subroutine locals and formals), avoiding repeated AST walks.
+    #[serde(skip)]
+    mixed_local_two_state: HashMap<String, std::sync::Arc<HashSet<String>>>,
     pub monitor_prev: HashMap<String, Value>,
     /// Previously-printed values of the active `$monitor`'s non-`$time`
     /// arguments. `$monitor` re-prints only when one of these changes
@@ -1475,6 +1481,8 @@ pub struct Simulator {
     monitor_m_active: bool,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
+    /// String payload for a tagged union whose active member is a `string`.
+    pub tagged_union_strings: HashMap<String, String>,
     pub max_time: u64,
     /// Seconds per simulation tick (finest timescale precision; 1e-9 default).
     pub tick_s: f64,
@@ -2927,6 +2935,15 @@ pub struct Simulator {
     /// Assignment patterns already warned about an uncovered member.
     #[serde(skip)]
     warned_uncovered_patterns: HashSet<(usize, usize)>,
+    /// Cached slice plans for packed assignment patterns, invalidated when
+    /// `type_tables_gen` advances.
+    #[serde(skip)]
+    packed_plan_cache: HashMap<
+        packed_assignment_patterns::PackedPlanCacheKey,
+        Option<std::sync::Arc<super::packed_assignment_pattern_plan::CachedPackedPlan>>,
+    >,
+    #[serde(skip)]
+    packed_plan_cache_gen: u64,
     /// Names the storage of each typed pattern value held at once.
     #[serde(skip)]
     typed_pattern_seq: u64,

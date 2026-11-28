@@ -579,10 +579,7 @@ impl Simulator {
                     let name = dotted
                         .strip_prefix(&format!("{}.", self.module.name))
                         .unwrap_or(&dotted);
-                    if let Some((base, off, width)) = self.packed_leaf_of_hier(name)
-                        && let Some(cur) = self.get_signal_value_by_name(&base)
-                    {
-                        let mut next = cur.clone();
+                    if let Some((base, off, width)) = self.packed_leaf_of_hier(name) {
                         // §7.3: a real union member stores real bits.
                         let real_member = width == 64
                             && !val.is_real
@@ -590,19 +587,24 @@ impl Simulator {
                                 .strip_prefix(&format!("{base}."))
                                 .is_some_and(|f| self.union_real_member(&base, f));
                         let fitted = if real_member {
-                            Value::from_f64(val.to_f64())
+                            Value::from_u64(val.to_f64().to_bits(), 64)
                         } else {
                             val.resize_for_assign(width)
                         };
                         let rhs = self.packed_member_piece(&base, name, fitted);
-                        for bit in 0..width as usize {
-                            next.set_bit(off as usize + bit, rhs.get_bit(bit));
+                        if !self.warn_x
+                            && let Some(&id) = self.signal_name_to_id.get(base.as_str())
+                            && let Some(changed) = self.splice_signal_bits(id, off as usize, &rhs)
+                        {
+                            return changed;
                         }
-                        if next == cur {
-                            return false;
+                        if let Some(mut next) = self.get_signal_value_by_name(&base) {
+                            if !next.copy_bits_from(off as usize, &rhs, 0, width as usize) {
+                                return false;
+                            }
+                            self.set_signal_value_by_name(&base, next);
+                            return true;
                         }
-                        self.set_signal_value_by_name(&base, next);
-                        return true;
                     }
                 }
                 // LRM §25.9: virtual-interface alias (task/function
@@ -985,7 +987,15 @@ impl Simulator {
                             if let Some(cur_sig) = self.get_local_or_signal(obj_name) {
                                 let total_w = cur_sig.width;
                                 let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize_for_assign(w);
+                                let mut piece = val.resize_for_assign(w);
+                                if piece.has_xz()
+                                    && !self.mixed_packed_vars.is_empty()
+                                    && self.packed_member_two_state(obj_name, &sub)
+                                {
+                                    let signed = piece.is_signed;
+                                    piece = piece.to_two_state();
+                                    piece.is_signed = signed;
+                                }
                                 cur.copy_bits_from(off as usize, &piece, 0, w as usize);
                                 let prev = self.get_local_or_signal(obj_name);
                                 let changed = prev.as_ref() != Some(&cur);
@@ -1158,18 +1168,19 @@ impl Simulator {
                 // name parses as one hierarchical ident, so the root-keyed field
                 // lookups above never matched it.
                 if let Some((base, off, w)) = self.packed_leaf_of_hier(&name) {
-                    if let Some(cur) = self.get_signal_value_by_name(&base) {
-                        let mut next = cur.clone();
-                        let mut piece = val.resize_for_assign(w);
-                        if !self.mixed_packed_vars.is_empty() {
-                            piece = self.packed_member_piece(&base, &name, piece);
-                        }
-                        for i in 0..w {
-                            next.set_bit((off + i) as usize, piece.get_bit(i as usize));
-                        }
-                        let changed = next != cur;
+                    let mut piece = val.resize_for_assign(w);
+                    if !self.mixed_packed_vars.is_empty() {
+                        piece = self.packed_member_piece(&base, &name, piece);
+                    }
+                    if let Some(&id) = self.signal_name_to_id.get(base.as_str())
+                        && let Some(changed) = self.splice_signal_bits(id, off as usize, &piece)
+                    {
+                        return changed;
+                    }
+                    if let Some(mut cur) = self.get_signal_value_by_name(&base) {
+                        let changed = cur.copy_bits_from(off as usize, &piece, 0, w as usize);
                         if changed {
-                            self.set_signal_value_by_name(&base, next);
+                            self.set_signal_value_by_name(&base, cur);
                         }
                         return changed;
                     }

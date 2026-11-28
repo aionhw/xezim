@@ -541,13 +541,11 @@ impl Simulator {
     }
 
     /// Whether an aggregate keeps each member in its OWN signal, so an
-    /// assignment pattern must be spread across them. An unpacked struct is one
-    /// signal; so is an untagged union — one storage shared by every member
-    /// (§7.3) — and both take the packed-value path instead.
+    /// assignment pattern must be spread across them. A packed struct is one
+    /// signal; so is any union — one storage shared by every member (untagged
+    /// §7.3, tagged §7.3.2) — and both take single-signal storage instead.
     pub(super) fn spreads_member_wise(su: &crate::ast::types::StructUnionType) -> bool {
-        let untagged_union =
-            matches!(su.kind, crate::ast::types::StructUnionKind::Union) && !su.tagged;
-        !su.packed && !untagged_union
+        !su.packed && !matches!(su.kind, crate::ast::types::StructUnionKind::Union)
     }
 
     /// Assign `e` to the flattened target `target` of declared type `dt`. When
@@ -1916,16 +1914,17 @@ impl Simulator {
             }
             let fixed_1d = self.module.arrays.get(&vname).copied();
             let fixed_2d = self.module.arrays_2d.get(&vname).copied();
-            if fixed_1d.is_some() || fixed_2d.is_some() {
+            let fixed_nd = self.module.arrays_nd.get(&vname).cloned();
+            if fixed_1d.is_some() || fixed_2d.is_some() || fixed_nd.is_some() {
                 let su = match self.resolve_dt(&dt) {
                     DataType::Struct(su) if Self::spreads_member_wise(&su) => su,
                     _ => continue,
                 };
-                let elems: Vec<String> = match (fixed_1d, fixed_2d) {
-                    (Some((lo, hi, _)), _) if hi >= lo && hi - lo < 1 << 16 => {
+                let elems: Vec<String> = match (fixed_1d, fixed_2d, fixed_nd) {
+                    (Some((lo, hi, _)), _, _) if hi >= lo && hi - lo < 1 << 16 => {
                         (lo..=hi).map(|i| format!("{}[{}]", vname, i)).collect()
                     }
-                    (None, Some(((l0, h0), (l1, h1), _)))
+                    (None, Some(((l0, h0), (l1, h1), _)), _)
                         if h0 >= l0 && h1 >= l1 && (h0 - l0 + 1) * (h1 - l1 + 1) <= 1 << 16 =>
                     {
                         (l0..=h0)
@@ -1933,13 +1932,41 @@ impl Simulator {
                             .map(|(i, j)| format!("{}[{}][{}]", vname, i, j))
                             .collect()
                     }
+                    (None, None, Some((shape, _))) => {
+                        let count = shape.iter().try_fold(1usize, |n, &(l, r)| {
+                            n.checked_mul(l.abs_diff(r) as usize + 1)
+                        });
+                        if count.is_some_and(|n| n <= (1 << 16)) {
+                            let lists: Vec<Vec<i64>> = shape
+                                .iter()
+                                .map(|&(l, r)| (l.min(r)..=l.max(r)).collect())
+                                .collect();
+                            let mut tuples: Vec<Vec<i64>> = vec![Vec::new()];
+                            for list in &lists {
+                                let mut next = Vec::with_capacity(tuples.len() * list.len());
+                                for t in &tuples {
+                                    for &idx in list {
+                                        let mut t2 = t.clone();
+                                        t2.push(idx);
+                                        next.push(t2);
+                                    }
+                                }
+                                tuples = next;
+                            }
+                            tuples
+                                .into_iter()
+                                .map(|t| format!("{}{}", vname, Self::index_suffix(&t)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    }
                     _ => Vec::new(),
                 };
                 for e in elems {
                     self.zero_two_state_members(&e, &su);
                     // §7.2.2: each element starts with its members' declared
-                    // defaults, as a scalar variable of the type does (the
-                    // elaborator writes those as initial assignments).
+                    // defaults, as a scalar variable of the type does.
                     self.apply_struct_member_defaults(&e, &su, 0);
                 }
                 continue;
@@ -1963,42 +1990,149 @@ impl Simulator {
                 let cur = self.get_signal_value_by_name(&vname);
                 if let (Some(fields), Some(mut cur)) = (fields, cur) {
                     let mut ts: HashSet<String> = HashSet::default();
-                    Self::collect_two_state_leaves(self, &su, "", &mut ts);
-                    let mut changed = false;
-                    for (fname, off, w) in &fields {
-                        if !ts.contains(fname) {
-                            continue;
+                    if matches!(su.kind, crate::ast::types::StructUnionKind::Union) && !su.tagged {
+                        // §7.3: an untagged union default-initializes from its
+                        // FIRST member only; later 2-state members must not
+                        // zero out a 4-state first member.
+                        if let Some(first_m) = su.members.first() {
+                            let first_only = crate::ast::types::StructUnionType {
+                                kind: su.kind,
+                                packed: su.packed,
+                                tagged: su.tagged,
+                                soft: su.soft,
+                                signing: su.signing,
+                                members: vec![first_m.clone()],
+                                dimensions: Vec::new(),
+                                span: su.span,
+                            };
+                            Self::collect_two_state_leaves(self, &first_only, "", &mut ts);
                         }
-                        for i in 0..*w {
-                            let idx = (*off + i) as usize;
-                            if idx < cur.width as usize
-                                && !matches!(cur.get_bit(idx), LogicBit::Zero | LogicBit::One)
-                            {
-                                cur.set_bit(idx, LogicBit::Zero);
-                                changed = true;
-                            }
-                        }
+                    } else {
+                        Self::collect_two_state_leaves(self, &su, "", &mut ts);
                     }
+                    let changed = if let Some(mask) =
+                        crate::compiler::struct_layout::StructLayout::build(
+                            &fields,
+                            false,
+                            Some(&ts),
+                        )
+                        .two_state_mask
+                    {
+                        cur.clear_xz_with_mask(&mask)
+                    } else {
+                        false
+                    };
                     if changed {
                         self.set_signal_value_by_name(&vname, cur);
                     }
                     continue;
                 }
                 if Self::spreads_member_wise(&su) {
+                    // Nested struct members (`outer.in`) are also entered in
+                    // `var_decl_types` by `register_member_leaf`; handle them
+                    // from their enclosing root struct so outer defaults are
+                    // not clobbered by inner defaults.
+                    let is_nested_member = vname.match_indices('.').any(|(pos, _)| {
+                        let prefix = &vname[..pos];
+                        let pbase = prefix.split('[').next().unwrap_or(prefix);
+                        self.module
+                            .var_decl_types
+                            .get(prefix)
+                            .or_else(|| self.module.var_decl_types.get(pbase))
+                            .is_some_and(|pdt| {
+                                matches!(
+                                    self.resolve_dt_ref(pdt),
+                                    DataType::Struct(psu) if Self::spreads_member_wise(psu)
+                                )
+                            })
+                    });
+                    if is_nested_member {
+                        continue;
+                    }
                     self.zero_two_state_members(&vname, &su.clone());
+                    let saved_hint = if let Some((scope, _)) = vname.rsplit_once('.') {
+                        Some(self.name_resolve_hint.replace(Some(scope.to_string())))
+                    } else {
+                        None
+                    };
+                    self.apply_struct_member_defaults(&vname, &su.clone(), 0);
+                    if let Some(prev_hint) = saved_hint {
+                        *self.name_resolve_hint.borrow_mut() = prev_hint;
+                    }
                 }
             }
         }
-        if !self.mixed_packed_vars.is_empty() {
-            let mixed = &self.mixed_packed_vars;
-            self.bc_packed_fields = Some(
-                self.module
-                    .packed_struct_fields
-                    .iter()
-                    .filter(|(k, _)| !mixed.contains(k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            );
+        // Build interned Arc<StructLayout> descriptors from packed_struct_fields:
+        // identical field slices share one Arc across all module instances, and
+        // mixed 4-state/2-state packed structs precompute their 2-state field
+        // set and bitmask once without cloning the full table.
+        self.packed_struct_layouts.clear();
+        let mut non_mixed_intern: HashMap<usize, std::sync::Arc<crate::compiler::struct_layout::StructLayout>> =
+            HashMap::default();
+        let mut mixed_ts_cache: HashMap<usize, std::sync::Arc<HashSet<String>>> = HashMap::default();
+        let mixed_set = &self.mixed_packed_vars;
+        for (k, slice) in self.module.packed_struct_fields.iter() {
+            let k_str = k.as_str();
+            let is_mixed = mixed_set.contains(k_str);
+            if !is_mixed {
+                let ptr = slice.as_ptr() as usize;
+                let layout = non_mixed_intern
+                    .entry(ptr)
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(crate::compiler::struct_layout::StructLayout::build(
+                            slice.as_slice(),
+                            false,
+                            None,
+                        ))
+                    })
+                    .clone();
+                self.packed_struct_layouts.insert(k.to_string(), layout);
+            } else {
+                let ts_opt = self.module.var_decl_types.get(k_str).and_then(|dt| {
+                    let DataType::Struct(su) = self.resolve_dt_ref(dt) else {
+                        return None;
+                    };
+                    let su_ptr = (su as *const crate::ast::types::StructUnionType) as usize;
+                    Some(
+                        mixed_ts_cache
+                            .entry(su_ptr)
+                            .or_insert_with(|| {
+                                let mut ts = HashSet::default();
+                                self.collect_two_state_leaves(su, "", &mut ts);
+                                std::sync::Arc::new(ts)
+                            })
+                            .clone(),
+                    )
+                });
+                let layout = std::sync::Arc::new(crate::compiler::struct_layout::StructLayout::build(
+                    slice.as_slice(),
+                    true,
+                    ts_opt.as_deref(),
+                ));
+                self.packed_struct_layouts.insert(k.to_string(), layout);
+            }
+        }
+    }
+
+    /// Cache 2-state leaf field names for a dynamically declared mixed-packed
+    /// local or formal variable so `packed_member_two_state` stays O(1).
+    pub(super) fn set_mixed_local_two_state(&mut self, name: &str, dt: &DataType) {
+        if let DataType::Struct(su) = self.resolve_dt_in_ctx(dt) {
+            let mut ts = HashSet::default();
+            self.collect_two_state_leaves(&su, "", &mut ts);
+            self.mixed_local_two_state
+                .insert(name.to_string(), std::sync::Arc::new(ts));
+        } else {
+            self.mixed_local_two_state.remove(name);
+        }
+    }
+
+    /// Refresh `mixed_local_two_state` when restoring formal metadata for `name`.
+    pub(super) fn refresh_mixed_local_two_state(&mut self, name: &str) {
+        if let Some(dt) = self.module.var_decl_types.get(name).cloned() {
+            self.set_mixed_local_two_state(name, &dt);
+        } else {
+            self.mixed_local_two_state.remove(name);
         }
     }
 
@@ -2027,6 +2161,14 @@ impl Simulator {
         let root = root.split('[').next().unwrap_or(root);
         if !self.mixed_packed_vars.contains(root) {
             return false;
+        }
+        if let Some(ts) = self.mixed_local_two_state.get(root) {
+            return ts.contains(field);
+        }
+        if let Some(layout) = self.packed_struct_layouts.get(root)
+            && layout.is_mixed
+        {
+            return layout.get(field).is_some_and(|f| f.is_two_state);
         }
         let Some(dt) = self.module.var_decl_types.get(root) else {
             return false;
@@ -2141,11 +2283,25 @@ impl Simulator {
                 };
                 match &resolved {
                     DT::Struct(inner) => {
+                        if super::elaborate::is_type_two_state_resolved(
+                            &m.data_type,
+                            &self.module.typedef_types,
+                        ) {
+                            out.insert(leaf.clone());
+                        }
                         self.collect_two_state_leaves(inner, &leaf, out);
                     }
                     // §8.4: a class handle starts null; it has no x state.
                     DT::TypeReference { .. }
                         if Self::dt_is_class_handle(&resolved, &self.module) =>
+                    {
+                        out.insert(leaf);
+                    }
+                    DT::Enum(_)
+                        if super::elaborate::is_type_two_state_resolved(
+                            &m.data_type,
+                            &self.module.typedef_types,
+                        ) =>
                     {
                         out.insert(leaf);
                     }
@@ -2163,9 +2319,8 @@ impl Simulator {
     }
 
     /// §7.2.2: write each declared member default of the unpacked struct
-    /// `su` (`real a = 1.5;`) into the leaves under `base`, converted to the
-    /// member's type; nested unpacked struct members recurse. Members with
-    /// unpacked dimensions keep their defaults.
+    /// `su` (`real a = 1.5;`, nested structs, fixed unpacked array members)
+    /// into the leaves under `base`, converted to the member's type.
     pub(super) fn apply_struct_member_defaults(
         &mut self,
         base: &str,
@@ -2178,16 +2333,53 @@ impl Simulator {
         for m in &su.members {
             let resolved = self.resolve_dt(&m.data_type);
             for md in &m.declarators {
-                if !md.dimensions.is_empty() {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
+                let leaf = format!("{}.{}", base, md.name.name);
+                if !dims.is_empty() {
+                    if let Some(lists) = self.member_dim_indices(&dims) {
+                        if let DataType::Struct(inner) = &resolved
+                            && Self::spreads_member_wise(inner)
+                        {
+                            let inner = inner.clone();
+                            let mut tuples: Vec<Vec<i64>> = vec![Vec::new()];
+                            for list in &lists {
+                                let mut next = Vec::with_capacity(tuples.len() * list.len());
+                                for t in &tuples {
+                                    for &idx in list {
+                                        let mut t2 = t.clone();
+                                        t2.push(idx);
+                                        next.push(t2);
+                                    }
+                                }
+                                tuples = next;
+                            }
+                            for t in tuples {
+                                let elem = format!("{}{}", leaf, Self::index_suffix(&t));
+                                self.apply_struct_member_defaults(&elem, &inner, depth + 1);
+                            }
+                        }
+                        if let Some(init) = &md.init {
+                            self.assign_pattern_over_dims_with_types(
+                                &leaf,
+                                &m.data_type,
+                                &lists,
+                                Some(init),
+                                false,
+                                &[],
+                            );
+                        }
+                    }
                     continue;
                 }
-                let leaf = format!("{}.{}", base, md.name.name);
                 match (&resolved, &md.init) {
-                    (DataType::Struct(inner), None) if Self::spreads_member_wise(inner) => {
+                    (DataType::Struct(inner), init_opt) if Self::spreads_member_wise(inner) => {
                         let inner = inner.clone();
                         self.apply_struct_member_defaults(&leaf, &inner, depth + 1);
+                        if let Some(init) = init_opt {
+                            self.assign_pattern_or_leaf(&leaf, &m.data_type, init);
+                        }
                     }
-                    (_, Some(init)) if self.signal_name_to_id.contains_key(leaf.as_str()) => {
+                    (_, Some(init)) => {
                         let w = super::elaborate::resolve_type_width(
                             &m.data_type,
                             Some(&self.module.parameters),
@@ -2209,6 +2401,14 @@ impl Simulator {
                             is_real,
                             signed,
                         );
+                        if !self.signal_name_to_id.contains_key(leaf.as_str()) {
+                            if !self.widths.contains_key(leaf.as_str()) {
+                                self.widths.insert(leaf.clone(), v.width);
+                            }
+                            if signed && !is_real {
+                                self.signed_signals.insert(leaf.clone());
+                            }
+                        }
                         self.set_signal_value_by_name(&leaf, v);
                     }
                     _ => {}
@@ -2261,7 +2461,14 @@ impl Simulator {
                         | DT::IntegerAtom {
                             kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
                             ..
-                        } => {
+                        }
+                        | DT::Enum(_)
+                        | DT::Struct(_)
+                            if super::elaborate::is_type_two_state_resolved(
+                                &m.data_type,
+                                &self.module.typedef_types,
+                            ) =>
+                        {
                             // The leaf is 2-state: later writes drop X/Z too.
                             if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
                                 if let Some(t) = self.signal_two_state.get_mut(id) {
@@ -2282,7 +2489,7 @@ impl Simulator {
                                 u == Value::new(v.width)
                             });
                             if untouched {
-                                let w = cur.map(|v| v.width).unwrap_or_else(|| {
+                                let w = cur.as_ref().map(|v| v.width).unwrap_or_else(|| {
                                     crate::elaborate::resolve_type_width(
                                         &m.data_type,
                                         Some(&self.module.parameters),
@@ -2290,7 +2497,9 @@ impl Simulator {
                                     )
                                     .max(1)
                                 });
-                                self.set_signal_value_by_name(&leaf, Value::zero(w));
+                                let mut z = Value::zero(w);
+                                z.is_signed = self.type_is_signed_concrete(&m.data_type);
+                                self.set_signal_value_by_name(&leaf, z);
                             }
                         }
                         _ => {}
@@ -3292,6 +3501,11 @@ impl Simulator {
     /// evaluated once, when the assignment captures its target, so the
     /// width lookup must not evaluate it (see `effect_free_target_width`).
     pub(super) fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
+        if let Some((_, _, su)) = self.tagged_union_dt_of_expr(lvalue)
+            && let Some((_, v, _)) = self.eval_tagged_rhs(&su, rvalue)
+        {
+            return v;
+        }
         if let Some(v) = self.eval_pattern_for_lvalue(lvalue, rvalue) {
             return v;
         }
