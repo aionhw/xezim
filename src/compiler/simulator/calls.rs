@@ -128,6 +128,11 @@ impl Simulator {
     }
 
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        if args.is_empty()
+            && let Some(value) = self.reduction_iterator_method(func)
+        {
+            return value;
+        }
         // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
         // evaluated once; the dispatch below resolves the receiver several
         // times, so a side-effecting select is folded to its value first.

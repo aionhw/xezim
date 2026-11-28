@@ -58,6 +58,12 @@ impl Simulator {
         }
         match &expr.kind {
             ExprKind::Ident(h) => {
+                // §7.12: a bare iterator method can omit parentheses.
+                if self.item_alias.is_some()
+                    && let Some(value) = self.reduction_iterator_method(expr)
+                {
+                    return value;
+                }
                 if let Some(v) = self.plain_ident_read(h) {
                     return v;
                 }
@@ -118,6 +124,11 @@ impl Simulator {
                 return self.sva_sig_read(args);
             }
             ExprKind::MemberAccess { expr: base, member } => {
+                if self.item_alias.is_some()
+                    && let Some(value) = self.reduction_iterator_method(expr)
+                {
+                    return value;
+                }
                 // §19.7 `cc.option.<name>` / `this.cc.option.<name>` in the
                 // class that holds covergroup `cc`.
                 if let Some((idx, field)) = self.cg_option_member_target(base, member)
@@ -3518,10 +3529,20 @@ impl Simulator {
                         if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
-                                for i in (0..rev_idxs.len()).rev() {
-                                    let v =
-                                        self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                                    name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
+                                let mut valid = true;
+                                for (index, &(left, right)) in rev_idxs.iter().rev().zip(&shape) {
+                                    if let Some(v) = self.eval_expr(index).to_index()
+                                        && (left.min(right)..=left.max(right)).contains(&v)
+                                    {
+                                        name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
+                                    } else {
+                                        valid = false;
+                                    }
+                                }
+                                if !valid {
+                                    return self
+                                        .coll_missing_elem_value(&base_name)
+                                        .unwrap_or_else(|| Value::new(w));
                                 }
                                 if let Some(&eid) = self.signal_name_to_id.get(name.as_ref()) {
                                     let mut v = self.signal_table[eid].clone();
@@ -3533,7 +3554,9 @@ impl Simulator {
                                 if let Some(sv) = self.signals.get(&*name) {
                                     return sv.clone();
                                 }
-                                return Value::new(w);
+                                return self
+                                    .coll_missing_elem_value(&base_name)
+                                    .unwrap_or_else(|| Value::new(w));
                             }
                         }
                     }
@@ -3546,7 +3569,7 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
-                        if self.module.arrays_2d.contains_key(&*name) {
+                        if let Some(&(rows, cols, w)) = self.module.arrays_2d.get(&*name) {
                             // §7.10.1: in the row select of a queue of
                             // fixed-size rows (`q[$][1]`), `$` is the queue's
                             // last index.
@@ -3559,15 +3582,22 @@ impl Simulator {
                             if queue_rows {
                                 self.dollar_bound.pop();
                             }
-                            // §11.5.1: an x/z index reads an all-x element.
-                            let (Some(i), Some(j)) = (row, self.eval_expr(index).to_index()) else {
-                                let ew = self
-                                    .module
-                                    .arrays_2d
-                                    .get(&*name)
-                                    .map(|d| d.2)
-                                    .unwrap_or(ctx_width.max(1));
-                                return Value::new(ew.max(1));
+                            // §7.4.6, Table 7-1: both an unknown index and
+                            // an out-of-range index read the element default.
+                            let col = self.eval_expr(index).to_index();
+                            let row = row.filter(|&i| {
+                                if queue_rows {
+                                    i >= 0 && (i as u64) < self.get_queue_size(&name)
+                                } else {
+                                    (rows.0.min(rows.1)..=rows.0.max(rows.1)).contains(&i)
+                                }
+                            });
+                            let (left, right) = cols;
+                            let col = col.filter(|j| (left.min(right)..=left.max(right)).contains(j));
+                            let (Some(i), Some(j)) = (row, col) else {
+                                return self
+                                    .coll_missing_elem_value(&name)
+                                    .unwrap_or_else(|| Value::new(w.max(1)));
                             };
                             let elem_name = format!("{}[{}][{}]", name, i, j);
                             if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
@@ -3580,8 +3610,9 @@ impl Simulator {
                             if let Some(sv) = self.signals.get(&elem_name) {
                                 return sv.clone();
                             }
-                            let w = self.module.arrays_2d.get(&*name).map(|t| t.2).unwrap_or(1);
-                            return Value::new(w);
+                            return self
+                                .coll_missing_elem_value(&name)
+                                .unwrap_or_else(|| Value::new(w.max(1)));
                         }
                     }
                 }
@@ -4647,10 +4678,12 @@ impl Simulator {
                 // the plain reduction came back.
                 let parsed = match parsed {
                     Some((mut arr, method)) => {
-                        if let Some(s) = self.instance_assoc_member(&arr) {
+                        if let Some(row) = self.reduction_row_alias(&arr) {
+                            arr = row.to_string();
+                        } else if let Some(s) = self.instance_assoc_member(&arr) {
                             arr = s;
                         }
-                        if !self.is_with_receiver_storage(&arr) && arr.contains('.') {
+                        if !self.is_reduction_with_receiver(&arr, &method) {
                             arr = self.resolve_locator_storage(&arr);
                         }
                         Some((arr, method))
@@ -4658,7 +4691,7 @@ impl Simulator {
                     None => None,
                 };
                 let parsed = match parsed {
-                    Some((arr, method)) if self.is_with_receiver_storage(&arr) => {
+                    Some((arr, method)) if self.is_reduction_with_receiver(&arr, &method) => {
                         Some((arr, method))
                     }
                     other => {
@@ -4672,7 +4705,7 @@ impl Simulator {
                         };
                         recv.and_then(|(r, m)| {
                             self.expr_assoc_name(r)
-                                .filter(|st| self.is_with_receiver_storage(st))
+                                .filter(|st| self.is_reduction_with_receiver(st, &m.name))
                                 .map(|st| (st, m.name.clone()))
                         })
                         .or(other)
@@ -4698,7 +4731,7 @@ impl Simulator {
                 }
                 {
                     if let Some((arr, method)) = parsed {
-                        let is_arr = self.is_with_receiver_storage(&arr);
+                        let is_arr = self.is_reduction_with_receiver(&arr, &method);
                         if is_arr {
                             if matches!(
                                 method.as_str(),

@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Return typed defaults for invalid multidimensional array reads, report
+  truncation from associative traversal, and preserve X/Z, full width, and
+  nested row iterators in array reductions (§7.4.6, §7.9.8, §7.12.3).
+
 - Release discarded queue and dynamic-array elements, expression-local array
   locator results, and private collection metadata when their lifetime ends
   (§6.21, §7.5.1, §7.10.2, §7.12.1, §8.7, #1667).
